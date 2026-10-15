@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sessionsteward"
+version = "0.1.0"
+description = "Versioned snapshots for agent working state: instant undo for CLAUDE.md and friends."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+sessionsteward = "sessionsteward.cli:main"

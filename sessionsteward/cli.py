@@ -10,7 +10,8 @@ Scope note: this is *session ops* (snapshots, undo, compaction guard).
 Memory *storage* is OneMemory's job — the boundary stays clean.
 
   sessionsteward init                  # set up the snapshots repo
-  sessionsteward watch --add CLAUDE.md # watch extra paths (also: ~/..., /abs/...)
+  sessionsteward watch --add NOTES.md  # watch extra paths (also: ~/..., /abs/...)
+  sessionsteward watch --remove AGENTS.md  # stop watching one (defaults too)
   sessionsteward snap -m "before refactor"
   sessionsteward precompact            # snapshot before compaction
   sessionsteward log                   # list snapshots
@@ -38,22 +39,34 @@ VERSION = "0.1.0"
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
 
+def _harden_streams() -> None:
+    """Never traceback on a console that cannot encode a path (Windows
+    cp1252 pipes, LANG=C): a strict stdout/stderr replaces unencodable
+    characters instead of raising UnicodeEncodeError mid-report."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def cmd_init(args) -> int:
     repo = core_mod.init_repo()
     print(f"snapshots repo: {repo}")
-    print("watching (defaults): " + ", ".join(core_mod.DEFAULT_WATCH))
+    print("watching: " + ", ".join(core_mod.watch_list()))
     print("add more: sessionsteward watch --add <path>")
     return 0
 
 
-def cmd_watch_add(args) -> int:
+def cmd_watch_edit(args) -> int:
     core_mod.init_repo()
-    cfg = core_mod.load_config()
-    for p in args.add:
-        if p not in cfg["watch"]:
-            cfg["watch"].append(p)
+    cfg = core_mod.edit_watch_list(core_mod.load_config(),
+                                   add=args.add or [], remove=args.remove or [])
     core_mod.save_config(cfg)
-    print("watching: " + ", ".join(cfg["watch"] or core_mod.DEFAULT_WATCH))
+    print("watching: " + ", ".join(core_mod.watch_list(cfg)))
     return 0
 
 
@@ -141,7 +154,7 @@ def cmd_undo(args) -> int:
     print(f"undone {args.steps} step(s) -> {target[:7]}")
     for r in restored:
         print(f"  {r}")
-    return 0
+    return 1 if core_mod.skipped(restored) else 0
 
 
 def cmd_restore(args) -> int:
@@ -167,7 +180,7 @@ def cmd_restore(args) -> int:
     print(f"restored {args.sha[:7]}")
     for r in restored:
         print(f"  {r}")
-    return 0
+    return 1 if core_mod.skipped(restored) else 0
 
 
 def cmd_diet(args) -> int:
@@ -218,7 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Set up the snapshots repo.")
     wa = sub.add_parser("watch", help="Watch daemon / manage watch list.")
     wa.add_argument("--add", nargs="+", default=None,
-                    help="Add paths to the watch list (then exit).")
+                    help="Add paths to the watch list (then exit). "
+                         "The defaults stay watched.")
+    wa.add_argument("--remove", nargs="+", default=None,
+                    help="Drop paths from the watch list, defaults "
+                         "included (then exit).")
     wa.add_argument("--interval", type=float, default=5.0,
                     help="Poll seconds for the daemon.")
     sn = sub.add_parser("snap", help="Snapshot now.")
@@ -242,9 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    _harden_streams()
     args = build_parser().parse_args(argv)
-    if args.cmd == "watch" and args.add:
-        return cmd_watch_add(args)
+    if args.cmd == "watch" and (args.add or args.remove):
+        return cmd_watch_edit(args)
     cmds = {
         "init": cmd_init, "watch": cmd_watch, "snap": cmd_snap,
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,

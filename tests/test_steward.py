@@ -1,16 +1,26 @@
 """Session steward tests. Uses temp dirs; never touches ~/.sessionsteward."""
 
+import datetime
 import io
 import json
 import os
 import shutil
+import stat
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 from sessionsteward import cli as cli_mod
 from sessionsteward import core as core_mod
 from sessionsteward import diet as diet_mod
+
+# Permission bits do not bind root (common in containers/CI), so the
+# read-only regressions are only observable as an ordinary user.
+IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def patch_env(test: unittest.TestCase):
@@ -563,6 +573,335 @@ class TestSteward(unittest.TestCase):
             pre = json.load(f)["hooks"]["PreCompact"]
         self.assertEqual(core_mod._hook_commands(pre),
                          [core_mod.HOOK_PRECOMPACT_CMD])
+
+    # ---- round-2 release-panel regressions ----
+
+    def test_identical_resnap_later_makes_no_commit(self):
+        # The manifest carried a timestamp, so snapping identical content
+        # seconds apart still committed. With hooks installed: good state
+        # -> agent nukes CLAUDE.md -> PreCompact snap -> SessionStart snap
+        # (same nuked content, new commit) -> `undo` stepped back one to
+        # the PreCompact snap, i.e. restored the NUKED state.
+        self._cli("init")
+        self._cli("snap", "-m", "good")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("- one bullet\n")
+        clock = [time.time()]
+
+        def seconds_later():
+            clock[0] += 30
+            return clock[0]
+
+        with mock.patch.object(core_mod.time, "time", seconds_later):
+            self._cli("precompact")
+            self._cli("snap", "-m", "session start")
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages, ["pre-compaction snapshot", "good"])
+        self.assertNotIn("at", core_mod._manifest_at("HEAD"))
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+
+    def test_non_ascii_filename_matches_snapshot(self):
+        # git quotes non-ASCII paths ("\316\232...") unless
+        # core.quotePath=false, so a .claude/commands/Καλάς.md made every
+        # snapshot look "dirty": undo took a pre-undo snap of the current
+        # state and then restored it — a permanent no-op.
+        cmds = os.path.join(self.proj, ".claude", "commands")
+        os.makedirs(cmds)
+        greek = os.path.join(cmds, "Καλάς.md")
+        with open(greek, "w", encoding="utf-8") as f:
+            f.write("rule\n" * 30)
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        head = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        self.assertTrue(core_mod.worktree_matches_snapshot(head, self.proj))
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("nuked\n")
+        with open(greek, "w", encoding="utf-8") as f:
+            f.write("- bullet\n")
+        _, out = self._cli("snap", "-m", "v2")
+        # guard names the file verbatim, not octal-escaped
+        self.assertIn("guard: .claude/commands/Καλάς.md shrank", out)
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        with open(greek, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "rule\n" * 30)
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertNotIn("pre-undo", messages)
+
+    def test_watch_add_keeps_defaults(self):
+        # `watch --add NOTES.md` REPLACED the default list: CLAUDE.md and
+        # the user memory file were silently unprotected.
+        with open(os.path.join(self.proj, "NOTES.md"), "w") as f:
+            f.write("notes\n")
+        user_mem = os.path.join(self._home, ".claude", "CLAUDE.md")
+        os.makedirs(os.path.dirname(user_mem))
+        with open(user_mem, "w") as f:
+            f.write("user memory\n")
+        self._cli("init")
+        code, out = self._cli("watch", "--add", "NOTES.md")
+        self.assertEqual(code, 0)
+        self.assertIn("CLAUDE.md", out)
+        names = {os.path.basename(p) for p in core_mod.watched_paths(self.proj)}
+        self.assertEqual(names, {"CLAUDE.md", ".claude", "NOTES.md"})
+        self.assertIn(os.path.abspath(user_mem),
+                      core_mod.watched_paths(self.proj))
+        self.assertEqual(core_mod.watch_list(),
+                         core_mod.DEFAULT_WATCH + ["NOTES.md"])
+        # adding a path twice, or a default, never duplicates
+        self._cli("watch", "--add", "NOTES.md", "CLAUDE.md")
+        self.assertEqual(core_mod.watch_list(),
+                         core_mod.DEFAULT_WATCH + ["NOTES.md"])
+
+    def test_watch_remove_drops_default_or_extra(self):
+        self._cli("init")
+        self._cli("watch", "--add", "NOTES.md")
+        code, out = self._cli("watch", "--remove", "AGENTS.md", "NOTES.md")
+        self.assertEqual(code, 0)
+        self.assertNotIn("AGENTS.md", out)
+        self.assertNotIn("NOTES.md", out)
+        self.assertEqual(core_mod.watch_list(),
+                         [p for p in core_mod.DEFAULT_WATCH if p != "AGENTS.md"])
+        with open(os.path.join(self.proj, "AGENTS.md"), "w") as f:
+            f.write("agents\n")
+        self.assertNotIn(os.path.join(self.proj, "AGENTS.md"),
+                         core_mod.watched_paths(self.proj))
+        # and a removed default can be re-added
+        self._cli("watch", "--add", "AGENTS.md")
+        self.assertEqual(core_mod.watch_list(), core_mod.DEFAULT_WATCH)
+        self.assertNotIn("unwatch", core_mod.load_config())
+
+    def test_restore_skips_unwritable_target_and_exits_1(self):
+        # A target that cannot be written (here: a directory now sits
+        # where the file was; on a 0444 file it was a PermissionError)
+        # tracebacked out of restore half-way. It must be reported as
+        # skipped, the other files restored, and the CLI exit 1.
+        notes = os.path.join(self.proj, "NOTES.md")
+        with open(notes, "w") as f:
+            f.write("notes v1\n")
+        self._cli("init")
+        self._cli("watch", "--add", "NOTES.md")
+        self._cli("snap", "-m", "v1")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("nuked\n")
+        os.remove(notes)
+        os.makedirs(notes)
+        with open(os.path.join(notes, "inner.txt"), "w") as f:
+            f.write("now a dir\n")
+        self._cli("snap", "-m", "v2")
+        code, out = self._cli("undo")  # must not raise
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"skipped .*NOTES\.md: .*\(left untouched\)")
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())  # the rest was restored
+        self.assertTrue(os.path.isfile(os.path.join(notes, "inner.txt")))
+
+    @unittest.skipIf(IS_ROOT, "root ignores permission bits")
+    def test_read_only_file_restore_skipped(self):
+        agents = os.path.join(self.proj, "AGENTS.md")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(agents, "w") as f:
+            f.write("agents v1\n")
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        for p in (claude, agents):
+            with open(p, "w") as f:
+                f.write("nuked\n")
+        self._cli("snap", "-m", "v2")
+        os.chmod(agents, 0o444)
+        self.addCleanup(os.chmod, agents, 0o644)
+        code, out = self._cli("undo")  # used to traceback (PermissionError)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"skipped .*AGENTS\.md: .*\(left untouched\)")
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        with open(agents) as f:
+            self.assertEqual(f.read(), "nuked\n")
+
+    @unittest.skipIf(IS_ROOT, "root ignores permission bits")
+    def test_read_only_dir_in_watched_dir_resnaps(self):
+        # copytree mirrored a 0555 dir / 0444 file with its modes, so the
+        # next snap's rmtree of the mirror crashed with PermissionError.
+        ro = os.path.join(self.proj, ".claude", "ro")
+        os.makedirs(ro)
+        with open(os.path.join(ro, "f.txt"), "w") as f:
+            f.write("x\n")
+        os.chmod(os.path.join(ro, "f.txt"), 0o444)
+        os.chmod(ro, 0o555)
+        self.addCleanup(os.chmod, ro, 0o755)
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("nuked\n")
+        code, out = self._cli("snap", "-m", "v2")  # must not raise
+        self.assertEqual(code, 0)
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages[:2], ["v2", "v1"])
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        with open(os.path.join(ro, "f.txt")) as f:
+            self.assertEqual(f.read(), "x\n")
+
+    def test_crlf_survives_gitattributes(self):
+        # `-c core.autocrlf=false` was not enough: a .gitattributes inside
+        # the watched dir (mirrored into the repo) or a global
+        # core.attributesFile saying `* text=auto` still normalised CRLF
+        # to LF on add, so undo handed back LF files.
+        attrs = os.path.join(self._tmp, "attributes")
+        with open(attrs, "w") as f:
+            f.write("* text=auto\n")
+        gitcfg = os.path.join(self._tmp, "gitconfig")
+        with open(gitcfg, "w") as f:
+            # Backslashes are escapes in git config values: write the
+            # path with forward slashes (git accepts them on Windows).
+            f.write(f"[core]\n\tattributesFile = {attrs.replace(os.sep, '/')}\n")
+        old = os.environ.get("GIT_CONFIG_GLOBAL")
+        os.environ["GIT_CONFIG_GLOBAL"] = gitcfg
+        self.addCleanup(_restore_var, "GIT_CONFIG_GLOBAL", old)
+        with open(os.path.join(self.proj, ".claude", ".gitattributes"),
+                  "w") as f:
+            f.write("* text=auto\n")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        nested = os.path.join(self.proj, ".claude", "notes.md")
+        want = {claude: b"# Project\r\n\r\nBe helpful.\r\n",
+                nested: b"mixed\r\nendings\nhere\r\n"}
+        for p, data in want.items():
+            with open(p, "wb") as f:
+                f.write(data)
+        self._cli("init")
+        with open(os.path.join(core_mod.REPO_DIR, ".git", "info",
+                               "attributes")) as f:
+            self.assertEqual(f.read(), core_mod.ATTRIBUTES)
+        self._cli("snap", "-m", "v1")
+        for p in want:
+            with open(p, "wb") as f:
+                f.write(b"clobbered\n")
+        self._cli("snap", "-m", "v2")
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        for p, data in want.items():
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), data, p)
+
+    def test_guard_scoped_to_project_and_reports_deletion(self):
+        # The guard sized the whole files/ tree: project A's snap flagged
+        # project B's shrunken AGENTS.md, and a watched file deleted
+        # outright was never mentioned (its stale mirror stayed in files/).
+        proj_a, proj_b = self.proj, make_project()
+        agents_b = os.path.join(proj_b, "AGENTS.md")
+        with open(agents_b, "w") as f:
+            f.write("rule\n" * 40)
+        self._cli_root(proj_a, "init")
+        self._cli_root(proj_b, "snap", "-m", "B1")
+        self._cli_root(proj_a, "snap", "-m", "A1")
+        with open(agents_b, "w") as f:
+            f.write("x\n")
+        _, out = self._cli_root(proj_b, "snap", "-m", "B2")
+        self.assertIn("guard: AGENTS.md shrank", out)  # B's own guard
+        claude_a = os.path.join(proj_a, "CLAUDE.md")
+        with open(claude_a, "a") as f:
+            f.write("more\n")
+        _, out = self._cli_root(proj_a, "snap", "-m", "A2")
+        self.assertNotIn("guard", out)  # not B's business
+        os.remove(claude_a)
+        _, out = self._cli_root(proj_a, "snap", "-m", "A3")
+        self.assertRegex(out, r"guard: CLAUDE\.md deleted \(\d+ bytes\)")
+        _, out = self._cli_root(proj_a, "log")
+        self.assertIn("CLAUDE.md deleted", out.splitlines()[1])
+        self.assertNotIn("AGENTS.md", out)
+
+    def test_strict_console_never_tracebacks(self):
+        # Hook output is a pipe: on Windows that is cp1252/strict, so a
+        # guard line naming .claude/commands/Καλάς.md raised
+        # UnicodeEncodeError inside the hook. Run the real CLI with an
+        # ASCII-only stdout: no traceback, exit 0, the name is replaced.
+        cmds = os.path.join(self.proj, ".claude", "commands")
+        os.makedirs(cmds)
+        greek = os.path.join(cmds, "Καλάς.md")
+        with open(greek, "w", encoding="utf-8") as f:
+            f.write("rule\n" * 30)
+        env = {**os.environ, "HOME": self._home, "USERPROFILE": self._home,
+               "PYTHONIOENCODING": "ascii"}
+        env.pop("PYTHONUTF8", None)
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(cli_mod.__file__)))
+
+        def run(*argv):
+            return subprocess.run(
+                [sys.executable, "-m", "sessionsteward", "--root", self.proj,
+                 *argv], capture_output=True, cwd=repo_root, env=env,
+                timeout=60)
+
+        self.assertEqual(run("init").returncode, 0)
+        self.assertEqual(run("snap", "-m", "v1").returncode, 0)
+        with open(greek, "w", encoding="utf-8") as f:
+            f.write("- bullet\n")
+        p = run("snap", "-m", "v2")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertIn(b"guard: .claude/commands/?????.md shrank", p.stdout)
+        p = run("log")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertIn(b"?????.md shrank", p.stdout)
+
+    def test_install_hooks_replaces_stale_interpreter_entry(self):
+        # Re-running install-hooks after moving/recreating the venv
+        # appended a second entry next to the stale one (whose python no
+        # longer exists); any hook that invokes sessionsteward must be
+        # rewritten in place instead.
+        stale_pre = "'/old/venv/bin/python' -m sessionsteward precompact"
+        stale_start = ('"C:\\old venv\\Scripts\\python.exe" -m '
+                       'sessionsteward snap -m "session start"')
+        settings = {"hooks": {
+            "PreCompact": [
+                {"matcher": "", "hooks": [
+                    {"type": "command", "command": "echo other"},
+                    {"type": "command", "command": stale_pre}]},
+                {"matcher": "", "hooks": [
+                    {"type": "command", "command": stale_pre}]}],
+            "SessionStart": [{"matcher": "", "hooks": [
+                {"type": "command", "command": stale_start}]}],
+        }}
+        core_mod.merge_hooks(settings)
+        self.assertEqual(core_mod._hook_commands(settings["hooks"]["PreCompact"]),
+                         ["echo other", core_mod.HOOK_PRECOMPACT_CMD])
+        self.assertEqual(
+            core_mod._hook_commands(settings["hooks"]["SessionStart"]),
+            [core_mod.HOOK_SESSIONSTART_CMD])
+        before = json.dumps(settings, sort_keys=True)
+        core_mod.merge_hooks(settings)
+        self.assertEqual(json.dumps(settings, sort_keys=True), before)
+
+    def test_log_dates_are_local_time(self):
+        # `--date=iso` printed the recorded offset; the log now renders
+        # snapshot times in the user's local zone (--date=iso-local).
+        self._cli("init")
+        when = "2025-01-01T12:00:00+09:00"
+        for var in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+            old = os.environ.get(var)
+            os.environ[var] = when
+            self.addCleanup(_restore_var, var, old)
+        self._cli("snap", "-m", "v1")
+        epoch = datetime.datetime.fromisoformat(when).timestamp()
+        want = time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+        self.assertEqual(core_mod.log(1, project_root=self.proj)[0]["date"][:16],
+                         want)
+        _, out = self._cli("log")
+        self.assertIn(want, out)
 
     def test_transcripts_not_snapshotted(self):
         tdir = os.path.join(self.proj, ".claude", "transcripts")

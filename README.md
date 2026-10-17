@@ -1,11 +1,30 @@
 # Session Steward (`sessionsteward`)
 
-Versioned snapshots for agent working state. Coding agents silently
-degrade: compaction drops constraints, and one "remember this" can
-overwrite your 30-line CLAUDE.md with a single bullet — no warning, no
-undo. sessionsteward git-versions your agent config + memory files on
-every change: instant undo, pre-compaction snapshots, and a context-diet
-report showing what's eating the window.
+**Undo for CLAUDE.md.** sessionsteward git-snapshots your agent memory
+files — `CLAUDE.md`, `.claude/`, `AGENTS.md`, `~/.claude/CLAUDE.md` — and
+`sessionsteward undo` brings them back.
+
+```bash
+pip install git+https://github.com/calasdan-sketch/sessionsteward
+sessionsteward init                      # one-time: snapshots repo + defaults
+sessionsteward install-hooks --write     # snapshot on every Claude Code session start and before compaction
+sessionsteward undo                      # the agent clobbered CLAUDE.md? back it comes
+```
+
+Coding agents silently degrade: compaction drops constraints, and one
+"remember this" can overwrite your 30-line CLAUDE.md with a single bullet —
+no warning, no undo. Every snapshot is a git commit in a private repo
+(`~/.sessionsteward/snapshots`), so you get instant undo, pre-compaction
+snapshots, a shrink guard, and a context-diet report showing what's eating
+the window.
+
+```bash
+$ sessionsteward snap -m "before letting the agent edit memory"
+$ # agent overwrites your 30-line CLAUDE.md with one bullet
+$ sessionsteward undo
+undone 1 step(s) -> a3f9c21
+  /home/you/proj/CLAUDE.md
+```
 
 **Scope:** session *ops* (snapshots, undo, compaction guard) — not memory
 *storage*. That boundary stays clean.
@@ -32,13 +51,14 @@ package with the interpreter you ran it from.
 
 ```bash
 sessionsteward init                        # set up the snapshots repo
-sessionsteward watch --add NOTES.md ~/x.md # watch extra paths
+sessionsteward watch --add NOTES.md ~/x.md # watch extra paths (defaults stay watched)
+sessionsteward watch --remove AGENTS.md    # stop watching a path, defaults included
 
 sessionsteward snap -m "before refactor"   # snapshot now
 sessionsteward precompact                  # snapshot before compaction
 sessionsteward watch                       # daemon: auto-snapshot on change
 
-sessionsteward log                         # list snapshots (this project only)
+sessionsteward log                         # list snapshots (this project only, local time)
 sessionsteward diff                        # what changed (e.g. what compaction dropped)
 sessionsteward undo                        # restore the previous snapshot
 sessionsteward restore <sha>               # restore a specific snapshot
@@ -49,20 +69,13 @@ sessionsteward install-hooks --write       # merge it into ~/.claude/settings.js
 
 Watched by default: `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, `AGENTS.md`
 (project root) and `~/.claude/CLAUDE.md` (your user-level memory).
-
-The horror-story scenario, fixed:
-
-```bash
-$ sessionsteward snap -m "before letting the agent edit memory"
-$ # agent overwrites your 30-line CLAUDE.md with one bullet
-$ sessionsteward undo
-undone 1 step(s) -> a3f9c21
-  /home/you/proj/CLAUDE.md
-```
+`watch --add` adds to that list — it never replaces it; `watch --remove`
+drops a path, a default included.
 
 **Shrink guard:** when a snapshot shows a watched file lost more than half
 its size since the previous snapshot (the "compaction ate my CLAUDE.md"
-case), `snap`, `precompact`, the `watch` daemon and `log` flag it:
+case), or a watched file disappeared altogether, `snap`, `precompact`, the
+`watch` daemon and `log` flag it:
 
 ```
 $ sessionsteward log
@@ -70,9 +83,14 @@ b81d0e4  2026-10-16 09:12  auto: files changed
   ! guard: CLAUDE.md shrank 2412 -> 18 bytes (-99%) — `sessionsteward undo` to recover
 ```
 
-Safety rules: empty snaps are skipped (no noise commits); `undo`/`restore`
-never delete — files that didn't exist in the target snapshot are moved to
-`~/.sessionsteward/trash/` instead, **directories included**.
+Safety rules: snapshots are byte-exact (CRLF stays CRLF whatever your git's
+`core.autocrlf` or `.gitattributes` say); identical content is never
+re-committed, so two hooks snapping the same state don't bury the good one;
+`undo`/`restore` never delete — files that didn't exist in the target
+snapshot are moved to `~/.sessionsteward/trash/` instead, **directories
+included** — and a file that cannot be written (read-only, or a directory
+now sits in its place) is reported as `skipped … (left untouched)` with
+exit code 1 while the rest is restored.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
 default: cwd): snapshots record their project root, and a `restore` of a
 snapshot from another project is refused rather than clobbering your files.
@@ -91,14 +109,19 @@ sessionsteward install-hooks            # print the hooks JSON + where it goes
 sessionsteward install-hooks --write   # merge into ~/.claude/settings.json
 ```
 
-This wires **PreCompact** → `sessionsteward precompact` and **SessionStart**
-→ `sessionsteward snap -m "session start"`. The hooks call the Python that
-ran `install-hooks` by absolute path (`"/path/to/python" -m sessionsteward ...`),
-because hook shells don't load your aliases or activate your venv — re-run
-`install-hooks` if you move or recreate that environment. `--write` merges
-into the existing settings file without clobbering your other hooks
-(re-running is a no-op, and older bare `sessionsteward ...` hooks are
-upgraded in place).
+This wires **PreCompact** → `sessionsteward precompact` (snapshot before
+compaction — run `sessionsteward diff` afterwards to see exactly what the
+compaction dropped) and **SessionStart** → `sessionsteward snap -m "session
+start"`. Point the steward at the same files your agent's memory hook
+writes (`watch --add`) and those get the same protection.
+
+The hooks call the Python that ran `install-hooks` by absolute path
+(`"/path/to/python" -m sessionsteward ...`), because hook shells don't load
+your aliases or activate your venv — re-run `install-hooks --write` if you
+move or recreate that environment: any hook that runs sessionsteward is
+rewritten in place (older bare `sessionsteward ...` hooks too), never
+duplicated. `--write` merges into the existing settings file without
+clobbering your other hooks, and re-running is a no-op.
 
 ## Context diet
 
@@ -116,20 +139,14 @@ Watched files: 3, total ~12,400 chars (~3,100 tokens)
   - `/proj/.claude/settings.json`
 ```
 
-## Suggested hook wiring
-
-- **Pre-compaction:** run `sessionsteward precompact` (or add it to your
-  agent's pre-compact hook) — then `sessionsteward diff` afterwards to see
-  exactly what the compaction dropped.
-- **Session start:** `sessionsteward snap -m "session start"`.
-- **Memory writes:** point the steward at the same files your agent's
-  memory hook writes.
-
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 31 tests, temp dirs only
+python3 -m unittest discover -s tests   # 43 tests, temp dirs only
 ```
+
+Two tests (read-only files/dirs) are skipped when run as root, where
+permission bits don't bind.
 
 ## License
 

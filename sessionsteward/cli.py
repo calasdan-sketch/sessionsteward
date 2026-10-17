@@ -46,7 +46,11 @@ def _harden_streams() -> None:
     characters instead of raising UnicodeEncodeError mid-report."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+        # Both handlers raise UnicodeEncodeError on a character the code
+        # page lacks: "strict" (the default) and "surrogateescape" (what a
+        # piped stdout reports on Windows 11 / Python 3.11, with cp1252).
+        if reconfigure is None or getattr(stream, "errors", None) not in (
+                "strict", "surrogateescape"):
             continue
         try:
             reconfigure(errors="replace")

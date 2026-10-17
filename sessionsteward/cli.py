@@ -9,7 +9,7 @@ snapshots, and a context-diet report.
 Scope note: this is *session ops* (snapshots, undo, compaction guard).
 Memory *storage* is OneMemory's job — the boundary stays clean.
 
-  sessionsteward init                  # set up the snapshots repo
+  sessionsteward init                  # set up the snapshots repo + first snapshot
   sessionsteward watch --add NOTES.md  # watch extra paths (also: ~/..., /abs/...)
   sessionsteward watch --remove AGENTS.md  # stop watching one (defaults too)
   sessionsteward snap -m "before refactor"
@@ -53,10 +53,55 @@ def _harden_streams() -> None:
             pass
 
 
+def _short(path: str, root: str) -> str:
+    """A path as the user knows it: project-relative inside the project,
+    ~/... under home, otherwise as is."""
+    root = os.path.abspath(root)
+    home = os.path.abspath(os.path.expanduser("~"))
+    for base, prefix in ((root, ""), (home, "~" + os.sep)):
+        if path == base:
+            return prefix.rstrip(os.sep) or "."
+        if path.startswith(base.rstrip(os.sep) + os.sep):
+            return prefix + path[len(base.rstrip(os.sep)) + 1:]
+    return path
+
+
+def _print_restored(restored: list[str], root: str) -> None:
+    """One short line per path: `restored CLAUDE.md`, `unchanged .claude`,
+    `moved .claude -> ~/.sessionsteward/trash/.claude.1760000000`. Keeps
+    the undo/restore report (and hook output) to the essentials."""
+    for r in restored:
+        for tag in ("moved ", "unchanged ", "skipped "):
+            if r.startswith(tag):
+                rest = r[len(tag):]
+                if tag == "moved ":
+                    src, _, dest = rest.partition(" -> ")
+                    rest = f"{_short(src, root)} -> {_short(dest, root)}"
+                elif tag == "skipped ":
+                    path, _, why = rest.partition(": ")
+                    rest = f"{_short(path, root)}: {why}"
+                else:
+                    rest = _short(rest, root)
+                print(f"  {tag}{rest}")
+                break
+        else:
+            print(f"  restored {_short(r, root)}")
+
+
 def cmd_init(args) -> int:
     repo = core_mod.init_repo()
     print(f"snapshots repo: {repo}")
     print("watching: " + ", ".join(core_mod.watch_list()))
+    if core_mod.log(1, project_root=args.root):
+        pass  # re-run on a project that already has snapshots
+    elif core_mod.watched_paths(args.root):
+        # A first snapshot right away, so `undo` has somewhere to go the
+        # moment the agent first clobbers a file.
+        sha = core_mod.snap(args.root, "initial snapshot")
+        print(f"snapshot {sha[:7]} (initial)")
+    else:
+        print(f"nothing to snapshot yet: no watched file exists in "
+              f"{os.path.abspath(args.root)}")
     print("add more: sessionsteward watch --add <path>")
     return 0
 
@@ -97,10 +142,19 @@ def cmd_log(args) -> int:
         print("no snapshots yet — run `sessionsteward init` first")
         return 0
     snaps = core_mod.log(args.limit + 1, project_root=args.root)
+    if not snaps:
+        print(f"no snapshots yet for {os.path.abspath(args.root)} — "
+              f"`sessionsteward snap` takes one")
+        return 0
+    # The "undo to recover" hint is only true while the live files ARE
+    # the shrunken top snapshot; after a restore it would re-clobber.
+    at_top = core_mod.worktree_matches_snapshot(snaps[0]["sha"], args.root)
     for i, s in enumerate(snaps[:args.limit]):
         print(f"{s['sha'][:7]}  {s['date'][:16]}  {s['message']}")
         if i + 1 < len(snaps):
-            for line in core_mod.guard_lines(s["sha"], snaps[i + 1]["sha"]):
+            hint = ("undo" if at_top else None) if i == 0 else "restore"
+            for line in core_mod.guard_lines(s["sha"], snaps[i + 1]["sha"],
+                                             hint=hint):
                 print(line)
     return 0
 
@@ -110,8 +164,13 @@ def cmd_diff(args) -> int:
         print("no snapshots yet")
         return 2
     snaps = core_mod.log(50, project_root=args.root)
+    if not snaps:
+        print("no snapshots yet")
+        return 2
     sha1 = args.sha1 or (snaps[1]["sha"] if len(snaps) > 1 else None)
-    sha2 = args.sha2 or "HEAD"
+    # Default to THIS project's newest snapshot, never global HEAD: the
+    # repo is shared, and HEAD may be another project's snapshot.
+    sha2 = args.sha2 or snaps[0]["sha"]
     if not sha1:
         print("only one snapshot — nothing to diff")
         return 0
@@ -122,6 +181,17 @@ def cmd_diff(args) -> int:
     return 0
 
 
+def _restore_errors(fn):
+    try:
+        return fn(), 0
+    except core_mod.NothingToRestoreError as e:
+        print(e)
+        return None, 1
+    except core_mod.CrossProjectError as e:
+        print(f"error: {e}")
+        return None, 1
+
+
 def cmd_undo(args) -> int:
     if not core_mod.repo_ready():
         print("no snapshots yet")
@@ -130,30 +200,38 @@ def cmd_undo(args) -> int:
     if not snaps:
         print("nothing to restore — no snapshots yet")
         return 1
-    if core_mod.worktree_matches_snapshot(snaps[0]["sha"], args.root):
-        # Clean state: the current state is already snapshotted, so undo
-        # needs no pre-snap and redo is just `restore` of snaps[0].
-        if len(snaps) < 2:
-            print("only one snapshot — nothing to undo to")
-            return 0
-        target = snaps[min(args.steps, len(snaps) - 1)]["sha"]
-    else:
+    # Where are we? The live files match the NEWEST snapshot only until
+    # the first undo; after that they match an older one, and stepping
+    # from snaps[0] would restore the state just undone (the clobber).
+    pos = core_mod.current_position(snaps, args.root)
+    if pos is None:
         # Dirty state: snapshot it first ("pre-undo") so undo is
         # reversible — redo is `restore` of the pre-undo snapshot.
         core_mod.snap(args.root, "pre-undo")
         snaps = core_mod.log(50, project_root=args.root)
-        target = snaps[min(args.steps, len(snaps) - 1)]["sha"]
-    try:
-        restored = core_mod.restore(target, project_root=args.root)
-    except core_mod.NothingToRestoreError as e:
-        print(e)
-        return 1
-    except core_mod.CrossProjectError as e:
-        print(f"error: {e}")
-        return 1
-    print(f"undone {args.steps} step(s) -> {target[:7]}")
-    for r in restored:
-        print(f"  {r}")
+        pos = 0
+    if len(snaps) < 2:
+        print("only one snapshot — nothing to undo to")
+        return 0
+    if pos == len(snaps) - 1:
+        print(f"already at the oldest snapshot ({snaps[pos]['sha'][:7]}) — "
+              f"nothing to undo to; `sessionsteward restore <sha>` goes forward")
+        return 0
+    steps = max(1, args.steps)
+    last = len(snaps) - 1
+    target_i = min(pos + steps, last)
+    target = snaps[target_i]
+    restored, rc = _restore_errors(
+        lambda: core_mod.restore(target["sha"], project_root=args.root))
+    if restored is None:
+        return rc
+    note = ""
+    if pos + steps > last:
+        note = (f" (asked for {steps} step(s); {target_i - pos} is the "
+                f"oldest snapshot)")
+    print(f"undone {target_i - pos} step(s) -> {target['sha'][:7]}  "
+          f"{target['message']}{note}")
+    _print_restored(restored, args.root)
     return 1 if core_mod.skipped(restored) else 0
 
 
@@ -162,24 +240,18 @@ def cmd_restore(args) -> int:
         print("no snapshots yet")
         return 2
     # Validate before the pre-restore snap so a bad sha doesn't pollute log.
-    try:
-        core_mod.check_restore(args.sha, args.root)
-    except core_mod.NothingToRestoreError as e:
-        print(e)
-        return 1
-    except core_mod.CrossProjectError as e:
-        print(f"error: {e}")
-        return 1
-    # Redo support: if the current state isn't snapshotted yet, snapshot
-    # it first ("pre-restore") so the restore is reversible.
+    _, rc = _restore_errors(lambda: core_mod.check_restore(args.sha, args.root))
+    if rc:
+        return rc
+    # Redo support: if the current state isn't snapshotted yet (matches
+    # no snapshot), snapshot it first ("pre-restore") so the restore is
+    # reversible.
     snaps = core_mod.log(50, project_root=args.root)
-    if snaps and not core_mod.worktree_matches_snapshot(snaps[0]["sha"],
-                                                        args.root):
+    if snaps and core_mod.current_position(snaps, args.root) is None:
         core_mod.snap(args.root, "pre-restore")
     restored = core_mod.restore(args.sha, project_root=args.root)
     print(f"restored {args.sha[:7]}")
-    for r in restored:
-        print(f"  {r}")
+    _print_restored(restored, args.root)
     return 1 if core_mod.skipped(restored) else 0
 
 
@@ -189,17 +261,21 @@ def cmd_diet(args) -> int:
 
 
 def cmd_install_hooks(args) -> int:
+    wiring = (f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
+              f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
+    if args.write:
+        path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
+        print(f"merged hooks into {path} (existing settings preserved; "
+              f"re-running is a no-op)")
+        print(wiring)
+        return 0
     payload = core_mod.build_hooks_json()
     print(json.dumps(payload, indent=2))
     print()
     print("Copy the JSON above into the \"hooks\" section of "
           "~/.claude/settings.json, or re-run with --write to merge it "
           "automatically (existing settings are preserved).")
-    print(f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
-          f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
-    if args.write:
-        path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
-        print(f"merged hooks into {path}")
+    print(wiring)
     return 0
 
 
@@ -228,7 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Project root for relative watch paths.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init", help="Set up the snapshots repo.")
+    sub.add_parser("init", help="Set up the snapshots repo and take a "
+                               "first snapshot.")
     wa = sub.add_parser("watch", help="Watch daemon / manage watch list.")
     wa.add_argument("--add", nargs="+", default=None,
                     help="Add paths to the watch list (then exit). "
@@ -243,11 +320,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("precompact", help="Snapshot before compaction.")
     lg = sub.add_parser("log", help="List snapshots.")
     lg.add_argument("--limit", type=int, default=20)
-    df = sub.add_parser("diff", help="Diff two snapshots.")
+    df = sub.add_parser("diff", help="Diff two snapshots (default: the "
+                                     "previous one against the newest).")
     df.add_argument("sha1", nargs="?")
-    df.add_argument("sha2", nargs="?", default="HEAD")
+    df.add_argument("sha2", nargs="?", default=None)
     un = sub.add_parser("undo", help="Restore the previous snapshot.")
-    un.add_argument("--steps", type=int, default=1)
+    un.add_argument("--steps", type=int, default=1,
+                    help="How many snapshots to step back (clamped to the "
+                         "oldest; the report says when).")
     rs = sub.add_parser("restore", help="Restore a specific snapshot.")
     rs.add_argument("sha")
     sub.add_parser("diet", help="Context-diet report.")
@@ -261,15 +341,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     _harden_streams()
     args = build_parser().parse_args(argv)
-    if args.cmd == "watch" and (args.add or args.remove):
-        return cmd_watch_edit(args)
     cmds = {
         "init": cmd_init, "watch": cmd_watch, "snap": cmd_snap,
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
         "install-hooks": cmd_install_hooks,
     }
-    return cmds[args.cmd](args)
+    if args.cmd == "watch" and (args.add or args.remove):
+        cmds["watch"] = cmd_watch_edit
+    try:
+        return cmds[args.cmd](args)
+    except (core_mod.StewardError, RuntimeError) as e:
+        # git missing, a stale .git/index.lock, a corrupt config or
+        # manifest: one line on stderr, exit 2 — never a traceback (as a
+        # SessionStart hook that would be pasted into the agent's context).
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

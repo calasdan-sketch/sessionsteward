@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from sessionsteward import cli as cli_mod
@@ -96,13 +96,18 @@ class TestSteward(unittest.TestCase):
         self.assertIn("snapshots repo", out)
 
     def test_snap_log(self):
-        self._cli("init")
-        self._cli("snap", "-m", "first")
-        self._cli("snap", "-m", "second")  # no changes -> skipped
+        self._cli("init")  # takes the initial snapshot
+        self._cli("snap", "-m", "first")  # identical content -> skipped
+        with open(os.path.join(self.proj, "CLAUDE.md"), "a") as f:
+            f.write("more\n")
+        self._cli("snap", "-m", "second")
+        self._cli("snap", "-m", "third")  # no changes -> skipped
         snaps = core_mod.log()
         messages = [s["message"] for s in snaps]
-        self.assertIn("first", messages)
-        self.assertNotIn("second", messages)  # empty snap skipped
+        self.assertIn("initial snapshot", messages)
+        self.assertIn("second", messages)
+        self.assertNotIn("first", messages)  # empty snaps skipped
+        self.assertNotIn("third", messages)
 
     def test_undo(self):
         self._cli("init")
@@ -140,6 +145,8 @@ class TestSteward(unittest.TestCase):
 
     def test_precompact(self):
         self._cli("init")
+        with open(os.path.join(self.proj, "CLAUDE.md"), "a") as f:
+            f.write("more\n")
         code, out = self._cli("precompact")
         self.assertEqual(code, 0)
         self.assertIn("pre-compaction", core_mod.log()[0]["message"])
@@ -225,9 +232,13 @@ class TestSteward(unittest.TestCase):
             self.assertIn("Be helpful.", f.read())
 
     def test_undo_no_snapshots(self):
-        # init only: no snapshots exist at all -> clean message, no crash
-        self._cli("init")
-        code, out = self._cli("undo")  # must not raise
+        # init in a project without any watched file: no snapshots exist
+        # at all -> clean message, no crash
+        empty = tempfile.mkdtemp()
+        code, out = self._cli_root(empty, "init")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to snapshot yet", out)
+        code, out = self._cli_root(empty, "undo")  # must not raise
         self.assertNotEqual(code, 0)
         self.assertIn("nothing to restore", out)
 
@@ -245,7 +256,8 @@ class TestSteward(unittest.TestCase):
 
     def test_restore_init_commit_clean_message(self):
         self._cli("init")
-        init_sha = core_mod.log()[0]["sha"]  # manifest-less init commit
+        init_sha = core_mod.log()[-1]["sha"]  # manifest-less init commit
+        self.assertEqual(core_mod.log()[-1]["message"], "init")
         code, out = self._cli("restore", init_sha[:7])  # must not raise
         self.assertNotEqual(code, 0)
         self.assertIn("nothing to restore", out)
@@ -267,10 +279,12 @@ class TestSteward(unittest.TestCase):
             f.write("B edited\n")
         self._cli_root(proj_b, "snap", "-m", "B-v2")
 
-        # log in A must not show B's snapshots
+        # log in A must not show B's snapshots (A-v1 is a no-op: init
+        # already snapshotted that content)
         _, out = self._cli_root(proj_a, "log")
-        self.assertIn("A-v1", out)
-        self.assertNotIn("B-v1", out)
+        self.assertIn("A-v2", out)
+        self.assertIn("initial snapshot", out)
+        self.assertNotIn("B-v", out)
 
         # undo in A restores A's file only; B is untouched
         code, _ = self._cli_root(proj_a, "undo")
@@ -364,8 +378,7 @@ class TestSteward(unittest.TestCase):
         with open(newfile, "w") as f:
             f.write("new\n")
         self._cli("snap", "-m", "v2")
-        v1 = next(s["sha"] for s in core_mod.log(50, project_root=self.proj)
-                  if s["message"] == "v1")
+        v1 = core_mod.log(50, project_root=self.proj)[-1]["sha"]  # init snap
         trash = os.path.join(self._tmp, "trash")
         restored = core_mod.restore(v1, trash_dir=trash,
                                     project_root=self.proj)
@@ -392,8 +405,7 @@ class TestSteward(unittest.TestCase):
         with open(newfile, "w") as f:
             f.write("live work\n")
         self._cli("snap", "-m", "v2")
-        v1 = next(s["sha"] for s in core_mod.log(50, project_root=self.proj)
-                  if s["message"] == "v1")
+        v1 = core_mod.log(50, project_root=self.proj)[-1]["sha"]  # init snap
         real_run = core_mod.subprocess.run
 
         def broken_archive(cmd, *a, **kw):
@@ -583,8 +595,10 @@ class TestSteward(unittest.TestCase):
         # (same nuked content, new commit) -> `undo` stepped back one to
         # the PreCompact snap, i.e. restored the NUKED state.
         self._cli("init")
-        self._cli("snap", "-m", "good")
         claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "a") as f:
+            f.write("Another rule.\n")
+        self._cli("snap", "-m", "good")
         with open(claude, "w") as f:
             f.write("- one bullet\n")
         clock = [time.time()]
@@ -598,7 +612,8 @@ class TestSteward(unittest.TestCase):
             self._cli("snap", "-m", "session start")
         messages = [s["message"]
                     for s in core_mod.log(50, project_root=self.proj)]
-        self.assertEqual(messages, ["pre-compaction snapshot", "good"])
+        self.assertEqual(messages, ["pre-compaction snapshot", "good",
+                                    "initial snapshot"])
         self.assertNotIn("at", core_mod._manifest_at("HEAD"))
         code, _ = self._cli("undo")
         self.assertEqual(code, 0)
@@ -747,7 +762,8 @@ class TestSteward(unittest.TestCase):
         self.assertEqual(code, 0)
         messages = [s["message"]
                     for s in core_mod.log(50, project_root=self.proj)]
-        self.assertEqual(messages[:2], ["v2", "v1"])
+        # init already took the first snapshot, so "v1" was a no-op
+        self.assertEqual(messages[:2], ["v2", "initial snapshot"])
         code, _ = self._cli("undo")
         self.assertEqual(code, 0)
         with open(claude) as f:
@@ -889,13 +905,12 @@ class TestSteward(unittest.TestCase):
     def test_log_dates_are_local_time(self):
         # `--date=iso` printed the recorded offset; the log now renders
         # snapshot times in the user's local zone (--date=iso-local).
-        self._cli("init")
         when = "2025-01-01T12:00:00+09:00"
         for var in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
             old = os.environ.get(var)
             os.environ[var] = when
             self.addCleanup(_restore_var, var, old)
-        self._cli("snap", "-m", "v1")
+        self._cli("init")  # takes the initial snapshot
         epoch = datetime.datetime.fromisoformat(when).timestamp()
         want = time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
         self.assertEqual(core_mod.log(1, project_root=self.proj)[0]["date"][:16],
@@ -922,6 +937,483 @@ class TestSteward(unittest.TestCase):
         mtimes = core_mod.file_mtimes(core_mod.watched_paths(self.proj))
         self.assertFalse(any("transcript" in p or p.endswith(".log")
                              for p in mtimes), list(mtimes))
+
+    # ---- round-3 release-panel regressions ----
+
+    def _cli_err(self, root, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli_mod.main(["--root", root, *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_watched_path_outside_home_never_escapes_repo(self):
+        # HIGH: _rel() built the mirror path from relpath(), so a watched
+        # file outside both home and the project became
+        # files/../../../x/notes.md. At one directory depth that resolved
+        # to the watched file ITSELF: snap removed it (not via trash) and
+        # then crashed copying it. At other depths the mirror silently
+        # landed outside the repo and the file was never protected.
+        tmp = self._tmp
+        proj = os.path.join(self._home, "a", "b", "c")  # depth that hit
+        os.makedirs(proj)
+        with open(os.path.join(proj, "CLAUDE.md"), "w") as f:
+            f.write("# proj\n")
+        outside = os.path.join(tmp, "outside2", "notes.md")
+        os.makedirs(os.path.dirname(outside))
+        with open(outside, "w") as f:
+            f.write("IMPORTANT NOTES\n")
+        self._cli_root(proj, "init")
+        self._cli_root(proj, "watch", "--add", outside)
+        code, out, err = self._cli_err(proj, "snap", "-m", "one")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isfile(outside), "watched file was deleted")
+        with open(outside) as f:
+            self.assertEqual(f.read(), "IMPORTANT NOTES\n")
+        rel = core_mod._rel(outside, proj)
+        # POSIX: __abs/root/...; Windows: __abs/<drive letter>/...
+        self.assertRegex(rel, r"^__abs/(root|[A-Za-z])/")
+        self.assertNotIn("..", rel)
+        names = core_mod._git(core_mod.REPO_DIR, "ls-tree", "-r",
+                              "--name-only", "HEAD").splitlines()
+        self.assertIn(f"files/{rel}", names)
+        files_dir = os.path.realpath(os.path.join(core_mod.REPO_DIR, "files"))
+        for n in names:
+            real = os.path.realpath(os.path.join(core_mod.REPO_DIR, n))
+            self.assertTrue(real.startswith(os.path.join(core_mod.REPO_DIR, "")),
+                            n)
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.dirname(tmp), "outside2")))  # no stray mirror either
+        # the file is actually protected: clobber -> undo brings it back
+        with open(outside, "w") as f:
+            f.write("x\n")
+        self._cli_root(proj, "snap", "-m", "two")
+        code, _, _ = self._cli_err(proj, "undo")
+        self.assertEqual(code, 0)
+        with open(outside) as f:
+            self.assertEqual(f.read(), "IMPORTANT NOTES\n")
+        # and the containment check itself refuses an escaping path
+        for bad in ("../x", "a/../../x", "/abs", "", "."):
+            with self.assertRaises(core_mod.StewardError):
+                core_mod._mirror_path(files_dir, bad)
+
+    def test_other_drive_path_maps_to_valid_mirror_name(self):
+        # Windows: a watched file on another drive has no relpath, so the
+        # fallback produced "D:_notes_x.md" — a colon is not a valid file
+        # name character there. It must become __abs/D/notes/x.md.
+        def splitdrive(p):
+            return (p[:2], p[2:]) if p[1:2] == ":" else ("", p)
+        with mock.patch.object(core_mod.os.path, "splitdrive", splitdrive):
+            rel = core_mod._abs_rel("D:\\notes\\x.md")
+            unc = core_mod._abs_rel("\\\\server\\share\\x.md")
+        self.assertEqual(rel, "__abs/D/notes/x.md")
+        self.assertNotIn(":", rel)
+        self.assertEqual(core_mod.display_rel(rel), "D:/notes/x.md")
+        with mock.patch.object(core_mod.os.path, "splitdrive",
+                               lambda p: ("\\\\server\\share", p[14:])):
+            unc = core_mod._abs_rel("\\\\server\\share\\x.md")
+        self.assertEqual(unc, "__abs/UNC/server/share/x.md")
+        self.assertEqual(core_mod.display_rel("__home/.claude/CLAUDE.md"),
+                         "~/.claude/CLAUDE.md")
+        self.assertEqual(core_mod.display_rel("__abs/root/x/notes.md"),
+                         "/x/notes.md")
+
+    def test_undo_twice_does_not_bring_the_clobber_back(self):
+        # HIGH: `undo` assumed the live files match snaps[0]. After one
+        # undo they match snaps[1], so the next undo saw a "dirty" tree,
+        # snapshotted it as pre-undo and restored snaps[1] — the clobber.
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("rule\n" * 30)
+        self._cli("init")  # initial snapshot = good
+        with open(claude, "w") as f:
+            f.write("- one bullet\n")
+        self._cli("snap", "-m", "clobber")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        self.assertIn("initial snapshot", out)
+        with open(claude) as f:
+            self.assertEqual(f.read(), "rule\n" * 30)
+        code, out = self._cli("undo")  # must NOT restore the clobber
+        self.assertEqual(code, 0)
+        self.assertIn("oldest snapshot", out)
+        with open(claude) as f:
+            self.assertEqual(f.read(), "rule\n" * 30)
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages, ["clobber", "initial snapshot"])
+        # redo = restore the clobber snapshot: the live tree matches an
+        # existing snapshot, so no pre-restore noise commit either
+        clobber = core_mod.log(50, project_root=self.proj)[0]["sha"]
+        code, _ = self._cli("restore", clobber[:7])
+        self.assertEqual(code, 0)
+        with open(claude) as f:
+            self.assertEqual(f.read(), "- one bullet\n")
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages, ["clobber", "initial snapshot"])
+
+    def test_undo_steps_from_current_position_and_reports_clamp(self):
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        self._cli("init")
+        for v in ("v2", "v3", "v4"):
+            with open(claude, "w") as f:
+                f.write(f"{v}\n")
+            self._cli("snap", "-m", v)
+        self._cli("undo")  # at v3
+        with open(claude) as f:
+            self.assertEqual(f.read(), "v3\n")
+        code, out = self._cli("undo", "--steps", "5")  # only 2 left
+        self.assertEqual(code, 0)
+        self.assertIn("undone 2 step(s)", out)
+        self.assertIn("asked for 5 step(s)", out)
+        with open(claude) as f:
+            self.assertEqual(f.read(), "# Project\n\nBe helpful.\n")
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertNotIn("pre-undo", messages)
+
+    def test_log_after_restore_drops_stale_undo_hint(self):
+        # After `restore <good>` the log's top entry (pre-restore, the
+        # clobbered state) still said "`sessionsteward undo` to recover";
+        # following it re-clobbered. The hint only holds while the live
+        # files ARE that top snapshot.
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("rule\n" * 30)
+        self._cli("init")
+        good = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        with open(claude, "w") as f:
+            f.write("- one bullet\n")
+        self._cli("snap", "-m", "clobber")
+        _, out = self._cli("log")
+        self.assertIn("`sessionsteward undo` to recover", out)  # live = clobber
+        self._cli("restore", good[:7])
+        _, out = self._cli("log")
+        self.assertIn("guard: CLAUDE.md shrank", out)  # history still shown
+        self.assertNotIn("`sessionsteward undo` to recover", out)
+        with open(claude, "w") as f:
+            f.write("dirty\n" * 40)
+        self._cli("snap", "-m", "later")
+        _, out = self._cli("log")
+        # older entries point at the snapshot holding the previous version
+        self.assertIn(f"`sessionsteward restore {good[:7]}` has the previous "
+                      f"version", out)
+        self.assertNotIn("`sessionsteward undo` to recover", out)
+
+    def test_diff_defaults_to_this_projects_snapshots(self):
+        # `diff` diffed against global HEAD, i.e. whichever project
+        # snapshotted last: project A's diff showed project B's changes.
+        proj_a, proj_b = self.proj, make_project()
+        self._cli_root(proj_a, "init")
+        with open(os.path.join(proj_a, "CLAUDE.md"), "a") as f:
+            f.write("A extra line.\n")
+        self._cli_root(proj_a, "snap", "-m", "A2")
+        with open(os.path.join(proj_b, "CLAUDE.md"), "a") as f:
+            f.write("B secret line.\n")
+        self._cli_root(proj_b, "snap", "-m", "B1")
+        code, out = self._cli_root(proj_a, "diff")
+        self.assertEqual(code, 0)
+        self.assertIn("A extra line.", out)
+        self.assertNotIn("B secret line.", out)
+
+    def test_git_missing_is_a_clean_error(self):
+        # git not on PATH raised FileNotFoundError out of subprocess (a
+        # traceback inside the SessionStart hook). One line, exit 2.
+        real_run = core_mod.subprocess.run
+
+        def no_git(cmd, *a, **kw):
+            if cmd and cmd[0] == "git":
+                raise FileNotFoundError(2, "No such file or directory", "git")
+            return real_run(cmd, *a, **kw)
+
+        with mock.patch.object(core_mod.subprocess, "run", no_git):
+            code, out, err = self._cli_err(self.proj, "init")
+        self.assertEqual(code, 2)
+        self.assertIn("error: git not found", err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Traceback", out)
+
+    def test_git_failure_is_a_clean_error(self):
+        # A stale .git/index.lock made `git add` fail -> RuntimeError
+        # traceback. Must be `error: git add -A failed: ...`, exit 2.
+        self._cli("init")
+        lock = os.path.join(core_mod.REPO_DIR, ".git", "index.lock")
+        with open(lock, "w") as f:
+            f.write("")
+        with open(os.path.join(self.proj, "CLAUDE.md"), "a") as f:
+            f.write("more\n")
+        code, out, err = self._cli_err(self.proj, "snap", "-m", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("error: git add -A failed", err)
+        self.assertIn("index.lock", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_identical_dir_not_swapped_and_trash_pruned(self):
+        # Every undo/restore moved a watched directory to trash and
+        # re-extracted it even when byte-identical, and the trash grew by
+        # one copy per undo, forever.
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        self._cli("init")
+        for i in range(3):
+            with open(claude, "w") as f:
+                f.write(f"v{i}\n")
+            self._cli("snap", "-m", f"v{i}")
+            code, out = self._cli("undo")
+            self.assertEqual(code, 0)
+            self.assertIn("unchanged .claude", out)
+            self.assertNotIn("moved", out)
+        self.assertFalse(os.path.exists(core_mod.TRASH_DIR))
+        # pruning: only the newest TRASH_KEEP entries survive
+        trash = os.path.join(self._tmp, "trash2")
+        os.makedirs(trash)
+        for i in range(core_mod.TRASH_KEEP + 5):
+            p = os.path.join(trash, f"old.{i}")
+            with open(p, "w") as f:
+                f.write("x")
+            os.utime(p, (1_600_000_000 + i, 1_600_000_000 + i))
+        removed = core_mod.prune_trash(trash)
+        self.assertEqual(len(removed), 5)
+        left = sorted(os.listdir(trash), key=lambda n: int(n.split(".")[1]))
+        self.assertEqual(len(left), core_mod.TRASH_KEEP)
+        self.assertEqual(left[0], "old.5")  # the oldest five went
+        # and restore() prunes after it moved something
+        with mock.patch.object(core_mod, "TRASH_KEEP", 1):
+            with open(os.path.join(self.proj, ".claude", "new.txt"), "w") as f:
+                f.write("new\n")
+            self._cli("snap", "-m", "with new")
+            self._cli("undo")  # .claude differs now -> moved to trash
+            self.assertEqual(len(os.listdir(core_mod.TRASH_DIR)), 1)
+            with open(os.path.join(self.proj, ".claude", "new2.txt"), "w") as f:
+                f.write("new2\n")
+            self._cli("snap", "-m", "with new2")
+            self._cli("undo")
+            self.assertEqual(len(os.listdir(core_mod.TRASH_DIR)), 1)
+
+    def test_guard_names_project_relative_file_under_home(self):
+        # For a project under $HOME every rel was __home/code/projH/...,
+        # so the guard said "__home/code/projH/CLAUDE.md shrank", not
+        # "CLAUDE.md" as the README shows.
+        proj = os.path.join(self._home, "code", "projH")
+        os.makedirs(proj)
+        claude = os.path.join(proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("rule\n" * 30)
+        user_mem = os.path.join(self._home, ".claude", "CLAUDE.md")
+        os.makedirs(os.path.dirname(user_mem))
+        with open(user_mem, "w") as f:
+            f.write("memory\n" * 20)
+        self._cli_root(proj, "init")
+        self.assertEqual(core_mod._rel(claude, proj), "CLAUDE.md")
+        self.assertEqual(core_mod._rel(user_mem, proj), "__home/.claude/CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("- bullet\n")
+        with open(user_mem, "w") as f:
+            f.write("- gone\n")
+        _, out = self._cli_root(proj, "snap", "-m", "v2")
+        self.assertIn("guard: CLAUDE.md shrank", out)
+        self.assertIn("guard: ~/.claude/CLAUDE.md shrank", out)
+        self.assertNotIn("__home", out)
+
+    def test_corrupt_config_is_kept_and_reported(self):
+        self._cli("init")
+        self._cli("watch", "--add", "NOTES.md")
+        with open(core_mod.CONFIG_PATH, "a") as f:
+            f.write("{{{ not json")
+        with open(core_mod.CONFIG_PATH) as f:
+            broken = f.read()
+        code, out, err = self._cli_err(self.proj, "snap", "-m", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("error: watch config", err)
+        self.assertIn(core_mod.CONFIG_PATH, err)
+        self.assertNotIn("Traceback", err)
+        with open(core_mod.CONFIG_PATH) as f:
+            self.assertEqual(f.read(), broken)  # not replaced
+        self.assertIn("NOTES.md", broken)  # the watch list is still there
+
+    def test_corrupt_manifest_is_a_clean_error(self):
+        self._cli("init")
+        with open(os.path.join(core_mod.REPO_DIR, "manifest.json"), "w") as f:
+            f.write("not json")
+        core_mod._git(core_mod.REPO_DIR, "add", "-A")
+        core_mod._git(core_mod.REPO_DIR, "commit", "-q", "-m", "tampered")
+        code, out, err = self._cli_err(self.proj, "log")
+        self.assertEqual(code, 2)
+        self.assertIn("corrupt manifest.json", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_diet_counts_only_files_loaded_into_context(self):
+        # diet counted .claude/settings.json and .gitattributes as
+        # context-eaters and ignored IGNORE_PATTERNS (transcripts, logs).
+        rules = os.path.join(self.proj, ".claude", "rules")
+        os.makedirs(rules)
+        with open(os.path.join(rules, "testing.md"), "w") as f:
+            f.write("Always run the tests before you claim success.\n")
+        with open(os.path.join(self.proj, ".claude", ".gitattributes"), "w") as f:
+            f.write("* text=auto\n")
+        with open(os.path.join(self.proj, ".claude", "debug.log"), "w") as f:
+            f.write("x" * 5000)
+        tdir = os.path.join(self.proj, ".claude", "transcripts")
+        os.makedirs(tdir)
+        with open(os.path.join(tdir, "s.jsonl"), "w") as f:
+            f.write("y" * 5000)
+        cmds = os.path.join(self.proj, ".claude", "commands")
+        os.makedirs(cmds)
+        with open(os.path.join(cmds, "deploy.md"), "w") as f:
+            f.write("on-demand skill text\n")
+        report = diet_mod.analyze(self.proj)
+        names = {os.path.relpath(f["path"], self.proj).replace(os.sep, "/")
+                 for f in report["files"]}
+        self.assertEqual(names, {"CLAUDE.md", ".claude/rules/testing.md"})
+        self.assertLess(report["total_chars"], 200)
+        self.assertEqual(report["n_not_context"], 3)  # settings, attrs, cmd
+        rendered = diet_mod.render(report)
+        self.assertIn("Files loaded into context: 2", rendered)
+        self.assertIn("3 other watched file(s)", rendered)
+        self.assertNotIn("settings.json", rendered)
+
+    def test_log_finds_this_projects_snapshots_behind_many_others(self):
+        # log() fetched a fixed window (max(limit*5, 100) commits) and
+        # filtered by project afterwards, so a project whose snapshots
+        # sat behind 100+ of another project's was reported as having
+        # none — and undo said "nothing to restore".
+        proj_a, proj_b = self.proj, make_project()
+        self._cli_root(proj_a, "init")
+        a_sha = core_mod.log(1, project_root=proj_a)[0]["sha"]
+        self._cli_root(proj_b, "snap", "-m", "B")
+        for i in range(105):  # B's manifest stays in the tree
+            core_mod._git(core_mod.REPO_DIR, "commit", "-q", "--allow-empty",
+                          "-m", f"B noise {i}")
+        snaps = core_mod.log(1, project_root=proj_a)
+        self.assertEqual([s["sha"] for s in snaps], [a_sha])
+        _, out = self._cli_root(proj_a, "log")
+        self.assertIn(a_sha[:7], out)
+        self.assertNotIn("noise", out)
+
+    def test_tilde_backslash_watch_entry_expands(self):
+        # `~\x.md` (Windows spelling) never matched startswith("~/") and
+        # was looked up relative to the project.
+        extra = os.path.join(self._home, "extra.md")
+        with open(extra, "w") as f:
+            f.write("extra\n")
+        self._cli("init")
+        self._cli("watch", "--add", "~\\extra.md")
+        self.assertIn(os.path.abspath(extra), core_mod.watched_paths(self.proj))
+        self.assertEqual(core_mod._rel(extra, self.proj), "__home/extra.md")
+
+    def test_init_takes_first_snapshot_so_undo_works_at_once(self):
+        # Right after the quickstart, the first clobber had nothing to
+        # undo to ("nothing to restore").
+        code, out = self._cli("init")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"snapshot [0-9a-f]{7} \(initial\)")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("- one bullet\n")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        # second init: no second initial snapshot
+        self._cli("init")
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages.count("initial snapshot"), 1)
+
+    def test_log_empty_repo_says_no_snapshots(self):
+        empty = tempfile.mkdtemp()
+        self._cli_root(empty, "init")
+        code, out = self._cli_root(empty, "log")
+        self.assertEqual(code, 0)
+        self.assertIn("no snapshots yet", out)
+        code, out = self._cli_root(empty, "diff")
+        self.assertEqual(code, 2)
+        self.assertIn("no snapshots yet", out)
+
+    def test_install_hooks_write_does_not_say_rerun_with_write(self):
+        settings = os.path.join(self._tmp, "settings.json")
+        with mock.patch.object(cli_mod, "CLAUDE_SETTINGS", settings):
+            code, out = self._cli("install-hooks", "--write")
+        self.assertEqual(code, 0)
+        self.assertIn(f"merged hooks into {settings}", out)
+        self.assertNotIn("re-run with --write", out)
+        self.assertNotIn("Copy the JSON", out)
+        self.assertTrue(os.path.isfile(settings))
+
+    def test_undo_report_is_short(self):
+        self._cli("init")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(os.path.join(self.proj, ".claude", "new.txt"), "w") as f:
+            f.write("new\n")
+        with open(claude, "w") as f:
+            f.write("nuked\n")
+        self._cli("snap", "-m", "v2")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^undone 1 step\(s\) -> [0-9a-f]{7}  initial snapshot$")
+        self.assertIn("  restored CLAUDE.md", lines)
+        moved = [ln for ln in lines if ln.startswith("  moved ")]
+        self.assertEqual(len(moved), 1)
+        # (the test trash dir is not under the fake home; in real use the
+        # destination reads ~/.sessionsteward/trash/.claude.<time>)
+        self.assertRegex(moved[0], r"^  moved \.claude -> \S+trash[/\\]\.claude\.\d+$")
+        self.assertNotIn(self.proj, out)  # no absolute project paths
+        self.assertEqual(cli_mod._short(
+            os.path.join(self._home, ".sessionsteward", "trash", "x.1"),
+            self.proj), os.path.join("~", ".sessionsteward", "trash", "x.1"))
+
+    def test_auto_memory_dir_watched_when_present(self):
+        # Claude Code's auto memory lives in
+        # ~/.claude/projects/<project>/memory/ (<project> = the repo or
+        # project path with non-alphanumerics replaced by '-'). It is
+        # watched by default when it exists.
+        slug = core_mod._project_slug(os.path.abspath(self.proj))
+        self.assertRegex(slug, r"^[A-Za-z0-9-]+$")
+        mem = os.path.join(self._home, ".claude", "projects", slug, "memory")
+        os.makedirs(mem)
+        index = os.path.join(mem, "MEMORY.md")
+        with open(index, "w") as f:
+            f.write("- prefers short answers\n" * 10)
+        self.assertEqual(core_mod.auto_memory_dir(self.proj), mem)
+        self.assertIn(os.path.abspath(mem), core_mod.watched_paths(self.proj))
+        self._cli("init")
+        with open(index, "w") as f:
+            f.write("- gone\n")
+        _, out = self._cli("snap", "-m", "v2")
+        self.assertIn("guard: ~/.claude/projects/", out)
+        self.assertIn("memory/MEMORY.md shrank", out)
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        with open(index) as f:
+            self.assertEqual(f.read(), "- prefers short answers\n" * 10)
+        # a project without one simply has nothing to watch there
+        self.assertIsNone(core_mod.auto_memory_dir(tempfile.mkdtemp()))
+        # the memory index counts as context in `diet`, topic files don't
+        with open(os.path.join(mem, "topic.md"), "w") as f:
+            f.write("details\n")
+        report = diet_mod.analyze(self.proj)
+        paths = [f["path"] for f in report["files"]]
+        self.assertIn(index, paths)
+        self.assertNotIn(os.path.join(mem, "topic.md"), paths)
+
+    def test_blob_ids_match_git(self):
+        # worktree_matches_snapshot compares locally computed git blob ids
+        # against ls-tree, instead of one `git show` per file.
+        self._cli("init")
+        head = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        tree = core_mod.snapshot_tree(head)
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        self.assertIn(claude, tree)
+        self.assertIn(os.path.join(self.proj, ".claude", "settings.json"), tree)
+        live = core_mod.live_tree(core_mod.watched_paths(self.proj))
+        self.assertEqual(live, tree)
+        self.assertEqual(tree[claude], core_mod._git(
+            core_mod.REPO_DIR, "hash-object", claude).strip())
+        with open(claude, "a") as f:
+            f.write("x")
+        self.assertFalse(core_mod.worktree_matches_snapshot(head, self.proj))
+        self.assertIsNone(core_mod.current_position(
+            core_mod.log(50, project_root=self.proj), self.proj))
 
 
 if __name__ == "__main__":

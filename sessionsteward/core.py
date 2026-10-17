@@ -1,15 +1,20 @@
 """Snapshot backend: git-versions watched files. Every snap is a commit.
 
 Layout inside the snapshots repo:
-  files/<rel>          mirrored watched files
+  files/<rel>          mirrored watched files (only this snapshot's project)
   manifest.json        {rel: abspath} for the latest snap
 
-rel = path relative to project root, or __home/... for home files.
+rel is the path relative to the project root; files outside the project
+are mirrored under __home/... (inside your home directory) or
+__abs/<drive-or-root>/... (anywhere else). A mirror path can therefore
+never climb out of files/ — and snap() verifies that before touching
+anything.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import io
 import json
 import os
@@ -27,10 +32,19 @@ REPO_DIR = os.path.expanduser("~/.sessionsteward/snapshots")
 CONFIG_PATH = os.path.expanduser("~/.sessionsteward/config.json")
 TRASH_DIR = os.path.expanduser("~/.sessionsteward/trash")
 
+# Undo/restore never delete: replaced files and directories go to
+# TRASH_DIR. Only the newest TRASH_KEEP entries are kept there.
+TRASH_KEEP = 20
+
+# Claude Code's auto-memory directory: the <project> folder name is derived
+# from the project's git repository (or its root outside git); see
+# auto_memory_dir(). Only watched when it exists.
+AUTO_MEMORY = "~/.claude/projects/<project>/memory"
+
 # ~/.claude/CLAUDE.md is Claude Code's user-level memory; CLAUDE.local.md
 # is the per-project private memory file.
 DEFAULT_WATCH = ["CLAUDE.md", "CLAUDE.local.md", ".claude", "AGENTS.md",
-                 "~/.claude/CLAUDE.md"]
+                 "~/.claude/CLAUDE.md", AUTO_MEMORY]
 
 # Names skipped when walking watched directories (snap + watch daemon).
 # Transcripts and logs balloon the snapshots repo; they are never
@@ -57,6 +71,10 @@ class StewardError(Exception):
     """Base for clean, user-facing sessionsteward errors."""
 
 
+class GitError(StewardError, RuntimeError):
+    """git is missing, or a git command failed (stale index.lock, ...)."""
+
+
 class NothingToRestoreError(StewardError):
     """Raised when a snapshot has no file manifest (e.g. the init commit)."""
 
@@ -75,15 +93,28 @@ def _norm_root(root: str | None) -> str | None:
     return os.path.abspath(os.path.expanduser(root))
 
 
+def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProcess:
+    """subprocess.run of a git command with the failure modes that are not
+    git's own exit code turned into GitError: no git on PATH, a hang."""
+    try:
+        return subprocess.run([*GIT, "-C", repo, *args], capture_output=True,
+                              timeout=60, **kw)
+    except FileNotFoundError:
+        raise GitError("git not found — sessionsteward needs git on PATH "
+                       "(https://git-scm.com/downloads)") from None
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git {' '.join(args)} did not finish within 60s") \
+            from None
+
+
 def _git(repo: str, *args: str) -> str:
     # git prints paths as UTF-8 bytes on every platform; decode them the
     # way os.walk() names files so the two always compare equal.
-    p = subprocess.run([*GIT, "-C", repo, *args], capture_output=True,
-                       encoding="utf-8", errors="surrogateescape",
-                       timeout=60)
+    p = _run_git(repo, args, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: "
-                           f"{p.stderr.strip()[:200]}")
+        # one line: hook output and `error:` lines must stay greppable
+        raise GitError(f"git {' '.join(args)} failed: "
+                       f"{' '.join(p.stderr.split())[:200]}")
     return p.stdout
 
 
@@ -120,16 +151,29 @@ def init_repo() -> str:
 
 
 def load_config() -> dict:
+    """The watch config. A missing file means defaults; a corrupt one is
+    an error (and is left in place) — silently replacing it would throw
+    away the user's watch list."""
     try:
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
-    except (OSError, ValueError):
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
         return {"watch": []}
+    try:
+        cfg = json.loads(raw)
+    except ValueError as e:
+        raise StewardError(
+            f"watch config {CONFIG_PATH} is not valid JSON ({e}); fix it "
+            f"or delete it to start from the defaults (it was left as is)")
+    if not isinstance(cfg, dict):
+        raise StewardError(f"watch config {CONFIG_PATH} must be a JSON "
+                           f"object (it was left as is)")
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 
@@ -167,33 +211,159 @@ def edit_watch_list(cfg: dict, add: list[str] = (),
     return cfg
 
 
+def _claude_config_dir() -> str:
+    # normpath: expanduser("~/.claude") keeps the forward slash on Windows,
+    # which would otherwise leak into every path built from it.
+    return os.path.normpath(os.environ.get("CLAUDE_CONFIG_DIR")
+                            or os.path.expanduser("~/.claude"))
+
+
+def _project_slug(path: str) -> str:
+    """Claude Code names a project's folder under ~/.claude/projects/ after
+    its absolute path with every non-alphanumeric character replaced by
+    '-' (/home/me/proj -> -home-me-proj, C:\\code\\proj -> C--code-proj)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def auto_memory_dir(project_root: str) -> str | None:
+    """Claude Code's auto-memory directory for project_root
+    (~/.claude/projects/<project>/memory), or None when none exists.
+
+    <project> is derived from the git repository the project is in, so a
+    subdirectory or worktree shares the main checkout's memory; outside
+    git it is the project root itself. Candidates are tried from the
+    repository root down to project_root, and only an existing directory
+    is returned — a guess that is wrong on some setup just leaves the
+    memory dir unwatched (add it with `watch --add` then).
+    """
+    root = _norm_root(project_root)
+    candidates = []
+    try:
+        p = _run_git(root, ("rev-parse", "--path-format=absolute",
+                            "--git-common-dir", "--show-toplevel"),
+                     encoding="utf-8", errors="surrogateescape")
+        if p.returncode == 0:
+            common, top = (p.stdout.splitlines() + ["", ""])[:2]
+            if common.strip():
+                candidates.append(os.path.dirname(os.path.abspath(common)))
+            if top.strip():
+                candidates.append(os.path.abspath(top))
+    except GitError:
+        pass
+    candidates.append(root)
+    projects = os.path.join(_claude_config_dir(), "projects")
+    for cand in candidates:
+        d = os.path.join(projects, _project_slug(cand), "memory")
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _expand_watch_entry(rel: str, project_root: str) -> str | None:
+    """Absolute path for a watch-list entry, or None when it has no
+    location (the auto-memory dir of a project without one)."""
+    if rel == AUTO_MEMORY:
+        return auto_memory_dir(project_root)
+    if rel[:1] == "~" and (len(rel) == 1 or rel[1] in "/\\"):
+        # `~\x.md` (Windows spelling) must expand like `~/x.md` everywhere
+        return os.path.expanduser("~" + rel[1:].replace("\\", os.sep))
+    if os.path.isabs(rel):
+        return rel
+    return os.path.join(project_root, rel)
+
+
 def watched_paths(project_root: str) -> list[str]:
     """Absolute paths of watched files that currently exist."""
     out = []
     for rel in watch_list():
-        if rel.startswith("~/"):
-            p = os.path.expanduser(rel)
-        elif os.path.isabs(rel):
-            p = rel
-        else:
-            p = os.path.join(project_root, rel)
-        if os.path.exists(p):
-            out.append(os.path.abspath(p))
+        p = _expand_watch_entry(rel, project_root)
+        if p and os.path.exists(p):
+            ap = os.path.abspath(p)
+            if ap not in out:
+                out.append(ap)
     return out
+
+
+def _inside(path: str, parent: str) -> bool:
+    return path == parent or path.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _abs_rel(abspath: str) -> str:
+    """__abs/<drive-or-root>/<path> for a file outside home and project.
+    The drive letter or UNC host is a plain name, never `D:` (a colon is
+    not a valid filename character on Windows)."""
+    drive, tail = os.path.splitdrive(abspath)
+    if drive:
+        label = drive.strip("\\/:").replace("\\", "/")
+        if drive.startswith(("\\\\", "//")):
+            label = "UNC/" + label
+        tail = tail.replace("\\", "/")
+    else:
+        label = "root"
+        tail = tail.replace(os.sep, "/")
+    return f"__abs/{label}/{tail.lstrip('/')}"
 
 
 def _rel(abspath: str, project_root: str) -> str:
     """Path of abspath inside files/, always with forward slashes (git's
-    tree paths are '/'-separated on every platform)."""
-    home = os.path.expanduser("~")
-    if abspath == home or abspath.startswith(home + os.sep):
+    tree paths are '/'-separated on every platform).
+
+    Inside the project: the project-relative path, so a guard line names
+    `CLAUDE.md` whether or not the project lives under your home dir.
+    Elsewhere under home: __home/<path from home>. Anywhere else:
+    __abs/<drive-or-root>/<path>. Never a relpath with `..` — that used to
+    let a mirror path escape files/ and, at the wrong depth, resolve to
+    the watched file itself.
+    """
+    project_root = _norm_root(project_root)
+    home = os.path.abspath(os.path.expanduser("~"))
+    if abspath == project_root or abspath == home:
+        raise StewardError(f"cannot watch {abspath}: it is the project root "
+                           f"or your home directory itself")
+    if _inside(abspath, project_root):
+        rel = os.path.relpath(abspath, project_root)
+    elif _inside(abspath, home):
         rel = os.path.join("__home", os.path.relpath(abspath, home))
     else:
-        try:
-            rel = os.path.relpath(abspath, project_root)
-        except ValueError:
-            rel = abspath.lstrip(os.sep).replace(os.sep, "_")
+        return _abs_rel(abspath)
     return rel.replace(os.sep, "/")
+
+
+def display_rel(rel: str) -> str:
+    """A snapshot rel as the user knows the path: CLAUDE.md, ~/.claude/…,
+    /abs/… or D:/…"""
+    if rel.startswith("__home/"):
+        return "~/" + rel[len("__home/"):]
+    if rel.startswith("__abs/"):
+        rest = rel[len("__abs/"):]
+        if rest.startswith("root/"):
+            return "/" + rest[len("root/"):]
+        if rest.startswith("UNC/"):
+            return "//" + rest[len("UNC/"):]
+        drive, _, tail = rest.partition("/")
+        return f"{drive}:/{tail}"
+    return rel
+
+
+def _mirror_path(files_dir: str, rel: str) -> str:
+    """files_dir/rel, verified to stay inside files_dir. Belt and braces:
+    _rel() can no longer produce an escaping path, but nothing in the
+    repo is removed or written before this check passes."""
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in parts):
+        raise StewardError(f"refusing to mirror {rel!r}: not a plain "
+                           f"relative path")
+    dest = os.path.join(files_dir, *parts)
+    base = os.path.realpath(files_dir)
+    real = os.path.realpath(dest)
+    try:
+        ok = os.path.commonpath([base, real]) == base and real != base
+    except ValueError:  # different drives on Windows
+        ok = False
+    if not ok:
+        raise StewardError(f"refusing to mirror {rel!r}: {dest} is outside "
+                           f"the snapshots repo")
+    return dest
 
 
 def _make_writable(path: str) -> None:
@@ -231,21 +401,31 @@ def snap(project_root: str, message: str) -> str:
         init_repo()
     _ensure_attributes()
     paths = watched_paths(project_root)
-    manifest = {}
     files_dir = os.path.join(REPO_DIR, "files")
+    # Plan every mirror path first: nothing is removed or written until
+    # all of them are known to sit inside files/.
+    plan = []
     for ap in paths:
         rel = _rel(ap, project_root)
-        manifest[rel] = ap
-        dest = os.path.join(files_dir, rel)
+        plan.append((rel, ap, _mirror_path(files_dir, rel)))
+    manifest = {rel: ap for rel, ap, _ in plan}
+    # files/ holds exactly this snapshot's files: stale mirrors of other
+    # projects (the repo is shared) would otherwise ride along in every
+    # commit and show up in `diff`.
+    if os.path.lexists(files_dir):
+        _remove_mirror(files_dir)
+    os.makedirs(files_dir)
+    for rel, ap, dest in plan:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.lexists(dest):
-            _remove_mirror(dest)
         # copyfile, not copy2/copytree's default: the mirror must never
         # inherit read-only modes, or the next snap cannot replace it.
+        # (dirs_exist_ok / the lexists check: a watched file inside a
+        # watched dir, e.g. ~/.claude/CLAUDE.md with ~ as the project.)
         if os.path.isdir(ap):
             shutil.copytree(ap, dest, copy_function=shutil.copyfile,
-                            ignore=shutil.ignore_patterns(*IGNORE_PATTERNS))
-        else:
+                            ignore=shutil.ignore_patterns(*IGNORE_PATTERNS),
+                            dirs_exist_ok=True)
+        elif not os.path.lexists(dest):
             shutil.copyfile(ap, dest)
     # No timestamp in the manifest: identical content must produce an
     # identical tree so the re-snap below is skipped. (It used to carry
@@ -264,25 +444,65 @@ def snap(project_root: str, message: str) -> str:
     return _git(REPO_DIR, "rev-parse", "HEAD").strip()
 
 
+def _manifests_at(shas: list[str]) -> dict[str, dict]:
+    """{sha: manifest} for many snapshots in one git call (cat-file
+    --batch); a commit without manifest.json maps to {}."""
+    if not shas:
+        return {}
+    p = _run_git(REPO_DIR, ("cat-file", "--batch"),
+                 input="".join(f"{s}:manifest.json\n" for s in shas).encode())
+    if p.returncode != 0:
+        raise GitError(f"git cat-file --batch failed: "
+                       f"{p.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    out, data, pos = {}, p.stdout, 0
+    for sha in shas:
+        nl = data.index(b"\n", pos)
+        header = data[pos:nl].decode("utf-8", "replace").split()
+        pos = nl + 1
+        if len(header) < 3 or header[1] != "blob":  # "<spec> missing"
+            out[sha] = {}
+            continue
+        size = int(header[2])
+        raw = data[pos:pos + size]
+        pos += size + 1
+        try:
+            out[sha] = json.loads(raw.decode("utf-8", "surrogateescape"))
+        except ValueError as e:
+            raise StewardError(f"snapshot {sha[:7]} has a corrupt "
+                               f"manifest.json ({e})")
+    return out
+
+
+def _manifest_at(sha: str) -> dict:
+    try:
+        full = _git(REPO_DIR, "rev-parse", "--verify", "--quiet",
+                    f"{sha}^{{commit}}").strip()
+    except GitError:
+        return {}
+    return _manifests_at([full]).get(full, {})
+
+
 def log(limit: int = 20, project_root: str | None = None) -> list[dict]:
     """List snapshots, newest first.
 
     When project_root is given, only snapshots whose manifest records
     that project root are returned (manifest-less commits like the
-    initial `init` commit belong to no project and are excluded).
+    initial `init` commit belong to no project and are excluded). The
+    whole history is scanned — the repo is shared between projects, so
+    this project's snapshots may sit behind any number of others'.
     """
-    # When filtering by project we must scan past other projects'
-    # commits; fetch a wider window (documented bound for v1).
-    fetch = max(limit * 5, 100) if project_root else limit
-    out = _git(REPO_DIR, "log", f"-{fetch}",
-               "--pretty=format:%H|%ad|%s", "--date=iso-local")
+    args = ["log", "--pretty=format:%H|%ad|%s", "--date=iso-local"]
+    if project_root is None:
+        args.insert(1, f"-{limit}")
+    out = _git(REPO_DIR, *args)
     want = _norm_root(project_root)
+    rows = [line.split("|", 2) for line in out.splitlines() if line]
+    manifests = _manifests_at([r[0] for r in rows]) if want else {}
     snaps = []
-    for line in out.splitlines():
-        sha, date, msg = line.split("|", 2)
+    for sha, date, msg in rows:
         entry = {"sha": sha, "date": date, "message": msg}
         if want is not None:
-            m = _manifest_at(sha)
+            m = manifests.get(sha) or {}
             if not m or _norm_root(m.get("project_root")) != want:
                 continue
             entry["project_root"] = m.get("project_root")
@@ -292,14 +512,6 @@ def log(limit: int = 20, project_root: str | None = None) -> list[dict]:
     return snaps
 
 
-def _manifest_at(sha: str) -> dict:
-    try:
-        raw = _git(REPO_DIR, "show", f"{sha}:manifest.json")
-    except RuntimeError:
-        return {}
-    return json.loads(raw)
-
-
 def _read_snapshot_file(sha: str, rel: str) -> tuple[bytes | None, bool]:
     """(content, is_dir) for files/<rel> at sha."""
     ls = _git(REPO_DIR, "ls-tree", sha, f"files/{rel}").strip()
@@ -307,8 +519,7 @@ def _read_snapshot_file(sha: str, rel: str) -> tuple[bytes | None, bool]:
         return None, False
     if ls.startswith("040000"):
         return None, True
-    p = subprocess.run([*GIT, "-C", REPO_DIR, "show", f"{sha}:files/{rel}"],
-                       capture_output=True, timeout=60)
+    p = _run_git(REPO_DIR, ("show", f"{sha}:files/{rel}"))
     return (p.stdout if p.returncode == 0 else None), False
 
 
@@ -325,6 +536,32 @@ def _move_to_trash(ap: str, trash_dir: str) -> str:
     return dest
 
 
+def prune_trash(trash_dir: str, keep: int | None = None) -> list[str]:
+    """Delete all but the newest `keep` (default TRASH_KEEP) trash
+    entries. Returns the removed entries."""
+    keep = TRASH_KEEP if keep is None else keep
+    try:
+        names = os.listdir(trash_dir)
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        p = os.path.join(trash_dir, name)
+        try:
+            entries.append((os.lstat(p).st_mtime, p))
+        except OSError:
+            pass
+    entries.sort(reverse=True)
+    removed = []
+    for _, p in entries[keep:]:
+        try:
+            _remove_mirror(p)
+            removed.append(p)
+        except OSError:
+            pass
+    return removed
+
+
 def check_restore(sha: str, project_root: str | None = None) -> dict:
     """Validate that sha is restorable for project_root.
 
@@ -335,9 +572,8 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
     """
     manifest = _manifest_at(sha)
     if not manifest:
-        p = subprocess.run(
-            [*GIT, "-C", REPO_DIR, "rev-parse", "--verify", "--quiet",
-             f"{sha}^{{commit}}"], capture_output=True, timeout=60)
+        p = _run_git(REPO_DIR, ("rev-parse", "--verify", "--quiet",
+                                f"{sha}^{{commit}}"))
         if p.returncode == 0:
             raise NothingToRestoreError(
                 f"nothing to restore — no snapshots yet "
@@ -354,64 +590,115 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
     return manifest
 
 
-def _dir_matches(sha: str, rel: str, ap: str) -> bool:
-    """True if the on-disk dir matches the snapshot's recorded tree."""
-    if not os.path.isdir(ap) or os.path.islink(ap):
-        return False
-    prefix = f"files/{rel}/"
-    snap_names = set()
-    for line in _git(REPO_DIR, "ls-tree", "-r", "--name-only",
-                     sha, f"files/{rel}").splitlines():
-        if line.startswith(prefix):
-            snap_names.add(line[len(prefix):])
-    disk_names = set()
-    for root, dirs, files in os.walk(ap):
-        dirs[:] = [d for d in dirs if not _ignored_name(d)]
-        for fn in files:
-            if _ignored_name(fn):
-                continue
-            fp = os.path.join(root, fn)
-            name = os.path.relpath(fp, ap).replace(os.sep, "/")
-            disk_names.add(name)
-            p = subprocess.run(
-                [*GIT, "-C", REPO_DIR, "show", f"{sha}:{prefix}{name}"],
-                capture_output=True, timeout=60)
-            if p.returncode != 0:
-                return False
-            try:
-                with open(fp, "rb") as f:
-                    if f.read() != p.stdout:
-                        return False
-            except OSError:
-                return False
-    return snap_names == disk_names
+# ---------------------------------------------------------------------------
+# Tree comparison: git blob ids, computed locally
+# ---------------------------------------------------------------------------
+
+def iter_files(paths: list[str]):
+    """Yield every file under the watched paths (directories walked,
+    IGNORE_PATTERNS applied), in a stable order."""
+    for ap in paths:
+        if os.path.isdir(ap):
+            for root, dirs, files in os.walk(ap):
+                dirs[:] = sorted(d for d in dirs if not _ignored_name(d))
+                for fn in sorted(files):
+                    if not _ignored_name(fn):
+                        yield os.path.join(root, fn)
+        elif os.path.exists(ap):
+            yield ap
 
 
-def worktree_matches_snapshot(sha: str, project_root: str) -> bool:
+def _blob_id(data: bytes, algo: str = "sha1") -> str:
+    """git's object id for a blob with this content."""
+    h = hashlib.new(algo)
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+def live_tree(paths: list[str], algo: str = "sha1") -> dict[str, str] | None:
+    """{abspath: blob id} for every file under `paths`; None when a file
+    cannot be read."""
+    tree = {}
+    for fp in iter_files(paths):
+        try:
+            with open(fp, "rb") as f:
+                tree[fp] = _blob_id(f.read(), algo)
+        except OSError:
+            return None
+    return tree
+
+
+def snapshot_tree(sha: str, manifest: dict | None = None) -> dict[str, str]:
+    """{abspath: blob id} recorded by snapshot sha, mapped through its
+    manifest (files/<rel>/<sub> -> <abspath of rel>/<sub>)."""
+    manifest = _manifest_at(sha) if manifest is None else manifest
+    files = manifest.get("files", {})
+    if not files:
+        return {}
+    out = {}
+    listing = _git(REPO_DIR, "ls-tree", "-r", sha, "--",
+                   *(f"files/{rel}" for rel in files))
+    for line in listing.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or parts[1] != "blob":
+            continue
+        rel = path[len("files/"):]
+        if rel in files:
+            out[files[rel]] = parts[2]
+            continue
+        for key, ap in files.items():
+            if rel.startswith(key + "/"):
+                sub = rel[len(key) + 1:].split("/")
+                out[os.path.join(ap, *sub)] = parts[2]
+                break
+    return out
+
+
+def _blob_algo(tree: dict[str, str]) -> str:
+    return "sha256" if any(len(v) == 64 for v in tree.values()) else "sha1"
+
+
+def worktree_matches_snapshot(sha: str, project_root: str,
+                              manifest: dict | None = None) -> bool:
     """True if the current watched files are byte-identical to the
     snapshot's recorded state (redo is possible without a pre-snap)."""
-    manifest = _manifest_at(sha)
+    manifest = _manifest_at(sha) if manifest is None else manifest
     if not manifest:
         return False
-    snap_files = manifest.get("files", {})
-    current = {os.path.abspath(p) for p in watched_paths(project_root)}
-    if set(snap_files.values()) != current:
+    current = watched_paths(project_root)
+    if set(manifest.get("files", {}).values()) != set(current):
         return False
-    for rel, ap in snap_files.items():
-        data, is_dir = _read_snapshot_file(sha, rel)
-        if is_dir:
-            if not _dir_matches(sha, rel, ap):
-                return False
-        elif data is None:
-            return False
-        else:
-            try:
-                with open(ap, "rb") as f:
-                    if f.read() != data:
-                        return False
-            except OSError:
-                return False
-    return True
+    snap = snapshot_tree(sha, manifest)
+    live = live_tree(current, _blob_algo(snap))
+    return live is not None and live == snap
+
+
+def current_position(snaps: list[dict], project_root: str) -> int | None:
+    """Index of the newest snapshot the live files match, or None when
+    the current state is not snapshotted (dirty)."""
+    if not snaps:
+        return None
+    manifests = _manifests_at([s["sha"] for s in snaps])
+    current = watched_paths(project_root)
+    live = None
+    for i, s in enumerate(snaps):
+        m = manifests.get(s["sha"]) or {}
+        if not m or set(m.get("files", {}).values()) != set(current):
+            continue
+        snap = snapshot_tree(s["sha"], m)
+        if live is None:
+            live = live_tree(current, _blob_algo(snap))
+            if live is None:
+                return None
+        if live == snap:
+            return i
+    return None
+
+
+def _subtree(tree: dict[str, str], ap: str) -> dict[str, str]:
+    return {k: v for k, v in tree.items() if _inside(k, ap)}
 
 
 def _latest_manifest_for_project(project_root: str | None) -> dict:
@@ -437,7 +724,8 @@ def restore(sha: str, trash_dir: str | None = None,
             project_root: str | None = None) -> list[str]:
     """Restore watched files from a snapshot. Files that exist now but
     didn't in the snapshot are moved to trash instead of deleted —
-    directories included (never `rmtree`'d).
+    directories included (never `rmtree`'d). Paths already at the
+    snapshot's state are left alone (reported as `unchanged …`).
 
     Raises NothingToRestoreError for a manifest-less snapshot (e.g. the
     `init` commit) and CrossProjectError when project_root is given and
@@ -451,13 +739,21 @@ def restore(sha: str, trash_dir: str | None = None,
     # that project's watched files (cross-project clobbering).
     latest = _latest_manifest_for_project(project_root)
     trash_dir = trash_dir or TRASH_DIR
+    moved = False
     for rel, ap in latest.get("files", {}).items():
         if rel not in manifest["files"] and os.path.lexists(ap):
             dest = _move_to_trash(ap, trash_dir)
             restored.append(f"moved {ap} -> {dest}")
+            moved = True
+    snap_tree = snapshot_tree(sha, manifest)
+    algo = _blob_algo(snap_tree)
     for rel, ap in manifest["files"].items():
         data, is_dir = _read_snapshot_file(sha, rel)
         if is_dir:
+            if (os.path.isdir(ap) and not os.path.islink(ap)
+                    and live_tree([ap], algo) == _subtree(snap_tree, ap)):
+                restored.append(f"unchanged {ap}")
+                continue
             # Extract next to the live dir and verify BEFORE touching it,
             # so a failed extract leaves the live dir as it was and the
             # final swap is a same-filesystem rename. tarfile, not `tar`:
@@ -466,10 +762,8 @@ def restore(sha: str, trash_dir: str | None = None,
             os.makedirs(parent, exist_ok=True)
             tmp = tempfile.mkdtemp(prefix=".steward-restore-", dir=parent)
             try:
-                src = os.path.join(tmp, "files", rel)
-                arch = subprocess.run(
-                    [*GIT, "-C", REPO_DIR, "archive", sha, f"files/{rel}"],
-                    capture_output=True, timeout=60)
+                src = os.path.join(tmp, "files", *rel.split("/"))
+                arch = _run_git(REPO_DIR, ("archive", sha, f"files/{rel}"))
                 try:
                     with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tf:
                         if hasattr(tarfile, "tar_filter"):
@@ -487,11 +781,21 @@ def restore(sha: str, trash_dir: str | None = None,
                     # link) to trash before restoring the snapshot copy.
                     dest = _move_to_trash(ap, trash_dir)
                     restored.append(f"moved {ap} -> {dest}")
+                    moved = True
                 os.rename(src, ap)
                 restored.append(ap)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         elif data is not None:
+            if os.path.isfile(ap) and not os.path.islink(ap):
+                try:
+                    with open(ap, "rb") as f:
+                        same = f.read() == data
+                except OSError:
+                    same = False
+                if same:
+                    restored.append(f"unchanged {ap}")
+                    continue
             # One unwritable target (0444 / read-only attribute, or a dir
             # now sitting where the file was) must not abort the restore
             # half-way: report it and carry on with the rest.
@@ -504,6 +808,8 @@ def restore(sha: str, trash_dir: str | None = None,
                                 f"(left untouched)")
                 continue
             restored.append(ap)
+    if moved:
+        prune_trash(trash_dir)
     return restored
 
 
@@ -515,9 +821,8 @@ def skipped(restored: list[str]) -> list[str]:
 
 def _sizes(sha: str) -> dict[str, int]:
     """{path under files/: blob size} at sha, limited to the paths the
-    snapshot's own manifest records. The repo is shared between projects
-    (and files/ keeps stale mirrors), so the whole files/ tree would
-    report other projects' files and hide this project's deletions."""
+    snapshot's own manifest records (the repo is shared between projects,
+    and older repos kept stale mirrors in files/)."""
     rels = list(_manifest_at(sha).get("files", {}))
     if not rels:
         return {}
@@ -543,39 +848,41 @@ def shrunk(sha: str, prev_sha: str, ratio: float = 0.5) -> list[tuple]:
     return hits
 
 
-def guard_lines(sha: str, prev_sha: str) -> list[str]:
+def guard_lines(sha: str, prev_sha: str, hint: str | None = "undo") -> list[str]:
+    """Shrink-guard report lines for snapshot sha against prev_sha.
+
+    hint: "undo" when `sessionsteward undo` would bring the file back
+    (the live files are at sha), "restore" to name the snapshot that has
+    the previous version, None for a purely historical entry.
+    """
+    if hint == "undo":
+        tail = " — `sessionsteward undo` to recover"
+    elif hint == "restore":
+        tail = f" — `sessionsteward restore {prev_sha[:7]}` has the previous version"
+    else:
+        tail = ""
     lines = []
     for rel, o, n in shrunk(sha, prev_sha):
+        name = display_rel(rel)
         if n is None:
-            lines.append(f"  ! guard: {rel} deleted ({o} bytes) — "
-                         f"`sessionsteward undo` to recover")
+            lines.append(f"  ! guard: {name} deleted ({o} bytes){tail}")
         else:
-            lines.append(f"  ! guard: {rel} shrank {o} -> {n} bytes "
-                         f"(-{100 - round(n * 100 / o)}%) — "
-                         f"`sessionsteward undo` to recover")
+            lines.append(f"  ! guard: {name} shrank {o} -> {n} bytes "
+                         f"(-{100 - round(n * 100 / o)}%){tail}")
     return lines
 
 
-def diff(sha1: str, sha2: str = "HEAD") -> str:
+def diff(sha1: str, sha2: str) -> str:
     return _git(REPO_DIR, "diff", f"{sha1}..{sha2}", "--", "files/")
 
 
 def file_mtimes(paths: list[str]) -> dict[str, float]:
     mtimes = {}
-    for ap in paths:
-        if os.path.isdir(ap):
-            for root, dirs, files in os.walk(ap):
-                dirs[:] = [d for d in dirs if not _ignored_name(d)]
-                for fn in files:
-                    if _ignored_name(fn):
-                        continue
-                    fp = os.path.join(root, fn)
-                    try:
-                        mtimes[fp] = os.path.getmtime(fp)
-                    except OSError:
-                        pass
-        elif os.path.exists(ap):
-            mtimes[ap] = os.path.getmtime(ap)
+    for fp in iter_files(paths):
+        try:
+            mtimes[fp] = os.path.getmtime(fp)
+        except OSError:
+            pass
     return mtimes
 
 
@@ -677,7 +984,7 @@ def merge_hooks(settings: dict) -> dict:
 def write_hooks_file(settings_path: str) -> str:
     """Merge hooks into the settings file at settings_path. Returns it."""
     try:
-        with open(settings_path) as f:
+        with open(settings_path, encoding="utf-8") as f:
             settings = json.load(f)
     except (OSError, ValueError):
         settings = {}
@@ -685,7 +992,7 @@ def write_hooks_file(settings_path: str) -> str:
         settings = {}
     merge_hooks(settings)
     os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
-    with open(settings_path, "w") as f:
+    with open(settings_path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
     return settings_path

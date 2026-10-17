@@ -21,24 +21,30 @@ def patch_env(test: unittest.TestCase):
     core_mod.REPO_DIR = os.path.join(tmp, "snapshots")
     core_mod.CONFIG_PATH = os.path.join(tmp, "config.json")
     core_mod.TRASH_DIR = os.path.join(tmp, "trash")
+    # DEFAULT_WATCH includes ~/.claude/CLAUDE.md: point ~ at a temp home
+    # so tests never read or restore the real user-level memory file.
+    home = os.path.join(tmp, "home")
+    os.makedirs(home)
+    for var in ("HOME", "USERPROFILE"):
+        old = os.environ.get(var)
+        os.environ[var] = home
+        test.addCleanup(_restore_var, var, old)
+    test._home = home
     test._tmp = tmp
     test.addCleanup(restore_env, test)
+
+
+def _restore_var(var, old):
+    if old is None:
+        os.environ.pop(var, None)
+    else:
+        os.environ[var] = old
 
 
 def restore_env(test: unittest.TestCase):
     core_mod.REPO_DIR = test._old_repo
     core_mod.CONFIG_PATH = test._old_cfg
     core_mod.TRASH_DIR = test._old_trash
-
-
-def make_project() -> str:
-    proj = tempfile.mkdtemp()
-    with open(os.path.join(proj, "CLAUDE.md"), "w") as f:
-        f.write("# Project\n\nBe helpful.\n")
-    os.makedirs(os.path.join(proj, ".claude"))
-    with open(os.path.join(proj, ".claude", "settings.json"), "w") as f:
-        f.write('{"x": 1}\n')
-    return proj
 
 
 def make_project() -> str:
@@ -171,6 +177,20 @@ class TestSteward(unittest.TestCase):
         rendered = diet_mod.render(report)
         self.assertIn("Duplicated content", rendered)
         self.assertIn("tokens", rendered)
+
+    def test_default_watch_user_and_local_memory(self):
+        # ~/.claude/CLAUDE.md (user memory) and CLAUDE.local.md were not
+        # watched by default, so compaction/overwrites there had no undo.
+        user_mem = os.path.join(self._home, ".claude", "CLAUDE.md")
+        os.makedirs(os.path.dirname(user_mem))
+        with open(user_mem, "w") as f:
+            f.write("user memory\n")
+        local_mem = os.path.join(self.proj, "CLAUDE.local.md")
+        with open(local_mem, "w") as f:
+            f.write("local memory\n")
+        paths = core_mod.watched_paths(self.proj)
+        self.assertIn(os.path.abspath(user_mem), paths)
+        self.assertIn(os.path.abspath(local_mem), paths)
 
     def test_mtimes(self):
         m = core_mod.file_mtimes(core_mod.watched_paths(self.proj))
@@ -351,6 +371,89 @@ class TestSteward(unittest.TestCase):
                         f"old dir not found in trash: {trashed}")
         self.assertTrue(any("moved" in r for r in restored))
 
+    def test_dir_restore_failed_extract_leaves_live_dir(self):
+        # Regression: the live dir was moved to trash BEFORE checking the
+        # extract worked; a bad/failed extract then lost it entirely.
+        from unittest import mock
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        live = os.path.join(self.proj, ".claude")
+        newfile = os.path.join(live, "newfile.txt")
+        with open(newfile, "w") as f:
+            f.write("live work\n")
+        self._cli("snap", "-m", "v2")
+        v1 = next(s["sha"] for s in core_mod.log(50, project_root=self.proj)
+                  if s["message"] == "v1")
+        real_run = core_mod.subprocess.run
+
+        def broken_archive(cmd, *a, **kw):
+            if "archive" in cmd:
+                return core_mod.subprocess.CompletedProcess(
+                    cmd, 0, b"not a tar stream", b"")
+            return real_run(cmd, *a, **kw)
+
+        with mock.patch.object(core_mod.subprocess, "run", broken_archive):
+            restored = core_mod.restore(
+                v1, trash_dir=os.path.join(self._tmp, "trash"),
+                project_root=self.proj)
+        with open(newfile) as f:
+            self.assertEqual(f.read(), "live work\n")
+        self.assertTrue(any(r.startswith("skipped") for r in restored))
+        self.assertFalse(os.path.exists(os.path.join(self._tmp, "trash")))
+        # no staging dir left behind in the project
+        self.assertEqual([n for n in os.listdir(self.proj)
+                          if n.startswith(".steward-restore-")], [])
+
+    def test_crlf_restores_byte_identical(self):
+        # Windows users commonly have core.autocrlf=true globally; the
+        # snapshots repo must still store and restore bytes verbatim.
+        gitcfg = os.path.join(self._tmp, "gitconfig")
+        with open(gitcfg, "w") as f:
+            f.write("[core]\n\tautocrlf = true\n")
+        old = os.environ.get("GIT_CONFIG_GLOBAL")
+        os.environ["GIT_CONFIG_GLOBAL"] = gitcfg
+        self.addCleanup(_restore_var, "GIT_CONFIG_GLOBAL", old)
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        nested = os.path.join(self.proj, ".claude", "notes.md")
+        want = {claude: b"# Project\r\n\r\nBe helpful.\r\n",
+                nested: b"mixed\r\nendings\nhere\r\n"}
+        for p, data in want.items():
+            with open(p, "wb") as f:
+                f.write(data)
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        for p in want:
+            with open(p, "wb") as f:
+                f.write(b"clobbered\n")
+        self._cli("snap", "-m", "v2")
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        for p, data in want.items():
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), data, p)
+
+    def test_guard_warns_on_big_shrink(self):
+        # One snapshot that drops >50% of a watched file (the compaction
+        # / "remember this" overwrite) must be flagged in snap and log.
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        with open(claude, "w") as f:
+            f.write("rule\n" * 30)
+        self._cli("init")
+        self._cli("snap", "-m", "v1")
+        with open(claude, "a") as f:
+            f.write("one more rule\n")  # growth: no warning
+        _, out = self._cli("snap", "-m", "v2")
+        self.assertNotIn("guard", out)
+        with open(claude, "w") as f:
+            f.write("- a single bullet\n")
+        _, out = self._cli("snap", "-m", "v3")
+        self.assertIn("guard: CLAUDE.md shrank", out)
+        _, out = self._cli("log")
+        lines = out.splitlines()
+        self.assertIn("v3", lines[0])
+        self.assertIn("guard: CLAUDE.md shrank", lines[1])
+        self.assertEqual(sum("guard" in ln for ln in lines), 1)
+
     def test_redo_after_undo(self):
         # dirty worktree -> undo auto-snaps "pre-undo" first, so the undo
         # is reversible: restoring the pre-undo snapshot redoes it.
@@ -397,7 +500,7 @@ class TestSteward(unittest.TestCase):
         payload = json.loads(out.split("\n\n")[0])
         precompact = payload["hooks"]["PreCompact"][0]["hooks"][0]["command"]
         sessstart = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        self.assertEqual(precompact, "sessionsteward precompact")
+        self.assertEqual(precompact, core_mod.HOOK_PRECOMPACT_CMD)
         self.assertIn("session start", sessstart)
         self.assertIn("~/.claude/settings.json", out)
 
@@ -418,7 +521,7 @@ class TestSteward(unittest.TestCase):
                          "echo stop")
         # our hooks added
         cmds = json.dumps(merged["hooks"])
-        self.assertIn("sessionsteward precompact", cmds)
+        self.assertIn("-m sessionsteward precompact", cmds)
         self.assertIn("session start", cmds)
         # idempotent: second run adds no duplicates
         before = json.dumps(merged["hooks"], sort_keys=True)
@@ -426,6 +529,40 @@ class TestSteward(unittest.TestCase):
         with open(settings_path) as f:
             after = json.dumps(json.load(f)["hooks"], sort_keys=True)
         self.assertEqual(before, after)
+
+    def test_hook_cmd_uses_absolute_interpreter(self):
+        # A bare `sessionsteward` fails silently in hook shells (no alias,
+        # no venv). Hooks must run this interpreter by absolute path.
+        import shlex
+        import sys
+        for cmd in (core_mod.HOOK_PRECOMPACT_CMD,
+                    core_mod.HOOK_SESSIONSTART_CMD):
+            self.assertFalse(cmd.startswith("sessionsteward"), cmd)
+            if os.name == "nt":
+                self.assertTrue(cmd.startswith(f'"{sys.executable}" '), cmd)
+            else:
+                self.assertEqual(shlex.split(cmd)[:3],
+                                 [sys.executable, "-m", "sessionsteward"])
+
+    def test_hook_cmd_quotes_paths_with_spaces(self):
+        from unittest import mock
+        exe = r"C:\Program Files\Python 3\python.exe"
+        with mock.patch.object(core_mod.sys, "executable", exe), \
+                mock.patch.object(core_mod.os, "name", "nt"):
+            self.assertEqual(core_mod._self_cmd(),
+                             f'"{exe}" -m sessionsteward')
+
+    def test_install_hooks_upgrades_legacy_bare_command(self):
+        settings_path = os.path.join(self._tmp, "settings.json")
+        with open(settings_path, "w") as f:
+            json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+                {"type": "command",
+                 "command": "sessionsteward precompact"}]}]}}, f)
+        core_mod.write_hooks_file(settings_path)
+        with open(settings_path) as f:
+            pre = json.load(f)["hooks"]["PreCompact"]
+        self.assertEqual(core_mod._hook_commands(pre),
+                         [core_mod.HOOK_PRECOMPACT_CMD])
 
     def test_transcripts_not_snapshotted(self):
         tdir = os.path.join(self.proj, ".claude", "transcripts")

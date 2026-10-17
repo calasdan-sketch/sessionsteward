@@ -57,9 +57,17 @@ def cmd_watch_add(args) -> int:
     return 0
 
 
+def _guard(root: str, sha: str) -> None:
+    snaps = core_mod.log(2, project_root=root)
+    if len(snaps) == 2 and snaps[0]["sha"] == sha:
+        for line in core_mod.guard_lines(sha, snaps[1]["sha"]):
+            print(line)
+
+
 def cmd_snap(args) -> int:
     sha = core_mod.snap(args.root, args.message or "manual snapshot")
     print(f"snapshot {sha[:7]}")
+    _guard(args.root, sha)
     return 0
 
 
@@ -67,6 +75,7 @@ def cmd_precompact(args) -> int:
     sha = core_mod.snap(args.root, "pre-compaction snapshot")
     print(f"pre-compaction snapshot {sha[:7]} — "
           f"`sessionsteward diff {sha[:7]}` after, to see what was dropped")
+    _guard(args.root, sha)
     return 0
 
 
@@ -74,8 +83,12 @@ def cmd_log(args) -> int:
     if not core_mod.repo_ready():
         print("no snapshots yet — run `sessionsteward init` first")
         return 0
-    for s in core_mod.log(args.limit, project_root=args.root):
+    snaps = core_mod.log(args.limit + 1, project_root=args.root)
+    for i, s in enumerate(snaps[:args.limit]):
         print(f"{s['sha'][:7]}  {s['date'][:16]}  {s['message']}")
+        if i + 1 < len(snaps):
+            for line in core_mod.guard_lines(s["sha"], snaps[i + 1]["sha"]):
+                print(line)
     return 0
 
 
@@ -169,8 +182,8 @@ def cmd_install_hooks(args) -> int:
     print("Copy the JSON above into the \"hooks\" section of "
           "~/.claude/settings.json, or re-run with --write to merge it "
           "automatically (existing settings are preserved).")
-    print("Wiring: PreCompact -> `sessionsteward precompact`, "
-          "SessionStart -> `sessionsteward snap -m \"session start\"`.")
+    print(f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
+          f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
     if args.write:
         path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
         print(f"merged hooks into {path}")
@@ -188,6 +201,7 @@ def cmd_watch(args) -> int:
             if now != mtimes:
                 sha = core_mod.snap(args.root, "auto: files changed")
                 print(f"change detected -> snapshot {sha[:7]}")
+                _guard(args.root, sha)
                 mtimes = now
     except KeyboardInterrupt:
         print("\nstopped.")

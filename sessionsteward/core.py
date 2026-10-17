@@ -10,10 +10,14 @@ rel = path relative to project root, or __home/... for home files.
 from __future__ import annotations
 
 import fnmatch
+import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 
@@ -21,13 +25,20 @@ REPO_DIR = os.path.expanduser("~/.sessionsteward/snapshots")
 CONFIG_PATH = os.path.expanduser("~/.sessionsteward/config.json")
 TRASH_DIR = os.path.expanduser("~/.sessionsteward/trash")
 
-DEFAULT_WATCH = ["CLAUDE.md", ".claude", "AGENTS.md"]
+# ~/.claude/CLAUDE.md is Claude Code's user-level memory; CLAUDE.local.md
+# is the per-project private memory file.
+DEFAULT_WATCH = ["CLAUDE.md", "CLAUDE.local.md", ".claude", "AGENTS.md",
+                 "~/.claude/CLAUDE.md"]
 
 # Names skipped when walking watched directories (snap + watch daemon).
 # Transcripts and logs balloon the snapshots repo; they are never
 # snapshotted. `.git` is always skipped too.
 IGNORE_PATTERNS = ["*.log", "*transcript*", "__pycache__", ".git",
                    "node_modules"]
+
+# Snapshots must be byte-exact: never let a user's global core.autocrlf
+# (common on Windows) rewrite CRLF/LF on add, show or archive.
+GIT = ["git", "-c", "core.autocrlf=false"]
 
 
 class StewardError(Exception):
@@ -53,7 +64,7 @@ def _norm_root(root: str | None) -> str | None:
 
 
 def _git(repo: str, *args: str) -> str:
-    p = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+    p = subprocess.run([*GIT, "-C", repo, *args], capture_output=True,
                        text=True, timeout=60)
     if p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: "
@@ -192,7 +203,7 @@ def _read_snapshot_file(sha: str, rel: str) -> tuple[bytes | None, bool]:
         return None, False
     if ls.startswith("040000"):
         return None, True
-    p = subprocess.run(["git", "-C", REPO_DIR, "show", f"{sha}:files/{rel}"],
+    p = subprocess.run([*GIT, "-C", REPO_DIR, "show", f"{sha}:files/{rel}"],
                        capture_output=True, timeout=60)
     return (p.stdout if p.returncode == 0 else None), False
 
@@ -221,7 +232,7 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
     manifest = _manifest_at(sha)
     if not manifest:
         p = subprocess.run(
-            ["git", "-C", REPO_DIR, "rev-parse", "--verify", "--quiet",
+            [*GIT, "-C", REPO_DIR, "rev-parse", "--verify", "--quiet",
              f"{sha}^{{commit}}"], capture_output=True, timeout=60)
         if p.returncode == 0:
             raise NothingToRestoreError(
@@ -259,7 +270,7 @@ def _dir_matches(sha: str, rel: str, ap: str) -> bool:
             name = os.path.relpath(fp, ap)
             disk_names.add(name)
             p = subprocess.run(
-                ["git", "-C", REPO_DIR, "show", f"{sha}:{prefix}{name}"],
+                [*GIT, "-C", REPO_DIR, "show", f"{sha}:{prefix}{name}"],
                 capture_output=True, timeout=60)
             if p.returncode != 0:
                 return False
@@ -342,22 +353,36 @@ def restore(sha: str, trash_dir: str | None = None,
     for rel, ap in manifest["files"].items():
         data, is_dir = _read_snapshot_file(sha, rel)
         if is_dir:
-            tmp = tempfile.mkdtemp(prefix="steward-restore-")
+            # Extract next to the live dir and verify BEFORE touching it,
+            # so a failed extract leaves the live dir as it was and the
+            # final swap is a same-filesystem rename. tarfile, not `tar`:
+            # works on Windows too.
+            parent = os.path.dirname(ap)
+            os.makedirs(parent, exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix=".steward-restore-", dir=parent)
             try:
-                arch = subprocess.run(
-                    ["git", "-C", REPO_DIR, "archive", sha, f"files/{rel}"],
-                    capture_output=True, timeout=60)
-                if arch.returncode != 0:
-                    continue
-                subprocess.run(["tar", "-x", "-C", tmp], input=arch.stdout,
-                               capture_output=True, timeout=60)
                 src = os.path.join(tmp, "files", rel)
+                arch = subprocess.run(
+                    [*GIT, "-C", REPO_DIR, "archive", sha, f"files/{rel}"],
+                    capture_output=True, timeout=60)
+                try:
+                    with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tf:
+                        if hasattr(tarfile, "tar_filter"):
+                            tf.extractall(tmp, filter="tar")
+                        else:  # Python without extraction filters
+                            tf.extractall(tmp)
+                except (tarfile.TarError, OSError):
+                    pass
+                if arch.returncode != 0 or not os.path.isdir(src):
+                    restored.append(f"skipped {ap}: could not extract "
+                                    f"snapshot {sha[:7]} (left untouched)")
+                    continue
                 if os.path.lexists(ap):
                     # Never delete: move the existing path (dir, file or
                     # link) to trash before restoring the snapshot copy.
                     dest = _move_to_trash(ap, trash_dir)
                     restored.append(f"moved {ap} -> {dest}")
-                shutil.copytree(src, ap)
+                os.rename(src, ap)
                 restored.append(ap)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -367,6 +392,33 @@ def restore(sha: str, trash_dir: str | None = None,
                 f.write(data)
             restored.append(ap)
     return restored
+
+
+def _sizes(sha: str) -> dict[str, int]:
+    """{path under files/: blob size} at sha."""
+    out = {}
+    for line in _git(REPO_DIR, "ls-tree", "-r", "-l", sha,
+                     "files/").splitlines():
+        meta, _, path = line.partition("\t")
+        size = meta.split()[-1]
+        if size.isdigit():
+            out[path[len("files/"):]] = int(size)
+    return out
+
+
+def shrunk(sha: str, prev_sha: str, ratio: float = 0.5) -> list[tuple]:
+    """Guard: files that lost more than `ratio` of their size between two
+    snapshots — the "compaction ate my CLAUDE.md" case.
+    Returns [(rel, old_size, new_size)]."""
+    old, new = _sizes(prev_sha), _sizes(sha)
+    return [(rel, old[rel], new[rel]) for rel in sorted(new)
+            if rel in old and new[rel] < old[rel] * (1 - ratio)]
+
+
+def guard_lines(sha: str, prev_sha: str) -> list[str]:
+    return [f"  ! guard: {rel} shrank {o} -> {n} bytes "
+            f"(-{100 - round(n * 100 / o)}%) — `sessionsteward undo` to recover"
+            for rel, o, n in shrunk(sha, prev_sha)]
 
 
 def diff(sha1: str, sha2: str = "HEAD") -> str:
@@ -396,8 +448,25 @@ def file_mtimes(paths: list[str]) -> dict[str, float]:
 # Claude Code hook wiring (`install-hooks`)
 # ---------------------------------------------------------------------------
 
-HOOK_PRECOMPACT_CMD = "sessionsteward precompact"
-HOOK_SESSIONSTART_CMD = 'sessionsteward snap -m "session start"'
+def _self_cmd() -> str:
+    """Absolute, quoted `python -m sessionsteward` for hook shells.
+
+    Hook shells don't load your aliases or activate your venv, so a bare
+    `sessionsteward` fails silently there. Windows paths with spaces need
+    double quotes (cmd and Git Bash both accept them); POSIX gets shlex.
+    """
+    exe = sys.executable
+    exe = f'"{exe}"' if os.name == "nt" else shlex.quote(exe)
+    return f"{exe} -m sessionsteward"
+
+
+HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact"
+HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap -m "session start"'
+# Bare commands written by older versions; merge_hooks upgrades them in
+# place instead of adding a duplicate hook next to them.
+_LEGACY_HOOK_CMDS = {"sessionsteward precompact": HOOK_PRECOMPACT_CMD,
+                     'sessionsteward snap -m "session start"':
+                         HOOK_SESSIONSTART_CMD}
 
 
 def build_hooks_json() -> dict:
@@ -441,6 +510,10 @@ def merge_hooks(settings: dict) -> dict:
     hooks = settings.setdefault("hooks", {})
     for event, entries in ours.items():
         existing = hooks.setdefault(event, [])
+        for e in existing:
+            for h in (e.get("hooks") or []) if isinstance(e, dict) else []:
+                if isinstance(h, dict) and h.get("command") in _LEGACY_HOOK_CMDS:
+                    h["command"] = _LEGACY_HOOK_CMDS[h["command"]]
         have = set(_hook_commands(existing))
         for entry in entries:
             cmd = entry["hooks"][0]["command"]

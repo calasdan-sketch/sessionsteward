@@ -15,16 +15,18 @@ report showing what's eating the window.
 Zero dependencies — Python 3.10+ stdlib only (uses your system's git).
 
 ```bash
-git clone <repo> && cd sessionsteward
-# no-install alias (run from the repo root):
-alias sessionsteward="python3 -m sessionsteward"
+pip install git+https://github.com/calasdan-sketch/sessionsteward
 ```
 
-Or install it properly (console script `sessionsteward`):
+Or from a clone (console script `sessionsteward`):
 
 ```bash
+git clone https://github.com/calasdan-sketch/sessionsteward && cd sessionsteward
 pip install .
 ```
+
+Install it before running `install-hooks`: the hooks call the installed
+package with the interpreter you ran it from.
 
 ## Usage
 
@@ -45,6 +47,9 @@ sessionsteward install-hooks               # print Claude Code hooks JSON
 sessionsteward install-hooks --write       # merge it into ~/.claude/settings.json
 ```
 
+Watched by default: `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, `AGENTS.md`
+(project root) and `~/.claude/CLAUDE.md` (your user-level memory).
+
 The horror-story scenario, fixed:
 
 ```bash
@@ -53,6 +58,16 @@ $ # agent overwrites your 30-line CLAUDE.md with one bullet
 $ sessionsteward undo
 undone 1 step(s) -> a3f9c21
   /home/you/proj/CLAUDE.md
+```
+
+**Shrink guard:** when a snapshot shows a watched file lost more than half
+its size since the previous snapshot (the "compaction ate my CLAUDE.md"
+case), `snap`, `precompact`, the `watch` daemon and `log` flag it:
+
+```
+$ sessionsteward log
+b81d0e4  2026-10-16 09:12  auto: files changed
+  ! guard: CLAUDE.md shrank 2412 -> 18 bytes (-99%) — `sessionsteward undo` to recover
 ```
 
 Safety rules: empty snaps are skipped (no noise commits); `undo`/`restore`
@@ -77,9 +92,13 @@ sessionsteward install-hooks --write   # merge into ~/.claude/settings.json
 ```
 
 This wires **PreCompact** → `sessionsteward precompact` and **SessionStart**
-→ `sessionsteward snap -m "session start"`. `--write` merges into the
-existing settings file without clobbering your other hooks (re-running is
-a no-op).
+→ `sessionsteward snap -m "session start"`. The hooks call the Python that
+ran `install-hooks` by absolute path (`"/path/to/python" -m sessionsteward ...`),
+because hook shells don't load your aliases or activate your venv — re-run
+`install-hooks` if you move or recreate that environment. `--write` merges
+into the existing settings file without clobbering your other hooks
+(re-running is a no-op, and older bare `sessionsteward ...` hooks are
+upgraded in place).
 
 ## Context diet
 
@@ -109,9 +128,9 @@ Watched files: 3, total ~12,400 chars (~3,100 tokens)
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 24 tests, temp dirs only
+python3 -m unittest discover -s tests   # 31 tests, temp dirs only
 ```
 
 ## License
 
-TBD
+MIT — see [LICENSE](LICENSE).

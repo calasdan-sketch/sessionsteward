@@ -2,7 +2,8 @@
 
 Layout inside the snapshots repo:
   files/<rel>          mirrored watched files (only this snapshot's project)
-  manifest.json        {rel: abspath} for the latest snap
+  manifest.json        {"project_root": ..., "files": {rel: abspath},
+                        "watch": [the watch list in force]} for the snap
 
 rel is the path relative to the project root; files outside the project
 are mirrored under __home/... (inside your home directory) or
@@ -272,16 +273,42 @@ def _expand_watch_entry(rel: str, project_root: str) -> str | None:
     return os.path.join(project_root, rel)
 
 
-def watched_paths(project_root: str) -> list[str]:
-    """Absolute paths of watched files that currently exist."""
-    out = []
+def _watched_entries(project_root: str) -> list[tuple[str, str]]:
+    """[(watch-list entry, absolute path)] for the watched paths that
+    exist now, deduped by path (the first entry naming a path wins)."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for rel in watch_list():
         p = _expand_watch_entry(rel, project_root)
         if p and os.path.exists(p):
             ap = os.path.abspath(p)
-            if ap not in out:
-                out.append(ap)
+            if ap not in seen:
+                seen.add(ap)
+                out.append((rel, ap))
     return out
+
+
+def watched_paths(project_root: str) -> list[str]:
+    """Absolute paths of watched files that currently exist."""
+    return [ap for _, ap in _watched_entries(project_root)]
+
+
+def _in_scope(entry: str, manifest: dict) -> bool:
+    """Was this watch-list entry on the list when the snapshot was taken?
+
+    A path added with `watch --add` after a snapshot is outside that
+    snapshot's scope: it neither makes the snapshot look "dirty" nor is
+    swept into the trash by a restore of it. Snapshots without a recorded
+    list (older repos) scope to the whole current list.
+    """
+    was = manifest.get("watch")
+    return was is None or entry in was
+
+
+def _scoped_paths(project_root: str, manifest: dict) -> list[str]:
+    """The watched paths that exist now, limited to the snapshot's scope."""
+    return [ap for entry, ap in _watched_entries(project_root)
+            if _in_scope(entry, manifest)]
 
 
 def _inside(path: str, parent: str) -> bool:
@@ -422,24 +449,37 @@ def snap(project_root: str, message: str) -> str:
         # (dirs_exist_ok / the lexists check: a watched file inside a
         # watched dir, e.g. ~/.claude/CLAUDE.md with ~ as the project.)
         if os.path.isdir(ap):
+            # Symlinks are followed: the mirror holds the content behind
+            # them (restore() never writes it back through the link).
             shutil.copytree(ap, dest, copy_function=shutil.copyfile,
                             ignore=shutil.ignore_patterns(*IGNORE_PATTERNS),
-                            dirs_exist_ok=True)
+                            ignore_dangling_symlinks=True, dirs_exist_ok=True)
         elif not os.path.lexists(dest):
             shutil.copyfile(ap, dest)
     # No timestamp in the manifest: identical content must produce an
     # identical tree so the re-snap below is skipped. (It used to carry
     # "at"; two hooks snapping the same clobbered state seconds apart
     # made two commits, and `undo` then stepped back to the clobbered one.)
+    # "watch" records the effective watch list, so a restore knows which
+    # paths were in this snapshot's scope (see _in_scope).
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump({"project_root": _norm_root(project_root),
-                   "files": manifest}, f, indent=2)
+                   "files": manifest, "watch": watch_list()}, f, indent=2)
     _git(REPO_DIR, "add", "-A")
-    # skip empty commits (nothing changed)
-    status = _git(REPO_DIR, "status", "--porcelain")
-    if not status.strip():
-        return _git(REPO_DIR, "rev-parse", "HEAD").strip()
+    # Skip the commit when nothing changed FOR THIS PROJECT: compare the
+    # index tree with the tree of this project's newest snapshot, not with
+    # global HEAD — the repo is shared, and with two projects snapping in
+    # turn (A, B, A) HEAD is B's, so A's identical state was re-committed
+    # and the next `undo` stepped onto that duplicate instead of the good
+    # snapshot before it.
+    tree = _git(REPO_DIR, "write-tree").strip()
+    newest = log(1, project_root=project_root)
+    if newest:
+        prev = _git(REPO_DIR, "rev-parse",
+                    f"{newest[0]['sha']}^{{tree}}").strip()
+        if prev == tree:
+            return newest[0]["sha"]
     _git(REPO_DIR, "commit", "-q", "-m", message)
     return _git(REPO_DIR, "rev-parse", "HEAD").strip()
 
@@ -596,11 +636,25 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
 
 def iter_files(paths: list[str]):
     """Yield every file under the watched paths (directories walked,
-    IGNORE_PATTERNS applied), in a stable order."""
+    IGNORE_PATTERNS applied), in a stable order.
+
+    Symlinked directories are walked (snap() mirrors what is behind
+    them, so the live tree must see the same files), with a guard so a
+    link back into the tree cannot loop forever."""
     for ap in paths:
         if os.path.isdir(ap):
-            for root, dirs, files in os.walk(ap):
-                dirs[:] = sorted(d for d in dirs if not _ignored_name(d))
+            seen: set[str] = set()
+            for root, dirs, files in os.walk(ap, followlinks=True):
+                seen.add(os.path.realpath(root))
+                keep = []
+                for d in sorted(dirs):
+                    if _ignored_name(d):
+                        continue
+                    full = os.path.join(root, d)
+                    if os.path.islink(full) and os.path.realpath(full) in seen:
+                        continue
+                    keep.append(d)
+                dirs[:] = keep
                 for fn in sorted(files):
                     if not _ignored_name(fn):
                         yield os.path.join(root, fn)
@@ -667,7 +721,7 @@ def worktree_matches_snapshot(sha: str, project_root: str,
     manifest = _manifest_at(sha) if manifest is None else manifest
     if not manifest:
         return False
-    current = watched_paths(project_root)
+    current = _scoped_paths(project_root, manifest)
     if set(manifest.get("files", {}).values()) != set(current):
         return False
     snap = snapshot_tree(sha, manifest)
@@ -677,21 +731,27 @@ def worktree_matches_snapshot(sha: str, project_root: str,
 
 def current_position(snaps: list[dict], project_root: str) -> int | None:
     """Index of the newest snapshot the live files match, or None when
-    the current state is not snapshotted (dirty)."""
+    the current state is not snapshotted (dirty). Each snapshot is
+    compared within its own scope (the paths watched when it was taken)."""
     if not snaps:
         return None
     manifests = _manifests_at([s["sha"] for s in snaps])
-    current = watched_paths(project_root)
-    live = None
+    entries = _watched_entries(project_root)
+    live_all = None
     for i, s in enumerate(snaps):
         m = manifests.get(s["sha"]) or {}
-        if not m or set(m.get("files", {}).values()) != set(current):
+        if not m:
+            continue
+        current = [ap for entry, ap in entries if _in_scope(entry, m)]
+        if set(m.get("files", {}).values()) != set(current):
             continue
         snap = snapshot_tree(s["sha"], m)
-        if live is None:
-            live = live_tree(current, _blob_algo(snap))
-            if live is None:
+        if live_all is None:
+            live_all = live_tree([ap for _, ap in entries], _blob_algo(snap))
+            if live_all is None:
                 return None
+        live = {fp: blob for fp, blob in live_all.items()
+                if any(_inside(fp, ap) for ap in current)}
         if live == snap:
             return i
     return None
@@ -701,31 +761,66 @@ def _subtree(tree: dict[str, str], ap: str) -> dict[str, str]:
     return {k: v for k, v in tree.items() if _inside(k, ap)}
 
 
-def _latest_manifest_for_project(project_root: str | None) -> dict:
-    """Manifest of the newest snapshot, scoped to project_root.
+def _live_matches(ap: str, snap_tree: dict[str, str], algo: str) -> bool:
+    """True when the file(s) at ap (a file, a dir, or a link to either)
+    are byte-identical to what the snapshot recorded there."""
+    return live_tree([ap], algo) == _subtree(snap_tree, ap)
 
-    The snapshots repo is shared between projects, so global HEAD may
-    belong to a different project. The trash sweep in restore() must
-    compare extra files against the current project's latest state,
-    never another project's — otherwise undo in project A would yank
-    project B's watched files into trash. Returns {} when no snapshot
-    exists for the project; when project_root is None (unscoped API
-    use) falls back to the global HEAD manifest (legacy behavior).
+
+def _links_under(top: str) -> list[str]:
+    """Every symlink (to a file or a dir) inside the directory top."""
+    links = []
+    for root, dirs, files in os.walk(top):
+        dirs[:] = [d for d in dirs if not _ignored_name(d)]
+        for name in dirs + files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                links.append(full)
+    return links
+
+
+def _keep_links(live_dir: str, staged: str, snap_tree: dict[str, str],
+                algo: str) -> list[str]:
+    """Carry the symlinks of live_dir over into the staged restore copy.
+
+    snap() mirrors the CONTENT behind a link, so the archive holds a real
+    file or dir where the live tree has a link. Restoring that copy would
+    materialise the link away (and a top-level write would go through
+    it): instead the link itself is kept, and when what is behind it
+    differs from the snapshot that is reported as skipped — sessionsteward
+    never writes through a link. Links the snapshot knows nothing about
+    stay in the old dir (which goes to trash). Returns the report lines.
     """
-    if project_root is None:
-        return _manifest_at("HEAD")
-    snaps = log(1, project_root=project_root)
-    if not snaps:
-        return {}
-    return _manifest_at(snaps[0]["sha"])
+    lines = []
+    for link in _links_under(live_dir):
+        sub = os.path.relpath(link, live_dir).split(os.sep)
+        target = os.path.join(staged, *sub)
+        if not os.path.lexists(target):
+            continue
+        tmp_link = target + ".steward-link"
+        try:
+            os.symlink(os.readlink(link), tmp_link)
+            _remove_mirror(target)
+            os.rename(tmp_link, target)
+        except OSError as e:  # e.g. no symlink privilege on Windows
+            lines.append(f"skipped {link}: is a symlink and could not be "
+                         f"kept ({e.strerror or e})")
+            continue
+        if not _live_matches(link, snap_tree, algo):
+            lines.append(f"skipped {link}: is a symlink (left untouched, "
+                         f"never written through)")
+    return lines
 
 
 def restore(sha: str, trash_dir: str | None = None,
             project_root: str | None = None) -> list[str]:
-    """Restore watched files from a snapshot. Files that exist now but
-    didn't in the snapshot are moved to trash instead of deleted —
-    directories included (never `rmtree`'d). Paths already at the
-    snapshot's state are left alone (reported as `unchanged …`).
+    """Restore watched files from a snapshot, so that afterwards the
+    watched files ARE the snapshot. Files that exist now but didn't in
+    the snapshot are moved to trash instead of deleted — directories
+    included (never `rmtree`'d). Paths already at the snapshot's state
+    are left alone (reported as `unchanged …`); paths that were not on
+    the watch list when the snapshot was taken are left alone too
+    (`kept …`); symlinks are never written through (`skipped …`).
 
     Raises NothingToRestoreError for a manifest-less snapshot (e.g. the
     `init` commit) and CrossProjectError when project_root is given and
@@ -734,24 +829,49 @@ def restore(sha: str, trash_dir: str | None = None,
     manifest = check_restore(sha, project_root)
     _ensure_attributes()  # `git archive` below honours attributes
     restored = []
-    # Scope the extra-file sweep to the current project: global HEAD may
-    # belong to another project, and sweeping against it would trash
-    # that project's watched files (cross-project clobbering).
-    latest = _latest_manifest_for_project(project_root)
     trash_dir = trash_dir or TRASH_DIR
     moved = False
-    for rel, ap in latest.get("files", {}).items():
-        if rel not in manifest["files"] and os.path.lexists(ap):
-            dest = _move_to_trash(ap, trash_dir)
-            restored.append(f"moved {ap} -> {dest}")
-            moved = True
+    files = manifest["files"]
+    root = _norm_root(project_root if project_root is not None
+                      else manifest.get("project_root"))
+    # Sweep what is on disk NOW: every watched path that has no place in
+    # the target snapshot goes to trash. (It used to compare against this
+    # project's NEWEST snapshot, so after `restore <older>` the extra
+    # files survived, the worktree matched nothing, and the next `undo`
+    # snapped that mess as pre-undo and stepped FORWARD onto the
+    # clobbered snapshot — moving the user's file to trash on the way.)
+    targets = set(files.values())
+    for entry, ap in (_watched_entries(root) if root else []):
+        if ap in targets or not os.path.lexists(ap):
+            continue
+        try:
+            if _rel(ap, root) in files:
+                continue
+        except StewardError:
+            continue  # never sweep a path that cannot even be mirrored
+        if not _in_scope(entry, manifest):
+            restored.append(f"kept {ap}: not watched when snapshot "
+                            f"{sha[:7]} was taken")
+            continue
+        dest = _move_to_trash(ap, trash_dir)
+        restored.append(f"moved {ap} -> {dest}")
+        moved = True
     snap_tree = snapshot_tree(sha, manifest)
     algo = _blob_algo(snap_tree)
-    for rel, ap in manifest["files"].items():
+    for rel, ap in files.items():
         data, is_dir = _read_snapshot_file(sha, rel)
+        if os.path.islink(ap):
+            # A top-level watched path that is a link: the snapshot holds
+            # the content behind it, and writing it back would go THROUGH
+            # the link into a file that was never watched as such.
+            if _live_matches(ap, snap_tree, algo):
+                restored.append(f"unchanged {ap}")
+            else:
+                restored.append(f"skipped {ap}: is a symlink (left "
+                                f"untouched, never written through)")
+            continue
         if is_dir:
-            if (os.path.isdir(ap) and not os.path.islink(ap)
-                    and live_tree([ap], algo) == _subtree(snap_tree, ap)):
+            if os.path.isdir(ap) and _live_matches(ap, snap_tree, algo):
                 restored.append(f"unchanged {ap}")
                 continue
             # Extract next to the live dir and verify BEFORE touching it,
@@ -776,6 +896,8 @@ def restore(sha: str, trash_dir: str | None = None,
                     restored.append(f"skipped {ap}: could not extract "
                                     f"snapshot {sha[:7]} (left untouched)")
                     continue
+                if os.path.isdir(ap):
+                    restored.extend(_keep_links(ap, src, snap_tree, algo))
                 if os.path.lexists(ap):
                     # Never delete: move the existing path (dir, file or
                     # link) to trash before restoring the snapshot copy.
@@ -787,7 +909,7 @@ def restore(sha: str, trash_dir: str | None = None,
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         elif data is not None:
-            if os.path.isfile(ap) and not os.path.islink(ap):
+            if os.path.isfile(ap):
                 try:
                     with open(ap, "rb") as f:
                         same = f.read() == data
@@ -803,6 +925,27 @@ def restore(sha: str, trash_dir: str | None = None,
                 os.makedirs(os.path.dirname(ap), exist_ok=True)
                 with open(ap, "wb") as f:
                     f.write(data)
+            except OSError as e:
+                restored.append(f"skipped {ap}: {e.strerror or e} "
+                                f"(left untouched)")
+                continue
+            restored.append(ap)
+        else:
+            # Recorded in the manifest but nothing in the tree: a watched
+            # directory that was empty or held only ignored files (git
+            # tracks no empty directories). The live path must become an
+            # empty directory too, or the snapshot could never be "the
+            # current position" again. (It used to be skipped outright:
+            # files added since stayed, and `undo` jumped forward.)
+            if os.path.isdir(ap) and live_tree([ap], algo) == {}:
+                restored.append(f"unchanged {ap}")
+                continue
+            try:
+                if os.path.lexists(ap):
+                    dest = _move_to_trash(ap, trash_dir)
+                    restored.append(f"moved {ap} -> {dest}")
+                    moved = True
+                os.makedirs(ap)
             except OSError as e:
                 restored.append(f"skipped {ap}: {e.strerror or e} "
                                 f"(left untouched)")

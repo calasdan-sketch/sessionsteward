@@ -26,6 +26,7 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -53,6 +54,40 @@ def _harden_streams() -> None:
             pass
 
 
+# Tests patch this to exercise the Windows branch on any OS.
+_WINDOWS = os.name == "nt"
+
+
+def _pipe_gone(exc: BaseException) -> bool:
+    """Did the reader of our stdout go away?
+
+    POSIX raises BrokenPipeError (EPIPE). Windows reports the same thing as
+    a plain OSError with errno EINVAL and no file name (measured on Windows
+    11 / Python 3.11: errno 22, winerror None), raised by the FLUSH rather
+    than by the print, and it fails a second time at interpreter exit
+    (status 120) unless fd 1 is pointed at the null device first."""
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno == errno.EPIPE:
+        return True
+    return (_WINDOWS and exc.errno == errno.EINVAL
+            and getattr(exc, "filename", None) is None)
+
+
+def _stdout_gone() -> None:
+    """The reader of our stdout went away (`sessionsteward log | head`):
+    there is nothing left to say, so say it quietly. Python flushes
+    stdout once more at exit, which would raise the same BrokenPipeError
+    again — point the descriptor at the null device first."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError:  # no real descriptor (captured stdout): nothing to do
+        pass
+
+
 def _short(path: str, root: str) -> str:
     """A path as the user knows it: project-relative inside the project,
     ~/... under home, otherwise as is."""
@@ -68,16 +103,17 @@ def _short(path: str, root: str) -> str:
 
 def _print_restored(restored: list[str], root: str) -> None:
     """One short line per path: `restored CLAUDE.md`, `unchanged .claude`,
-    `moved .claude -> ~/.sessionsteward/trash/.claude.1760000000`. Keeps
+    `moved .claude -> ~/.sessionsteward/trash/.claude.1760000000`,
+    `kept NOTES.md: not watched when snapshot a3f9c21 was taken`. Keeps
     the undo/restore report (and hook output) to the essentials."""
     for r in restored:
-        for tag in ("moved ", "unchanged ", "skipped "):
+        for tag in ("moved ", "unchanged ", "skipped ", "kept "):
             if r.startswith(tag):
                 rest = r[len(tag):]
                 if tag == "moved ":
                     src, _, dest = rest.partition(" -> ")
                     rest = f"{_short(src, root)} -> {_short(dest, root)}"
-                elif tag == "skipped ":
+                elif tag in ("skipped ", "kept "):
                     path, _, why = rest.partition(": ")
                     rest = f"{_short(path, root)}: {why}"
                 else:
@@ -350,7 +386,15 @@ def main(argv=None) -> int:
     if args.cmd == "watch" and (args.add or args.remove):
         cmds["watch"] = cmd_watch_edit
     try:
-        return cmds[args.cmd](args)
+        rc = cmds[args.cmd](args)
+        if sys.stdout is not None:
+            sys.stdout.flush()  # a closed pipe surfaces here, not at exit
+        return rc
+    except OSError as e:
+        if not _pipe_gone(e):
+            raise
+        _stdout_gone()
+        return 0
     except (core_mod.StewardError, RuntimeError) as e:
         # git missing, a stale .git/index.lock, a corrupt config or
         # manifest: one line on stderr, exit 2 — never a traceback (as a

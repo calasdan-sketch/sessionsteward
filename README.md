@@ -102,12 +102,20 @@ snapshot that holds the previous version (`restore <sha>`) instead.
 
 Safety rules: snapshots are byte-exact (CRLF stays CRLF whatever your git's
 `core.autocrlf` or `.gitattributes` say); identical content is never
-re-committed, so two hooks snapping the same state don't bury the good one;
-`undo`/`restore` never delete — files that didn't exist in the target
-snapshot are moved to `~/.sessionsteward/trash/` instead, **directories
+re-committed — it is compared with *this project's* newest snapshot, so two
+hooks snapping the same state, or another project snapping in between,
+don't bury the good one. After `undo`/`restore` your watched files *are*
+the target snapshot: whatever is watched now but didn't exist in it is
+moved to `~/.sessionsteward/trash/` — never deleted, **directories
 included** — and a file that cannot be written (read-only, or a directory
 now sits in its place) is reported as `skipped … (left untouched)` with
-exit code 1 while the rest is restored.
+exit code 1 while the rest is restored. Symlinks are never written
+through: the link stays where it is, and when what is behind it differs
+from the snapshot that is `skipped … is a symlink` (exit 1). A path added
+with `watch --add` *after* a snapshot was taken is outside that snapshot's
+scope — restoring it leaves the path alone and says so (`kept NOTES.md:
+not watched when snapshot a3f9c21 was taken`); every snapshot records its
+watch list for this.
 The trash keeps the newest 20 entries; paths that are already at the
 snapshot's state are left alone (`unchanged .claude`) rather than swapped.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
@@ -115,8 +123,9 @@ default: cwd): snapshots record their project root (one repo is shared by
 all your projects and the whole history is scanned, so another project's
 snapshots never hide yours), and a `restore` of a snapshot from another
 project is refused rather than clobbering your files.
-`undo` steps back from wherever you are: after one undo your files match
-an older snapshot, and the next `undo` continues from there instead of
+`undo` steps back from wherever you are: because a restore leaves your
+files equal to its target, after one undo (or a `restore <sha>`) they match
+that snapshot, and the next `undo` continues from there instead of
 bringing the undone state back (`--steps N` stops at the oldest snapshot
 and says so). Undoing or restoring with unsaved changes — a state that
 matches no snapshot — first snapshots it as `pre-undo`/`pre-restore`, so
@@ -190,11 +199,11 @@ transcripts and logs are watched for undo but never counted.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 64 tests, temp dirs only
+python3 -m unittest discover -s tests   # 71 tests, temp dirs only
 ```
 
 Two tests (read-only files/dirs) are skipped when run as root, where
-permission bits don't bind.
+permission bits don't bind; the symlink test is skipped on Windows.
 
 ## License
 

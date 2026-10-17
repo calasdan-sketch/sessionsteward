@@ -1415,6 +1415,280 @@ class TestSteward(unittest.TestCase):
         self.assertIsNone(core_mod.current_position(
             core_mod.log(50, project_root=self.proj), self.proj))
 
+    # ---- round-4 release-panel regressions ----
+
+    def _position(self, root=None):
+        root = root or self.proj
+        return core_mod.current_position(
+            core_mod.log(50, project_root=root), root)
+
+    def _trashed(self):
+        out = []
+        for root, _, files in os.walk(core_mod.TRASH_DIR):
+            out.extend(os.path.join(root, fn) for fn in files)
+        return out
+
+    def test_restore_older_then_newer_sweeps_against_live_tree(self):
+        # HIGH (repro A): the extra-file sweep compared against this
+        # project's NEWEST snapshot instead of the live worktree. After
+        # `undo` (-> A) and `restore B`, AGENTS.md (gone in B) survived,
+        # the worktree matched no snapshot, and the next `undo` snapped
+        # it as pre-undo and stepped FORWARD onto B: "undone -> B",
+        # AGENTS.md trashed, CLAUDE.md = the clobber.
+        shutil.rmtree(os.path.join(self.proj, ".claude"))
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        agents = os.path.join(self.proj, "AGENTS.md")
+        with open(agents, "w") as f:
+            f.write("# agents\n")
+        self._cli("init")  # A: CLAUDE.md + AGENTS.md
+        os.remove(agents)
+        with open(claude, "w") as f:
+            f.write("clobber\n")
+        self._cli("snap", "-m", "B")
+        b_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        code, _ = self._cli("undo")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._position(), 1)
+        self.assertTrue(os.path.exists(agents))
+        code, out = self._cli("restore", b_sha[:7])
+        self.assertEqual(code, 0)
+        # the worktree IS B now: AGENTS.md went to trash (not deleted)
+        self.assertFalse(os.path.exists(agents))
+        self.assertIn("moved AGENTS.md", out)
+        self.assertEqual(self._position(), 0)
+        code, out = self._cli("undo")  # back to A, not "forward" to B
+        self.assertEqual(code, 0)
+        self.assertIn("initial snapshot", out)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        with open(agents) as f:
+            self.assertEqual(f.read(), "# agents\n")
+        self.assertEqual(self._position(), 1)
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=self.proj)]
+        self.assertEqual(messages, ["B", "initial snapshot"])
+
+    def test_undo_twice_past_an_added_file_then_stops(self):
+        # HIGH (repro B): A(v1) -> B(v2 + AGENTS.md) -> C(v3, AGENTS.md
+        # deleted). undo -> B fine; undo -> A left AGENTS.md behind (B,
+        # the newest snapshot, is not where it came from); the third undo
+        # then went forward to C.
+        shutil.rmtree(os.path.join(self.proj, ".claude"))
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        agents = os.path.join(self.proj, "AGENTS.md")
+        self._cli("init")  # A
+        with open(claude, "w") as f:
+            f.write("v2\n")
+        with open(agents, "w") as f:
+            f.write("agents\n")
+        self._cli("snap", "-m", "B")
+        with open(claude, "w") as f:
+            f.write("v3\n")
+        os.remove(agents)
+        self._cli("snap", "-m", "C")
+        self._cli("undo")
+        self.assertEqual(self._position(), 1)
+        self.assertTrue(os.path.exists(agents))
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        self.assertIn("moved AGENTS.md", out)
+        self.assertFalse(os.path.exists(agents))
+        self.assertEqual(self._position(), 2)
+        code, out = self._cli("undo")  # oldest: must not jump to C
+        self.assertEqual(code, 0)
+        self.assertIn("already at the oldest snapshot", out)
+        with open(claude) as f:
+            self.assertEqual(f.read(), "# Project\n\nBe helpful.\n")
+        self.assertEqual(len(self._trashed()), 1)  # AGENTS.md, once
+
+    def test_restore_of_effectively_empty_watched_dir(self):
+        # HIGH (repro C): a watched dir holding only ignored files has a
+        # manifest entry but no tree entry (git tracks no empty dirs), so
+        # restore skipped it: settings.json added later stayed, the
+        # worktree matched nothing, and the next undo went forward.
+        dot = os.path.join(self.proj, ".claude")
+        os.remove(os.path.join(dot, "settings.json"))
+        with open(os.path.join(dot, "debug.log"), "w") as f:
+            f.write("noise\n")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        self._cli("init")  # A: .claude is effectively empty
+        a_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        self.assertTrue(core_mod.worktree_matches_snapshot(a_sha, self.proj))
+        settings = os.path.join(dot, "settings.json")
+        with open(settings, "w") as f:
+            f.write("{}\n")
+        with open(claude, "w") as f:
+            f.write("v2\n")
+        self._cli("snap", "-m", "B")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(settings))
+        self.assertTrue(os.path.isdir(dot))
+        self.assertIn("moved .claude", out)
+        self.assertEqual(self._position(), 1)
+        code, out = self._cli("undo")
+        self.assertIn("already at the oldest snapshot", out)
+        with open(claude) as f:
+            self.assertIn("Be helpful.", f.read())
+        # and when the dir is still (effectively) empty, it is unchanged
+        with open(claude, "w") as f:
+            f.write("v3\n")
+        self._cli("snap", "-m", "C")  # .claude empty here too
+        code, out = self._cli("undo", "--steps", "2")  # C -> A
+        self.assertEqual(code, 0)
+        self.assertIn("unchanged .claude", out)
+        self.assertNotIn("moved", out)
+        self.assertEqual(self._position(), 2)
+
+    def test_identical_resnap_skipped_across_projects(self):
+        # MED: "nothing changed" was `git status` against the GLOBAL
+        # HEAD. With two projects snapping in turn (A, B, A) A's identical
+        # state was re-committed, and `undo` stepped onto that duplicate
+        # — a no-op that buried the good snapshot one step further.
+        proj_a, proj_b = self.proj, make_project()
+        claude_a = os.path.join(proj_a, "CLAUDE.md")
+        self._cli_root(proj_a, "init")
+        with open(claude_a, "w") as f:
+            f.write("clobber\n")
+        self._cli_root(proj_a, "snap", "-m", "A-clobber")
+        self._cli_root(proj_b, "snap", "-m", "B1")  # HEAD is B's now
+        code, out = self._cli_root(proj_a, "snap", "-m", "A-again")
+        self.assertEqual(code, 0)
+        messages = [s["message"]
+                    for s in core_mod.log(50, project_root=proj_a)]
+        self.assertEqual(messages, ["A-clobber", "initial snapshot"])
+        a_head = core_mod.log(1, project_root=proj_a)[0]["sha"]
+        self.assertIn(a_head[:7], out)  # reports the existing snapshot
+        code, _ = self._cli_root(proj_a, "undo")
+        self.assertEqual(code, 0)
+        with open(claude_a) as f:
+            self.assertIn("Be helpful.", f.read())
+        # a real change in A is still committed
+        with open(claude_a, "w") as f:
+            f.write("new\n")
+        self._cli_root(proj_a, "snap", "-m", "A-new")
+        self.assertEqual(core_mod.log(1, project_root=proj_a)[0]["message"],
+                         "A-new")
+
+    def test_undo_past_watch_add_keeps_the_newer_file(self):
+        # LOW: undoing to a snapshot taken before `watch --add NOTES.md`
+        # trashed NOTES.md — a file that snapshot knew nothing about. The
+        # manifest now records the watch list; out-of-scope paths are
+        # left alone and reported, and do not make the snapshot "dirty".
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        notes = os.path.join(self.proj, "NOTES.md")
+        self._cli("init")  # A: NOTES.md not watched
+        a_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        with open(notes, "w") as f:
+            f.write("my notes\n")
+        self._cli("watch", "--add", "NOTES.md")
+        with open(claude, "w") as f:
+            f.write("v2\n")
+        self._cli("snap", "-m", "B")
+        self.assertEqual(core_mod._manifest_at("HEAD")["watch"],
+                         core_mod.DEFAULT_WATCH + ["NOTES.md"])
+        with open(claude, "w") as f:
+            f.write("v3\n")
+        self._cli("snap", "-m", "C")
+        self._cli("undo")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 0)
+        self.assertIn(f"  kept NOTES.md: not watched when snapshot "
+                      f"{a_sha[:7]} was taken", out)
+        self.assertNotIn("moved", out)
+        with open(notes) as f:
+            self.assertEqual(f.read(), "my notes\n")
+        self.assertEqual(self._trashed(), [])
+        self.assertEqual(self._position(), 2)  # A, NOTES.md notwithstanding
+        code, out = self._cli("undo")
+        self.assertIn("already at the oldest snapshot", out)
+        # a snapshot taken AFTER the add does sweep a deleted-in-it file
+        c_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        self._cli("restore", c_sha[:7])
+        self.assertEqual(self._position(), 0)
+        with open(notes) as f:
+            self.assertEqual(f.read(), "my notes\n")
+
+    @unittest.skipIf(not hasattr(os, "symlink") or os.name == "nt",
+                     "POSIX symlinks")
+    def test_restore_never_writes_through_symlinks(self):
+        # LOW: a top-level watched symlink was restored THROUGH the link
+        # (overwriting the never-watched target), and a symlinked dir
+        # inside .claude came back as a real directory.
+        shared = os.path.join(self._tmp, "shared")
+        os.makedirs(os.path.join(shared, "cmds"))
+        shared_claude = os.path.join(shared, "CLAUDE.md")
+        shared_cmd = os.path.join(shared, "cmds", "deploy.md")
+        with open(shared_claude, "w") as f:
+            f.write("shared v1\n")
+        with open(shared_cmd, "w") as f:
+            f.write("deploy v1\n")
+        claude = os.path.join(self.proj, "CLAUDE.md")
+        os.remove(claude)
+        os.symlink(shared_claude, claude)
+        commands = os.path.join(self.proj, ".claude", "commands")
+        os.symlink(os.path.join(shared, "cmds"), commands)
+        settings = os.path.join(self.proj, ".claude", "settings.json")
+        self._cli("init")
+        a_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
+        # what is behind the links is seen, so the live tree matches
+        self.assertTrue(core_mod.worktree_matches_snapshot(a_sha, self.proj))
+        for p, text in ((shared_claude, "shared v2\n"),
+                        (shared_cmd, "deploy v2\n"), (settings, "{}\n")):
+            with open(p, "w") as f:
+                f.write(text)
+        self._cli("snap", "-m", "B")
+        code, out = self._cli("undo")
+        self.assertEqual(code, 1)  # something was skipped
+        self.assertIn("  skipped CLAUDE.md: is a symlink", out)
+        self.assertIn("  skipped .claude/commands: is a symlink", out)
+        self.assertIn("  restored .claude", out)
+        # links intact, targets untouched, the rest restored
+        self.assertTrue(os.path.islink(claude))
+        self.assertTrue(os.path.islink(commands))
+        self.assertEqual(os.readlink(commands), os.path.join(shared, "cmds"))
+        with open(shared_claude) as f:
+            self.assertEqual(f.read(), "shared v2\n")
+        with open(shared_cmd) as f:
+            self.assertEqual(f.read(), "deploy v2\n")
+        with open(settings) as f:
+            self.assertEqual(f.read(), '{"x": 1}\n')
+        # a link whose content already matches is just "unchanged"
+        with open(shared_claude, "w") as f:
+            f.write("shared v1\n")
+        with open(shared_cmd, "w") as f:
+            f.write("deploy v1\n")
+        self.assertEqual(self._position(), 1)
+        code, out = self._cli("restore", a_sha[:7])
+        self.assertEqual(code, 0)
+        self.assertIn("  unchanged CLAUDE.md", out)
+        self.assertIn("  unchanged .claude", out)
+
+    def test_broken_pipe_exits_quietly(self):
+        # LOW: `sessionsteward install-hooks | head -1` ended in a
+        # BrokenPipeError traceback. Run the real CLI with its stdout
+        # closed by the reader: no traceback, exit 0.
+        env = {**os.environ, "HOME": self._home, "USERPROFILE": self._home}
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(cli_mod.__file__)))
+        p = subprocess.Popen(
+            [sys.executable, "-m", "sessionsteward", "--root", self.proj,
+             "install-hooks"], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=repo_root, env=env)
+        p.stdout.close()
+        err = p.stderr.read()
+        p.stderr.close()
+        self.assertEqual(p.wait(timeout=60), 0, err)
+        self.assertNotIn(b"Traceback", err)
+        self.assertNotIn(b"BrokenPipe", err)
+        # and in-process: a stdout whose write raises is swallowed too
+        class Gone(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+        with redirect_stdout(Gone()):
+            self.assertEqual(cli_mod.main(["--root", self.proj,
+                                           "install-hooks"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

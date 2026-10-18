@@ -34,10 +34,9 @@ import subprocess
 import sys
 import time
 
+from . import __version__
 from . import core as core_mod
 from . import diet as diet_mod
-
-VERSION = "0.1.2"
 
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
@@ -163,6 +162,21 @@ def _warn_too_big(too_big: list, root: str) -> None:
     _warn(f"{what}; SESSIONSTEWARD_MAX_FILE_MB changes the limit")
 
 
+def _warn_unwatchable(root: str) -> None:
+    """One warning per watch-list entry that cannot be watched (`.`, `~`: see
+    core.unwatchable_reason), naming the command that drops it. The command
+    goes on with the rest of the list - a hook must keep protecting what it
+    can. An unreadable config is not mentioned here: the command reports it."""
+    try:
+        bad = core_mod.unwatchable_entries(root)
+    except core_mod.StewardError:
+        return
+    for entry, what in bad:
+        drop = core_mod.shell_word(entry)
+        _warn(f"not watching '{entry}': it is {what}; "
+              f"`sessionsteward watch --remove {drop}` drops the entry")
+
+
 def cmd_init(args) -> int:
     repo = core_mod.init_repo()
     print(f"snapshots repo: {repo}")
@@ -183,6 +197,8 @@ def cmd_init(args) -> int:
 
 
 def cmd_watch_edit(args) -> int:
+    # before anything is created or written: a refused entry changes nothing
+    core_mod.check_watch_additions(args.add or [], args.root)
     core_mod.init_repo()
     cfg = core_mod.edit_watch_list(core_mod.load_config(),
                                    add=args.add or [], remove=args.remove or [])
@@ -453,8 +469,13 @@ def _poll_interval(text) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sessionsteward", description=__doc__)
-    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    # RawDescription: the docstring is a paragraph plus a list of examples,
+    # one per line - the default formatter folds it into a single block.
+    p = argparse.ArgumentParser(
+        prog="sessionsteward", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     p.add_argument("--root", default=os.getcwd(),
                    help="Project root for relative watch paths.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -526,6 +547,9 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "watch":
             args.interval = _poll_interval(args.interval)
+        if args.cmd in ("init", "snap", "precompact", "undo", "restore") \
+                or (args.cmd == "watch" and not (args.add or args.remove)):
+            _warn_unwatchable(args.root)   # not for the edit that fixes it
         with core_mod.locked() if writes else contextlib.nullcontext():
             rc = cmds[args.cmd](args)
         if sys.stdout is not None:
@@ -545,6 +569,12 @@ def main(argv=None) -> int:
         return _fail(e, 2)
     except subprocess.SubprocessError as e:
         return _fail(e, 1)
+    except Exception as e:   # noqa: BLE001 - input nobody foresaw, or a bug
+        # Still one line and not a traceback (a hook's output is read by the
+        # agent); exit 1 like any other failure of the system around us.
+        return _fail(RuntimeError(
+            f"unexpected {type(e).__name__}: {e} - this is a bug in "
+            f"sessionsteward; please report it"), 1)
 
 
 if __name__ == "__main__":

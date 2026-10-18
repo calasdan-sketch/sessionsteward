@@ -15,6 +15,11 @@ import unicodedata
 import unittest
 from unittest import mock
 
+try:   # pytest imports tests/ as a package, unittest discover as top-level
+    from . import _isolate  # noqa: F401  (first: a private temp directory)
+except ImportError:
+    import _isolate  # noqa: F401
+
 from sessionsteward import cli as cli_mod
 from sessionsteward import core as core_mod
 

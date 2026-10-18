@@ -14,6 +14,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+try:   # pytest imports tests/ as a package, unittest discover as top-level
+    from . import _isolate  # noqa: F401  (first: a private temp directory)
+except ImportError:
+    import _isolate  # noqa: F401
+
 from sessionsteward import cli as cli_mod
 from sessionsteward import core as core_mod
 from sessionsteward import diet as diet_mod
@@ -1649,7 +1654,11 @@ class TestSteward(unittest.TestCase):
         self._cli("snap", "-m", "B")
         code, out = self._cli("undo")
         self.assertEqual(code, 1)  # something was skipped
-        self.assertIn("  skipped CLAUDE.md: is a symlink", out)
+        # named as its folder lists it (ciopfs, the case-insensitive mount the
+        # tests can run on, keeps no case for the name of a symlink)
+        listed = [n for n in os.listdir(self.proj) if n.lower() == "claude.md"]
+        self.assertEqual(len(listed), 1, listed)
+        self.assertIn("  skipped %s: is a symlink" % listed[0], out)
         self.assertIn("  skipped .claude/commands: is a symlink", out)
         self.assertIn("  restored .claude", out)
         # links intact, targets untouched, the rest restored
@@ -1670,7 +1679,7 @@ class TestSteward(unittest.TestCase):
         self.assertEqual(self._position(), 1)
         code, out = self._cli("restore", a_sha[:7])
         self.assertEqual(code, 0)
-        self.assertIn("  unchanged CLAUDE.md", out)
+        self.assertIn("  unchanged " + listed[0], out)
         self.assertIn("  unchanged .claude", out)
 
     def test_broken_pipe_exits_quietly(self):

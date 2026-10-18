@@ -4,6 +4,9 @@ Layout inside the snapshots repo:
   files/<rel>          mirrored watched files (only this snapshot's project)
   manifest.json        {"project_root": ..., "files": {rel: abspath},
                         "kinds": {rel: "file" | "dir"},
+                        "modes": {path under files/: "0600"},   (POSIX; only
+                                  paths with narrower group/other bits than
+                                  git's own 0644 / 0755; absent if none)
                         "watch": [the watch list in force]} for the snap
 
 rel is the path relative to the project root; files outside the project
@@ -191,7 +194,9 @@ def max_file_bytes() -> int | None:
     """The size above which a file inside a watched directory is left out of
     snapshots, or None for no limit. SESSIONSTEWARD_MAX_FILE_MB (megabytes
     of 1024 * 1024 bytes, fractions allowed) overrides MAX_FILE_MB; 0 means
-    no limit; anything that is not a finite number >= 0 is ignored."""
+    no limit, and so does a number so large that its byte count is more
+    than a float can hold (1e305); anything that is not a finite number >= 0
+    is ignored."""
     raw = os.environ.get("SESSIONSTEWARD_MAX_FILE_MB")
     try:
         megabytes = float(raw) if raw and raw.strip() else MAX_FILE_MB
@@ -199,7 +204,10 @@ def max_file_bytes() -> int | None:
         megabytes = MAX_FILE_MB
     if not 0 <= megabytes < float("inf"):   # also false for nan
         megabytes = MAX_FILE_MB
-    return int(megabytes * 1024 * 1024) or None
+    try:
+        return int(megabytes * 1024 * 1024) or None
+    except OverflowError:   # the product is inf: bigger than any file
+        return None
 
 
 def _regular_size(path: str) -> int | None:
@@ -438,17 +446,39 @@ def init_repo() -> str:
         return REPO_DIR
 
 
-def load_config() -> dict:
-    """The watch config. A missing file means defaults; a corrupt one is
-    an error (and is left in place) — silently replacing it would throw
-    away the user's watch list."""
+def _config_text(raw: bytes) -> str:
+    """The text of a config file: UTF-8, with or without the byte-order mark
+    that PowerShell 5 (Set-Content -Encoding utf8) and Notepad write. UTF-16
+    - what PowerShell 5's `>` and Out-File write - is not read, but said so
+    in words that name the cure."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in raw:
+        raise StewardError(
+            f"watch config {CONFIG_PATH} is UTF-16 (what PowerShell 5's > "
+            f"writes), not UTF-8; save it as UTF-8 (Set-Content -Encoding "
+            f"utf8) or delete it (it was left as is)")
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise StewardError(
+            f"watch config {CONFIG_PATH} is not valid UTF-8 ({e.reason} at "
+            f"byte {e.start}); fix it or delete it (it was left as is)"
+        ) from None
+
+
+def load_config() -> dict:
+    """The watch config. A missing file means defaults; a corrupt one - not
+    JSON, not UTF-8, or not the shape `watch` and `unwatch` need (lists of
+    paths) - is an error (and is left in place): silently replacing it would
+    throw away the user's watch list, and guessing at it would watch
+    something else."""
+    try:
+        with open(CONFIG_PATH, "rb") as f:
             raw = f.read()
     except OSError:
         return {"watch": []}
+    text = _config_text(raw)
     try:
-        cfg = json.loads(raw)
+        cfg = json.loads(text)
     except ValueError as e:
         raise StewardError(
             f"watch config {CONFIG_PATH} is not valid JSON ({e}); fix it "
@@ -456,6 +486,16 @@ def load_config() -> dict:
     if not isinstance(cfg, dict):
         raise StewardError(f"watch config {CONFIG_PATH} must be a JSON "
                            f"object (it was left as is)")
+    for key in ("watch", "unwatch"):
+        value = cfg.get(key)
+        if value is None:
+            cfg.pop(key, None)   # null is the same as not set
+        elif not (isinstance(value, list)
+                  and all(isinstance(item, str) for item in value)):
+            raise StewardError(
+                f'watch config {CONFIG_PATH}: "{key}" must be a list of '
+                f'paths such as ["NOTES.md"]; fix it or delete it (it was '
+                f'left as is)')
     return cfg
 
 
@@ -567,13 +607,185 @@ def _same_entry(a: str, b: str) -> bool:
     so a symlink is itself and not what it points at."""
     try:
         return os.path.samestat(os.lstat(a), os.lstat(b))
-    except OSError:
+    except (OSError, ValueError):   # ValueError: a NUL in a name
         return False
+
+
+def _real(path: str) -> str:
+    """path with its links followed - or as given when the system cannot
+    look it up (a NUL in a name makes realpath raise ValueError)."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return path
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """Do these two paths name one directory entry - by spelling (Windows
+    ignores case), or by what the file system says (macOS ignores it too)?"""
+    return os.path.normcase(a) == os.path.normcase(b) or _same_entry(a, b)
+
+
+def unwatchable_reason(abspath: str,
+                       project_root: str) -> tuple[str, str] | None:
+    """Why this path can never be a watch-list entry, as (what it is, what to
+    do instead) - or None when it can. Four paths cannot be mirrored: the
+    project root and your home directory (everything in them would be
+    snapshotted, the snapshots repo included), the root of a drive, and the
+    snapshots repo itself or a folder that holds it (it would end up as a
+    mirror of its own mirror). Naming one made every later snap, undo and
+    restore fail, and with them the hooks. A link to one of them is that path
+    for a walk, so the path is looked at twice: as given, and with its links
+    followed."""
+    root = _norm_root(project_root)
+    home = os.path.abspath(os.path.expanduser("~"))
+    inside_it = "name the files or folders in it that matter"
+    repo = os.path.abspath(REPO_DIR)
+    stores = [os.path.normcase(p)
+              for p in dict.fromkeys((repo, _real(repo)))]
+    for path in dict.fromkeys((abspath, _real(abspath))):
+        if _same_dir(path, root):
+            return ("the project root itself",
+                    f"{inside_it}, for example `watch --add docs/plan.md`")
+        if _same_dir(path, home):
+            return ("your home directory itself",
+                    f"{inside_it}, for example `watch --add "
+                    f"~/.claude/settings.json`")
+        if os.path.dirname(path) == path:
+            return ("the root of a drive",
+                    f"{inside_it}, for example `watch --add docs/plan.md`")
+        here = os.path.normcase(path)
+        if any(_inside(store, here) or _inside(here, store)
+               for store in stores):
+            return ("where sessionsteward keeps its snapshots",
+                    "that folder is not something to protect")
+    return None
+
+
+def check_watch_additions(entries, project_root: str) -> None:
+    """Refuse (StewardError, nothing changed) an entry for `watch --add` that
+    unwatchable_reason() rules out, saying what to name instead."""
+    root = _norm_root(project_root)
+    for entry in entries:
+        path = _expand_watch_entry(entry, root)
+        bad = unwatchable_reason(os.path.abspath(path), root) if path else None
+        if bad:
+            raise StewardError(f"cannot watch '{entry}': it is {bad[0]}; "
+                               f"{bad[1]}")
+
+
+def unwatchable_entries(project_root: str) -> list[tuple[str, str]]:
+    """[(entry, what it is)] for the entries of the watch list that
+    unwatchable_reason() rules out - from a config.json written by a version
+    that accepted them, or by hand. They are left out of every snapshot (the
+    others are still taken) and the commands say so."""
+    root = _norm_root(project_root)
+    out = []
+    for entry in watch_list():
+        path = (None if entry == AUTO_MEMORY
+                else _expand_watch_entry(entry, root))
+        bad = unwatchable_reason(os.path.abspath(path), root) if path else None
+        if bad:
+            out.append((entry, bad[0]))
+    return out
+
+
+def shell_word(text: str) -> str:
+    """text as one shell word that can be pasted back: a bare ~ would be
+    replaced by the shell with the path of your home directory."""
+    if os.name == "nt":
+        return text if re.fullmatch(r"[\w./\\:-]+", text) else f'"{text}"'
+    return shlex.quote(text)
+
+
+def _fold(name: str) -> str:
+    """A name as a case-insensitive file system compares it: composed
+    Unicode, case folded."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _names_in(directory: str, cache: dict | None) -> list[str]:
+    """The names a directory lists, sorted (none when it cannot be read);
+    remembered in `cache` for as long as the caller keeps it."""
+    if cache is not None and directory in cache:
+        return cache[directory]
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        names = []
+    if cache is not None:
+        cache[directory] = names
+    return names
+
+
+def _on_disk_spelling(path: str, project_root: str | None,
+                      listings: dict | None = None) -> str:
+    """`path` with every name below its anchor spelled the way the file
+    system spells it.
+
+    A case-insensitive file system (Windows, macOS) finds `claude.md` when
+    the file is called `CLAUDE.md`, so a watch-list entry typed one way stays
+    valid for the other. A snapshot must not carry that difference: its
+    mirror and git's tree know a file under one name only, and an entry that
+    spells a file differently from the walk of a watched folder around it
+    met the same file under two names - the snapshot was refused for good,
+    or (a folder entry nested in another) restored as an empty folder. So
+    each name below the anchor - the project root when the path is inside it,
+    else your home directory, else the drive - is replaced by the name the
+    folder lists for it. The match is the file system's own: the same name
+    once Unicode is composed and case ignored, and the two paths confirmed to
+    be one directory entry. The anchor is left as given (it is how the
+    project is identified); a name that does not exist, and what follows it,
+    stays as typed. On a case-sensitive file system nothing changes.
+    `listings` caches folder listings for the length of one pass."""
+    path = os.path.abspath(path)
+    anchor = None
+    for base in (project_root, os.path.abspath(os.path.expanduser("~"))):
+        if base and _inside(path, base) and (anchor is None
+                                             or len(base) > len(anchor)):
+            anchor = base
+    if anchor is None:
+        drive, tail = os.path.splitdrive(path)
+        anchor = drive + tail[:1]
+    parts = [p for p in path[len(anchor):].split(os.sep) if p]
+    cur = anchor
+    for i, part in enumerate(parts):
+        here = os.path.join(cur, part)
+        if not os.path.lexists(here):
+            return os.path.join(cur, *parts[i:])
+        names = _names_in(cur, listings)
+        if part not in names:
+            want = _fold(part)
+            for name in names:
+                if (_fold(name) == want
+                        and _same_entry(os.path.join(cur, name), here)):
+                    part = name
+                    break
+        cur = os.path.join(cur, part)
+    return cur
+
+
+def _on_disk_files(manifest: dict, project_root: str | None,
+                   listings: dict | None = None) -> dict:
+    """The manifest's {rel: abspath} with each abspath spelled as the file
+    system spells it now. A snapshot taken by an older version holds the
+    spelling the watch list used; compared with the live paths (which are
+    spelled as on disk) it would look like another file."""
+    files = manifest.get("files") or {}
+    return {rel: (_on_disk_spelling(ap, project_root, listings)
+                  if isinstance(ap, str) else ap)
+            for rel, ap in files.items()}
 
 
 def _watched_entries(project_root: str) -> list[tuple[str, str]]:
     """[(watch-list entry, absolute path)] for the watched paths that
     exist now, deduped by path (the first entry naming a path wins).
+    Entries that unwatchable_reason() rules out are not among them.
+
+    Each path is spelled as the file system spells it (_on_disk_spelling):
+    `.claude/rules/style.md` for the file `Style.md` comes out as
+    `.../Style.md`, the name the walk of a watched folder meets, and is
+    recorded under that name.
 
     So are two spellings that differ only by case and name one file: on a
     case-insensitive file system `claude.md` next to the default `CLAUDE.md`
@@ -584,6 +796,8 @@ def _watched_entries(project_root: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     by_fold: dict[str, list[str]] = {}
+    listings: dict[str, list[str]] = {}
+    root = _norm_root(project_root)
     for rel in watch_list():
         p = _expand_watch_entry(rel, project_root)
         # A regular file or a directory (or a link to one). A named pipe,
@@ -591,6 +805,9 @@ def _watched_entries(project_root: str) -> list[tuple[str, str]]:
         # for ever - so it is as good as absent.
         if p and (os.path.isfile(p) or os.path.isdir(p)):
             ap = os.path.abspath(p)
+            if unwatchable_reason(ap, root):
+                continue   # unwatchable_entries() is how the user hears of it
+            ap = _on_disk_spelling(ap, root, listings)
             if ap in seen:
                 continue
             twins = by_fold.setdefault(ap.casefold(), [])
@@ -660,7 +877,8 @@ def _rel(abspath: str, project_root: str) -> str:
     home = os.path.abspath(os.path.expanduser("~"))
     if abspath == project_root or abspath == home:
         raise StewardError(f"cannot watch {abspath}: it is the project root "
-                           f"or your home directory itself")
+                           f"or your home directory itself (drop the entry "
+                           f"with `sessionsteward watch --remove <entry>`)")
     if _inside(abspath, project_root):
         rel = os.path.relpath(abspath, project_root)
     elif _inside(abspath, home):
@@ -803,10 +1021,129 @@ def _composed(name: str) -> str:
     return unicodedata.normalize("NFC", name)
 
 
-def _check_staged(files_dir: str, kinds: dict[str, str]) -> None:
+# ---------------------------------------------------------------------------
+# Permission bits
+# ---------------------------------------------------------------------------
+# git records one bit of a file's mode (the owner's execute bit), and the tar
+# a restore extracts holds 0644 and 0755 - so a restored 0600 secret or 0700
+# folder would come back readable by everybody. The group and other bits of
+# a path are therefore recorded in the manifest wherever they are narrower
+# than that default, and a restore gives a path those bits, minus any the live
+# path has lost since: never more open than the snapshot recorded or than the
+# path is now. Bits wider than the default (a group-writable file) are not
+# carried over; the owner's bits are not recorded (a restore gives a folder or
+# an executable rwx and any other file rw). POSIX only: Windows has no such
+# bits.
+
+def _default_go(mode: int) -> int:
+    """The group and other bits git's own modes give a path of this kind:
+    0755 for a folder or anything the owner can execute, else 0644."""
+    return 0o055 if stat.S_ISDIR(mode) or mode & stat.S_IXUSR else 0o044
+
+
+def _recorded_modes(plan: list) -> dict[str, str]:
+    """{path under files/: "0600"} for every mirrored path (each watched path
+    and everything the mirror holds under a watched folder) whose group or
+    other bits are narrower than _default_go() - read from the mirror, which
+    keeps the permission bits of what it copies. Sorted, so identical
+    permissions make an identical manifest."""
+    if os.name == "nt":
+        return {}
+    found: dict[str, str] = {}
+
+    def note(path: str, key: str) -> None:
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            return
+        if not stat.S_ISLNK(mode) and _default_go(mode) & ~mode & 0o077:
+            found[key] = "%04o" % stat.S_IMODE(mode)
+
+    for rel, _ap, dest in plan:
+        note(dest, rel)
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            for root, dirs, files in os.walk(dest):
+                dirs.sort()
+                here = os.path.relpath(root, dest).replace(os.sep, "/")
+                prefix = rel if here == "." else f"{rel}/{here}"
+                if here != ".":
+                    note(root, prefix)
+                for name in sorted(files):
+                    note(os.path.join(root, name), f"{prefix}/{name}")
+    return dict(sorted(found.items()))
+
+
+def _manifest_modes(manifest: dict) -> dict[str, int]:
+    """The group and other bits a manifest records, {path under files/: bits}.
+    An entry that is not an octal mode string (a hand-edited manifest) is
+    dropped, not an error."""
+    raw = manifest.get("modes")
+    if os.name == "nt" or not isinstance(raw, dict):
+        return {}
+    return {key: int(text, 8) & 0o077 for key, text in raw.items()
+            if isinstance(key, str) and isinstance(text, str)
+            and re.fullmatch(r"[0-7]{3,4}", text)}
+
+
+def _apply_modes(staged: str, live: str, rel: str,
+                 recorded: dict[str, int]) -> None:
+    """Set the permission bits of the extracted copy of a watched folder
+    (`staged`, about to replace `live`; `rel` is its path under files/):
+    owner rwx on a folder or an executable, rw on any other file; group and
+    other get what the snapshot recorded for the path (else git's default),
+    minus whatever the live path of that name does not have. Links kept from
+    the live folder are left alone."""
+    if os.name == "nt":
+        return
+
+    def fix(path: str, sub: list[str]) -> None:
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            return
+        if stat.S_ISLNK(mode):
+            return
+        default = _default_go(mode)
+        want = recorded.get("/".join([rel, *sub]), default) & default
+        try:
+            seen = os.lstat(os.path.join(live, *sub)).st_mode
+            have = 0o077 if stat.S_ISLNK(seen) else seen & 0o077
+        except OSError:
+            have = 0o077   # nothing lives there now: nothing to exceed
+        new = (0o700 if default == 0o055 else 0o600) | (want & have)
+        if new != stat.S_IMODE(mode):
+            with contextlib.suppress(OSError):
+                os.chmod(path, new)
+
+    fix(staged, [])
+    for root, dirs, files in os.walk(staged):
+        here = [] if root == staged else os.path.relpath(
+            root, staged).split(os.sep)
+        for name in dirs + files:
+            fix(os.path.join(root, name), here + [name])
+
+
+def _narrow_to_recorded(path: str, rel: str, recorded: dict[str, int]) -> None:
+    """After a file was written (or an empty folder made) in place: take away
+    the group and other bits the snapshot recorded as absent for `rel`. Never
+    adds one, and leaves a path the snapshot recorded nothing for as it is."""
+    if os.name == "nt" or rel not in recorded:
+        return
+    try:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        new = (mode & ~0o077) | (mode & recorded[rel])
+        if new != mode:
+            os.chmod(path, new)
+    except OSError:
+        pass
+
+
+def _check_staged(files_dir: str, kinds: dict[str, str],
+                  entries: dict[str, str] | None = None) -> None:
     """Refuse to commit a snapshot that lacks something it mirrored: every
     file under files/ (and every watched file) must be in the index, under
-    the name the mirror gives it.
+    the name the mirror gives it. `entries` maps a rel to the watch-list
+    entry it came from, so the refusal can name the entry to drop.
 
     Names are compared exactly - in particular NOT ignoring case: _snap
     rebuilds the index from the mirror every time, so a name that differs
@@ -836,9 +1173,17 @@ def _check_staged(files_dir: str, kinds: dict[str, str]) -> None:
                 unmatched.append(name)
         missing = unmatched
     if missing:
+        first = missing[0]
+        entry = (entries or {}).get(first[len("files/"):])
+        remedy = ""
+        if entry is not None:
+            remedy = (f"; the watch-list entry '{entry}' names it, and "
+                      f"`sessionsteward watch --remove {shell_word(entry)}` "
+                      f"drops that entry")
         raise StewardError(
             f"snapshot incomplete: git did not record {len(missing)} of the "
-            f"mirrored file(s) (first: {missing[0]}) - nothing was committed")
+            f"mirrored file(s) (first: {first}) - nothing was committed"
+            f"{remedy}")
 
 
 def snap(project_root: str, message: str) -> str:
@@ -861,14 +1206,15 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     if not repo_ready():
         init_repo()
     _ensure_attributes()
-    paths = watched_paths(project_root)
     files_dir = os.path.join(REPO_DIR, "files")
     # Plan every mirror path first: nothing is removed or written until
     # all of them are known to sit inside files/.
     plan = []
-    for ap in paths:
+    entry_of = {}   # rel -> the watch-list entry it came from
+    for entry, ap in _watched_entries(project_root):
         rel = _rel(ap, project_root)
         plan.append((rel, ap, _mirror_path(files_dir, rel)))
+        entry_of.setdefault(rel, entry)
     manifest = {rel: ap for rel, ap, _ in plan}
     # What each watched path IS: a path with a manifest entry but nothing in
     # the tree is an empty directory only if it was one. (A file that git
@@ -897,17 +1243,30 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
                             dirs_exist_ok=True)
         elif not os.path.lexists(dest):
             _copy_content(ap, dest)
+    if too_big:
+        # The limit is for what a walk of a watched folder finds. A file the
+        # watch list names itself was copied above whatever its size - it is
+        # in the snapshot, and `undo` brings it back - so it is not "left
+        # out" (the walk skipped it first; that is all this list recorded).
+        named = {os.path.normcase(ap) for rel, ap, _ in plan
+                 if kinds[rel] == "file"}
+        too_big[:] = [(path, size) for path, size in too_big
+                      if os.path.normcase(path) not in named]
     # No timestamp in the manifest: identical content must produce an
     # identical tree so the re-snap below is skipped. (It used to carry
     # "at"; two hooks snapping the same clobbered state seconds apart
     # made two commits, and `undo` then stepped back to the clobbered one.)
     # "watch" records the effective watch list, so a restore knows which
     # paths were in this snapshot's scope (see _in_scope).
+    document = {"project_root": _norm_root(project_root),
+                "files": manifest, "kinds": kinds}
+    modes = _recorded_modes(plan)
+    if modes:
+        document["modes"] = modes
+    document["watch"] = watch_list()
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
               encoding="utf-8") as f:
-        json.dump({"project_root": _norm_root(project_root),
-                   "files": manifest, "kinds": kinds,
-                   "watch": watch_list()}, f, indent=2)
+        json.dump(document, f, indent=2)
     # The index is rebuilt from the mirror on every snapshot, never updated
     # in place. On a case-insensitive file system (Windows, macOS) git sees
     # a file or directory renamed by case alone (Notes.md -> notes.md) as
@@ -923,7 +1282,7 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     # .gitignore that was itself mirrored out of a watched directory - and
     # silently leaves matching files out of the tree.
     _git(REPO_DIR, "add", "-A", "-f")
-    _check_staged(files_dir, kinds)
+    _check_staged(files_dir, kinds, entry_of)
     # Skip the commit when nothing changed FOR THIS PROJECT: compare the
     # index tree with the tree of this project's newest snapshot, not with
     # global HEAD — the repo is shared, and with two projects snapping in
@@ -1264,8 +1623,11 @@ def snapshot_tree(sha: str, manifest: dict | None = None) -> dict[str, str]:
     if not files:
         return {}
     out = {}
-    listing = _git(REPO_DIR, "ls-tree", "-r", "-z", sha, "--",
-                   *(f"files/{rel}" for rel in files))
+    # each watched path under both spellings: git on a Mac composes a
+    # pathspec itself, a git elsewhere does not
+    specs = sorted({f"files/{rel}" for rel in files}
+                   | {f"files/{_composed(rel)}" for rel in files})
+    listing = _git(REPO_DIR, "ls-tree", "-r", "-z", sha, "--", *specs)
     for line in listing.split("\0"):   # -z: names arrive unquoted
         meta, _, path = line.partition("\t")
         parts = meta.split()
@@ -1280,7 +1642,36 @@ def snapshot_tree(sha: str, manifest: dict | None = None) -> dict[str, str]:
                 sub = rel[len(key) + 1:].split("/")
                 out[os.path.join(ap, *sub)] = parts[2]
                 break
+        else:
+            # git may spell the name of a watched path composed where the
+            # manifest has it decomposed (macOS lists names decomposed);
+            # _same_tree() takes it from there
+            crel = _composed(rel)
+            for key, ap in files.items():
+                ckey = _composed(key)
+                if crel == ckey:
+                    out[ap] = parts[2]
+                    break
+                if crel.startswith(ckey + "/"):
+                    sub = crel[len(ckey) + 1:].split("/")
+                    out[os.path.join(ap, *sub)] = parts[2]
+                    break
     return out
+
+
+def _same_tree(live: dict[str, str], snap: dict[str, str]) -> bool:
+    """Are these the same paths with the same content? {abspath: blob id}
+    both. A path compares as git records it: macOS keeps a name like
+    e-acute decomposed (e + a combining accent) and git, with
+    core.precomposeunicode, stores it composed - the allowance _check_staged
+    makes - so two paths that differ only in composition are one file here
+    too. Never at the price of merging two files: if composing makes two
+    paths of one side the same, the sides are not equal."""
+    if live == snap:
+        return True
+    a = {_composed(path): blob for path, blob in live.items()}
+    b = {_composed(path): blob for path, blob in snap.items()}
+    return len(a) == len(live) and len(b) == len(snap) and a == b
 
 
 def _blob_algo(tree: dict[str, str]) -> str:
@@ -1294,12 +1685,14 @@ def worktree_matches_snapshot(sha: str, project_root: str,
     manifest = _manifest_at(sha) if manifest is None else manifest
     if not manifest:
         return False
+    manifest = dict(manifest, files=_on_disk_files(
+        manifest, _norm_root(project_root)))
     current = _scoped_paths(project_root, manifest)
     if set(manifest.get("files", {}).values()) != set(current):
         return False
     snap = snapshot_tree(sha, manifest)
     live = live_tree(current, _blob_algo(snap))
-    return live is not None and live == snap
+    return live is not None and _same_tree(live, snap)
 
 
 def current_position(snaps: list[dict], project_root: str) -> int | None:
@@ -1310,11 +1703,14 @@ def current_position(snaps: list[dict], project_root: str) -> int | None:
         return None
     manifests = _manifests_at([s["sha"] for s in snaps])
     entries = _watched_entries(project_root)
+    root = _norm_root(project_root)
+    listings: dict[str, list[str]] = {}
     live_all = None
     for i, s in enumerate(snaps):
         m = manifests.get(s["sha"]) or {}
         if not m:
             continue
+        m = dict(m, files=_on_disk_files(m, root, listings))
         current = [ap for entry, ap in entries if _in_scope(entry, m)]
         if set(m.get("files", {}).values()) != set(current):
             continue
@@ -1325,7 +1721,7 @@ def current_position(snaps: list[dict], project_root: str) -> int | None:
                 return None
         live = {fp: blob for fp, blob in live_all.items()
                 if any(_inside(fp, ap) for ap in current)}
-        if live == snap:
+        if _same_tree(live, snap):
             return i
     return None
 
@@ -1337,7 +1733,8 @@ def _subtree(tree: dict[str, str], ap: str) -> dict[str, str]:
 def _live_matches(ap: str, snap_tree: dict[str, str], algo: str) -> bool:
     """True when the file(s) at ap (a file, a dir, or a link to either)
     are byte-identical to what the snapshot recorded there."""
-    return live_tree([ap], algo) == _subtree(snap_tree, ap)
+    live = live_tree([ap], algo)
+    return live is not None and _same_tree(live, _subtree(snap_tree, ap))
 
 
 def _links_under(top: str) -> list[str]:
@@ -1383,6 +1780,42 @@ def _keep_links(live_dir: str, staged: str, snap_tree: dict[str, str],
             lines.append(f"skipped {link}: is a symlink (left untouched, "
                          f"never written through)")
     return lines
+
+
+def _unpack_folder(archive: bytes, prefix: str, dest: str) -> None:
+    """Unpack the folder `prefix` of a `git archive` stream AS `dest`.
+
+    The archive names everything by its whole mirror path
+    (files/__home/.claude/projects/<project>/memory/...). Unpacking that as
+    it stands, in a staging folder beside the live one, nested the long part
+    of the path a second time: for a project with a long name that passed the
+    260-character limit of a Windows without long-path support, and the
+    restore failed with "could not extract". Here the leading path is
+    dropped, so the staged copy is only a few characters deeper than the
+    live folder. Raises tarfile.TarError or OSError when the folder could not
+    be unpacked completely (nothing partial is ever swapped in).
+    """
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tf:
+        members = []
+        for member in tf.getmembers():
+            if member.name == prefix:
+                member.name = "."
+            elif member.name.startswith(prefix + "/"):
+                member.name = member.name[len(prefix) + 1:]
+            else:
+                continue   # a folder around it, which the archive lists first
+            parts = member.name.replace("\\", "/").split("/")
+            if (member.islnk() or ".." in parts
+                    or member.name.startswith(("/", "\\"))):
+                raise tarfile.ExtractError(
+                    f"unexpected entry {member.name!r} in the archive")
+            members.append(member)
+        if not members:
+            raise tarfile.ReadError(f"nothing under {prefix} in the archive")
+        if hasattr(tarfile, "tar_filter"):
+            tf.extractall(dest, members=members, filter="tar")
+        else:  # Python without extraction filters
+            tf.extractall(dest, members=members)
 
 
 def _swap_via_trash(ap: str, put_in_place, trash_dir: str,
@@ -1449,9 +1882,14 @@ def _restore(sha: str, trash_dir: str | None,
     restored = []
     trash_dir = trash_dir or TRASH_DIR
     trashed: list[str] = []   # what this restore put in the trash
-    files = manifest["files"]
     root = _norm_root(project_root if project_root is not None
                       else manifest.get("project_root"))
+    # The live paths as the file system spells them now: a snapshot from an
+    # older version holds the spelling of the watch list, and restoring
+    # under that name would trash the file whose name differs in case only
+    # and write it again under the other one.
+    files = _on_disk_files(manifest, root)
+    manifest = dict(manifest, files=files)
     # Sweep what is on disk NOW: every watched path that has no place in
     # the target snapshot goes to trash. (It used to compare against this
     # project's NEWEST snapshot, so after `restore <older>` the extra
@@ -1482,6 +1920,7 @@ def _restore(sha: str, trash_dir: str | None,
     snap_tree = snapshot_tree(sha, manifest)
     algo = _blob_algo(snap_tree)
     modes = _tree_blobs(sha)   # git file mode of every file in the snapshot
+    bits = _manifest_modes(manifest)   # group/other bits (see _apply_modes)
     for rel, ap in files.items():
         data, is_dir = _read_snapshot_file(sha, rel)
         if os.path.islink(ap):
@@ -1506,22 +1945,21 @@ def _restore(sha: str, trash_dir: str | None,
             os.makedirs(parent, exist_ok=True)
             tmp = tempfile.mkdtemp(prefix=".steward-restore-", dir=parent)
             try:
-                src = os.path.join(tmp, "files", *rel.split("/"))
+                src = tmp   # the folder is unpacked AS tmp (_unpack_folder)
                 arch = _run_git(REPO_DIR, ("archive", sha, f"files/{rel}"))
-                try:
-                    with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tf:
-                        if hasattr(tarfile, "tar_filter"):
-                            tf.extractall(tmp, filter="tar")
-                        else:  # Python without extraction filters
-                            tf.extractall(tmp)
-                except (tarfile.TarError, OSError):
-                    pass
-                if arch.returncode != 0 or not os.path.isdir(src):
+                why = "" if arch.returncode == 0 else " (git could not read it)"
+                if not why:
+                    try:
+                        _unpack_folder(arch.stdout, f"files/{rel}", src)
+                    except (tarfile.TarError, OSError) as e:
+                        why = f" ({getattr(e, 'strerror', None) or e})"
+                if why:
                     restored.append(f"skipped {ap}: could not extract "
-                                    f"snapshot {sha[:7]} (left untouched)")
+                                    f"snapshot {sha[:7]}{why} (left untouched)")
                     continue
                 if os.path.isdir(ap):
                     restored.extend(_keep_links(ap, src, snap_tree, algo))
+                _apply_modes(src, ap, rel, bits)
                 # Never delete: the existing path (dir, file or link) goes
                 # to trash before the snapshot copy takes its place - and
                 # comes back if that fails.
@@ -1559,6 +1997,7 @@ def _restore(sha: str, trash_dir: str | None,
                                 f"(left untouched)")
                 continue
             _set_executable(ap, modes.get(rel) == "100755")
+            _narrow_to_recorded(ap, rel, bits)
             restored.append(ap)
         else:
             # Recorded in the manifest but nothing in the tree: a watched
@@ -1572,6 +2011,7 @@ def _restore(sha: str, trash_dir: str | None,
                 continue
             if _swap_via_trash(ap, lambda: os.makedirs(ap), trash_dir,
                                restored, trashed):
+                _narrow_to_recorded(ap, rel, bits)
                 restored.append(ap)
     if trashed:
         prune_trash(trash_dir, protect=trashed)

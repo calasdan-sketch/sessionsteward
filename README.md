@@ -81,6 +81,15 @@ If yours is not picked up, add it explicitly:
 `watch --add` adds to that list — it never replaces it; `watch --remove`
 drops a path, a default included. Paths may be project-relative, `~/…`
 (`~\…` on Windows) or absolute, including files on another drive.
+`watch --add` refuses what could never be snapshotted - the project root
+itself (`.`), your home directory (`~`), the root of a drive and
+sessionsteward's own folder (`~/.sessionsteward`), also when a link leads
+there - with one `error:` line (exit 2) that says what to name instead, and
+changes nothing. An entry like that already in `config.json` (older versions
+accepted them, and every snap, undo and restore then failed) is skipped: each
+command says so in one `warning:` line per entry on stderr, naming the
+command that drops it (`sessionsteward watch --remove .`), and snapshots
+everything else as usual.
 
 **Shrink guard:** when a snapshot shows a watched file lost more than half
 its size since the previous snapshot (the "compaction ate my CLAUDE.md"
@@ -129,9 +138,22 @@ were moved there, never by the age of the file, and never including what the
 restore in progress has just put there); paths that are already at the
 snapshot's state are left alone (`unchanged .claude`) rather than swapped.
 **What a snapshot holds:** the bytes of every regular file under the watched
-paths (bar the ignored names and the oversized files described below), and
-whether it is executable (a hook script comes back runnable).
-Nothing else is recorded: not other permission bits, owners or timestamps;
+paths (bar the ignored names and the oversized files described below),
+whether it is executable (a hook script comes back runnable) and, on Linux
+and macOS, the group and other permission bits of every path that has fewer
+of them than git's own modes give back (0644 for a file, 0755 for a folder
+or an executable): a 0600 token file, a 0700 `.claude`. A restore gives a
+path those bits, less any the live path has lost since, so it is never more
+open than the snapshot recorded or than the path is now: a `.claude` (0700)
+holding a `secret.json` (0600) comes back 0700 and 0600, also when the agent
+had rewritten the file 0644. A path that is gone has nothing to be compared
+with and gets the recorded bits. A snapshot taken before 0.1.3 recorded none:
+there the live path's bits are the only limit, and a path that is gone comes
+back 0644 or 0755.
+Nothing else is recorded: not bits wider than that (a group-writable file
+loses its group write bit when its folder is restored), not the owner's
+bits (a restored folder or executable is rwx for you, any other file rw; a
+file written in place keeps its owner bits), owners or timestamps;
 not empty directories; not symlinks (a link is stored as the content behind
 it, and a restore keeps a link that is in place but never recreates one that
 is gone); not special files (a named pipe, socket or device is skipped,
@@ -142,7 +164,8 @@ loses its `.git` when `.claude` is restored). A restore
 replaces a watched directory as a whole, so whatever a snapshot cannot hold
 is *not* carried over - it stays in the trash copy the restore names
 (`moved .claude -> ~/.sessionsteward/trash/...`). A change that only toggles
-a file's executable bit is recorded by `snap`, but `undo` does not revert it.
+a file's executable bit or narrows its permissions is recorded by `snap`, but
+`undo` does not revert it.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
 default: cwd): snapshots record their project root (one repo is shared by
 all your projects and the whole history is scanned, so another project's
@@ -177,26 +200,53 @@ old-case path and never records the new one - so the snapshots repo's index
 is rebuilt from the files being mirrored on every snapshot instead of being
 updated in place. Version 0.1.1 (which refused every snapshot, `undo` and
 `restore` after such a rename, leaving a clobbered CLAUDE.md unrecoverable)
-left exactly that state behind; the next `snap` of 0.1.2 heals it, and a
-SessionStart hook is enough. The check that a snapshot holds every mirrored
-file compares names exactly - a name that differs in case is a different
-file - apart from one allowance: a name macOS keeps decomposed on disk (an
-accented letter as a letter plus a combining mark) counts as the file git
-recorded in composed form. A watch-list entry that spells a watched path in
-another case (`watch --add claude.md` next to the default `CLAUDE.md`) names
-that same path: it is stored once, under whichever spelling comes first in
-the list (before 0.1.2 it made every snapshot fail with `snapshot
-incomplete` until the entry was removed). Two files that merely differ by
-case, on a file system that allows it, stay two. One limit remains: a
-project is identified by its path as it is spelled, so the same folder
-reached as `C:\Users\Dan\Proj` and as `c:\users\dan\proj` is two projects
-with two histories (`undo` from the second says `nothing to restore`); start
-sessionsteward from the same spelling every time, or pass `--root`. The tests
-reproduce the rename on any OS by telling git to ignore case, and again on
-the file system itself wherever the temp directory is case-insensitive; they
-have been run on Linux over a case-insensitive FUSE mount (ciopfs), not on a
-Windows or macOS machine, and the macOS allowance is tested with hand-made
-names only.
+left exactly that state behind; the next `snap` heals it, and a
+SessionStart hook is enough.
+
+A watch-list entry is recorded under the spelling the file system gives the
+path, not the one that was typed. That covers `watch --add claude.md` for the
+file `CLAUDE.md`; the default `~/.claude/CLAUDE.md` when the file is
+`.claude/claude.md` (your home directory as the project); `watch --add
+.claude/rules/style.md` for `Style.md` inside the watched `.claude`; a
+folder entry in the other case (`.claude/Rules`); and an entry that names a
+file by the case it had before it was renamed. Every name below the project
+root (below your home directory for a path outside the project, below the
+drive for any other) is matched with the names its folder lists, the way the
+file system matches them, and replaced by the listed one. The project root
+itself is left as given. Two entries that name one file are one entry, the
+first in the list; two files that merely differ by case, on a file system
+that allows it, stay two. Before 0.1.3 these cases made `init`, `snap`, `undo`
+and `restore` fail with `snapshot incomplete ... (first:
+files/.claude/CLAUDE.md)` until the entry was removed; the next `snap` now
+heals a store they had wedged. If a snapshot is refused all the same for a
+file that a watch-list entry names, the message names the entry and the
+command that drops it (`sessionsteward watch --remove <entry>`). A snapshot
+taken by an older version holds the spelling the list had: `undo` and
+`restore` write the file in place under the name it has now (it is not moved
+to the trash and written again under the other one), but the first
+snapshot after the upgrade records the other spelling, so `diff` shows the
+old-case name removed and the new one added, and the guard line calls the
+old-case path `deleted`, as it does after any case-only rename.
+
+The check that a snapshot holds every mirrored file compares names exactly -
+a name that differs in case is a different file - apart from one allowance:
+a name macOS keeps decomposed on disk (an accented letter as a letter plus a
+combining mark) counts as the file git recorded in composed form. The
+comparison of your files with a snapshot, which tells `undo`, `restore` and
+`log` where you are, makes the same allowance (a file named that way would
+otherwise look changed for ever, and `undo` would take an extra `pre-undo`
+snapshot every time - seen with hand-made names, not on a Mac); two files
+that differ only that way are still two, never taken for one. One
+limit remains: a project is identified by its path as it is spelled, so the
+same folder reached as `C:\Users\Dan\Proj` and as `c:\users\dan\proj` is two
+projects with two histories (`undo` from the second says `nothing to
+restore`); start sessionsteward from the same spelling every time, or pass
+`--root`. The tests reproduce the rename on any OS by telling git to ignore
+case, emulate the lookup of a path in another case, and run again on the file
+system itself wherever the temp directory is case-insensitive; they have been
+run on Linux over a case-insensitive FUSE mount (ciopfs), not on a Windows or
+macOS machine, and the macOS allowance is tested with hand-made names only (a
+decomposed name on disk, the composed one in the snapshot), never on a Mac.
 
 **Your git setup stays out of it.** The snapshots repo is private, and
 every git command sessionsteward runs names that repo outright (a broken
@@ -249,19 +299,23 @@ name.
 A file found inside a watched directory that is bigger than 10 MB is left out
 too: `init`, `snap`, `precompact` and the `watch` daemon say so in one
 `warning:` line on stderr that names it, and `SESSIONSTEWARD_MAX_FILE_MB`
-changes the limit (`0` lifts it). A file you name yourself with `watch --add`
-is never left out for its size. None of the things left out comes back with a
-restore of the directory they sit in: when a restore replaces that
-directory, the old one - with them in it - goes to the trash
-(`moved .claude -> ...`).
+changes the limit (`0` lifts it, and so does a number too big to count, such
+as `1e305`). A file you name yourself with `watch --add` is never left out
+for its size, even where it lies inside a watched folder, and is never
+reported as left out; naming the folder does not name the files in it. None
+of the things left out comes back with a restore of the directory they sit
+in: when a restore replaces that directory, the old one - with them in it -
+goes to the trash (`moved .claude -> ...`).
 
 **Who can read the store.** `~/.sessionsteward` (the snapshots repo, the
 trash, the config and the lock) is created readable by you alone (mode 0700),
 and an older one that other users could enter is tightened the next time a
 command that writes runs; a mirrored file never gets more access than your
-own (a 0600 file is mirrored 0600). Everything you watch is copied, so a
-secret in `CLAUDE.local.md` is in the store too. Windows has no such mode:
-the folder inherits the permissions of your profile.
+own (a 0600 file is mirrored 0600), and a restore never gives your own files
+more access than they had either (see what a snapshot holds). Everything you
+watch is copied, so a secret in `CLAUDE.local.md` is in the store too.
+Windows has no such mode: the folder inherits the permissions of your
+profile.
 
 Mirrors live under `~/.sessionsteward/snapshots/files/` at their
 project-relative path (`__home/…` for files elsewhere under your home
@@ -269,10 +323,16 @@ directory, `__abs/<drive>/…` for anything else), so a mirror can never
 land outside the repo. On Windows that puts a few extra path components
 under `%USERPROFILE%`: a very deeply nested project can hit the 260-char
 `MAX_PATH` limit unless long paths are enabled (`git config --global
-core.longpaths true` plus Windows' `LongPathsEnabled`).
+core.longpaths true` plus Windows' `LongPathsEnabled`). Restoring a folder
+unpacks the copy next to it first, which adds about 20 characters to the
+longest path inside it.
 
-A corrupt `~/.sessionsteward/config.json` is reported with its path and
-left in place (your watch list is never silently replaced).
+A corrupt `~/.sessionsteward/config.json` is reported with its path, as one
+`error:` line (exit 2), and left in place - your watch list is never
+silently replaced. Corrupt means: not JSON; not UTF-8 (UTF-16, which is what
+PowerShell 5's `>` writes, gets a hint to save it as UTF-8; a UTF-8
+byte-order mark is fine); or a `watch` or `unwatch` that is not a list of
+paths (`"watch": "NOTES.md"` is refused, not read letter by letter).
 
 ## Claude Code hooks
 
@@ -318,8 +378,9 @@ knows about as a single `error: …` line on stderr instead of a traceback:
 exit code 2 for git (missing, unusable, a stale `index.lock`), a corrupt
 config or manifest, or a busy lock; exit code 1 when the operating system
 refuses a read or write (an unwritable home directory, a full disk, a file
-where a directory belongs). Only a bug in sessionsteward itself can still
-print a traceback.
+where a directory belongs). Whatever else goes wrong - a bug in
+sessionsteward, input nobody foresaw - is also one line, `error: unexpected
+...`, exit code 1, never a traceback.
 
 ## Context diet
 
@@ -350,15 +411,19 @@ python3 -m unittest discover -s tests   # temp dirs only; never touches ~/.sessi
 ```
 
 Every test runs against a temporary HOME; the newer ones also give git a
-private config and remove every `GIT_*` variable. The tests for read-only
-files and directories are skipped when run as root, where permission bits
-don't bind; tests that need POSIX features (symlinks, named pipes, execute
-and permission bits, shell-script hooks) are skipped on Windows; the tests
-that rename a file by case alone, or list a path in another case, on the
-file system itself are skipped wherever the temp directory is case-sensitive
-(set `TMPDIR` to a case-insensitive mount to run them on Linux: ciopfs,
-mounted with `-o use_ino` so that both spellings of a file report one file
-id, as NTFS and APFS do).
+private config and remove every `GIT_*` variable, and everything a run
+creates sits in one directory under `TMPDIR` that is removed when the run
+ends. The tests for read-only files and directories are skipped when run as
+root, where permission bits don't bind; tests that need POSIX features
+(symlinks, named pipes, execute and permission bits, shell-script hooks) are
+skipped on Windows; the tests that rename a file by case alone, or list a
+path in another case, on the file system itself are skipped wherever the temp
+directory is case-sensitive (set `TMPDIR` to a case-insensitive mount to run
+them on Linux: ciopfs, mounted with `-o
+use_ino,entry_timeout=0,attr_timeout=0,negative_timeout=0` so that both
+spellings of a file report one file id, as NTFS and APFS do, and nothing is
+cached across a rename). The same cases also run everywhere with only the
+lookup of a path in another case emulated.
 
 ## License
 

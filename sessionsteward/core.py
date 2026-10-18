@@ -15,9 +15,11 @@ anything.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import errno
 import fnmatch
+import functools
 import hashlib
 import io
 import json
@@ -33,6 +35,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import unicodedata
 
 try:  # POSIX: advisory whole-file locks
     import fcntl
@@ -66,6 +69,26 @@ DEFAULT_WATCH = ["CLAUDE.md", "CLAUDE.local.md", ".claude", "AGENTS.md",
 # snapshotted. `.git` is always skipped too.
 IGNORE_PATTERNS = ["*.log", "*transcript*", "__pycache__", ".git",
                    "node_modules"]
+
+# Dependencies and build output are never your memory, and a virtualenv can
+# be hundreds of megabytes, so these directories are skipped too, wherever
+# they sit inside a watched directory (directories only: a FILE called
+# `build` or `target` is a script somebody wrote):
+#   - a Python virtual environment: `.venv`, or any directory with a
+#     pyvenv.cfg (`venv`, `env`, ...);
+#   - `dist`, `build` and `target` next to a build manifest - only there,
+#     because `rules/build/` or `commands/dist/` is the user's own and must
+#     never be left out of a snapshot on the strength of its name alone.
+BUILD_OUTPUT_DIRS = ["dist", "build", "target"]
+BUILD_MANIFESTS = ["package.json", "pyproject.toml", "setup.py", "setup.cfg",
+                   "Cargo.toml", "pom.xml", "build.gradle",
+                   "build.gradle.kts", "build.sbt", "CMakeLists.txt",
+                   "Makefile", "meson.build", "go.mod", "tsconfig.json"]
+
+# A file found INSIDE a watched directory that is bigger than this is not
+# snapshotted (`snap` says so); a file you named yourself is exempt.
+# SESSIONSTEWARD_MAX_FILE_MB changes the limit, 0 lifts it.
+MAX_FILE_MB = 10.0
 
 # Snapshots must be byte-exact: never let a user's global core.autocrlf
 # (common on Windows) rewrite CRLF/LF on add, show or archive. Paths must
@@ -149,6 +172,47 @@ def _ignored_name(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
 
+def _ignored_dir(parent: str, name: str) -> bool:
+    """Is the directory parent/name skipped when a watched directory is
+    walked: an IGNORE_PATTERNS name, a virtual environment, or build output
+    (see BUILD_OUTPUT_DIRS)."""
+    if _ignored_name(name):
+        return True
+    full = os.path.join(parent, name)
+    if fnmatch.fnmatch(name, ".venv") \
+            or os.path.isfile(os.path.join(full, "pyvenv.cfg")):
+        return True
+    return (any(fnmatch.fnmatch(name, pat) for pat in BUILD_OUTPUT_DIRS)
+            and any(os.path.isfile(os.path.join(parent, m))
+                    for m in BUILD_MANIFESTS))
+
+
+def max_file_bytes() -> int | None:
+    """The size above which a file inside a watched directory is left out of
+    snapshots, or None for no limit. SESSIONSTEWARD_MAX_FILE_MB (megabytes
+    of 1024 * 1024 bytes, fractions allowed) overrides MAX_FILE_MB; 0 means
+    no limit; anything that is not a finite number >= 0 is ignored."""
+    raw = os.environ.get("SESSIONSTEWARD_MAX_FILE_MB")
+    try:
+        megabytes = float(raw) if raw and raw.strip() else MAX_FILE_MB
+    except ValueError:
+        megabytes = MAX_FILE_MB
+    if not 0 <= megabytes < float("inf"):   # also false for nan
+        megabytes = MAX_FILE_MB
+    return int(megabytes * 1024 * 1024) or None
+
+
+def _regular_size(path: str) -> int | None:
+    """Size of the regular file at path (a link to one counts); None for
+    anything else - a pipe, a socket, a device, a dangling link - or what
+    cannot be examined."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size if stat.S_ISREG(st.st_mode) else None
+
+
 def _norm_root(root: str | None) -> str | None:
     if root is None:
         return None
@@ -177,6 +241,24 @@ _held = threading.local()   # per thread: how deep the nested `locked()` is
 
 def lock_path() -> str:
     return os.path.join(os.path.dirname(REPO_DIR) or ".", "steward.lock")
+
+
+def _private_dir(path: str) -> None:
+    """Create the folder that holds the snapshots repo, the trash, the config
+    and the lock (~/.sessionsteward) so that only you can enter it: the repo
+    mirrors your memory files - CLAUDE.local.md is private by design - and the
+    trash holds whatever undo replaced. 0700 on POSIX, and an older folder
+    that is open to group or others is tightened (nothing else is touched).
+    Windows has no such mode; the folder inherits your profile's access."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if os.name == "nt":
+        return
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077 and st.st_uid == os.geteuid():
+            os.chmod(path, stat.S_IMODE(st.st_mode) & ~0o077)
+    except OSError:
+        pass
 
 
 def _lock_timeout() -> float:
@@ -235,7 +317,7 @@ def locked(timeout: float | None = None):
             _held.depth -= 1
         return
     path = lock_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _private_dir(os.path.dirname(path))
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
     try:
         wait = _lock_timeout() if timeout is None else timeout
@@ -480,11 +562,28 @@ def _expand_watch_entry(rel: str, project_root: str) -> str | None:
     return os.path.join(project_root, rel)
 
 
+def _same_entry(a: str, b: str) -> bool:
+    """Are these two paths one directory entry? Compared as lstat sees them,
+    so a symlink is itself and not what it points at."""
+    try:
+        return os.path.samestat(os.lstat(a), os.lstat(b))
+    except OSError:
+        return False
+
+
 def _watched_entries(project_root: str) -> list[tuple[str, str]]:
     """[(watch-list entry, absolute path)] for the watched paths that
-    exist now, deduped by path (the first entry naming a path wins)."""
+    exist now, deduped by path (the first entry naming a path wins).
+
+    So are two spellings that differ only by case and name one file: on a
+    case-insensitive file system `claude.md` next to the default `CLAUDE.md`
+    is the same path, and mirrored twice the second spelling would land on
+    the first one's file - git records a single name and the completeness
+    check would refuse every snapshot. (On a case-sensitive one two files
+    that merely differ by case are two paths, and both are kept.)"""
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
+    by_fold: dict[str, list[str]] = {}
     for rel in watch_list():
         p = _expand_watch_entry(rel, project_root)
         # A regular file or a directory (or a link to one). A named pipe,
@@ -492,9 +591,14 @@ def _watched_entries(project_root: str) -> list[tuple[str, str]]:
         # for ever - so it is as good as absent.
         if p and (os.path.isfile(p) or os.path.isdir(p)):
             ap = os.path.abspath(p)
-            if ap not in seen:
-                seen.add(ap)
-                out.append((rel, ap))
+            if ap in seen:
+                continue
+            twins = by_fold.setdefault(ap.casefold(), [])
+            if any(_same_entry(ap, other) for other in twins):
+                continue
+            seen.add(ap)
+            twins.append(ap)
+            out.append((rel, ap))
     return out
 
 
@@ -632,30 +736,49 @@ def _remove_mirror(path: str) -> None:
             retry(os.unlink, path, None)
 
 
-def _not_copied(dirpath: str, names: list[str]) -> set[str]:
-    """copytree's ignore: the IGNORE_PATTERNS, and everything that is not a
-    regular file or a directory once links are followed. Copying a named
-    pipe blocks for ever or fails, a socket or a device cannot be copied at
-    all; a dangling link has nothing behind it."""
-    skip = set(shutil.ignore_patterns(*IGNORE_PATTERNS)(dirpath, names))
+def _not_copied(dirpath: str, names: list[str],
+                too_big: list | None = None) -> set[str]:
+    """copytree's ignore: the IGNORE_PATTERNS, the virtual environments and
+    build output (_ignored_dir), everything that is not a regular file or a
+    directory once links are followed - copying a named pipe blocks for ever
+    or fails, a socket or a device cannot be copied at all, a dangling link
+    has nothing behind it - and regular files over max_file_bytes(), which
+    are appended to too_big as (path, size)."""
+    limit = max_file_bytes()
+    skip = set()
     for name in names:
         full = os.path.join(dirpath, name)
-        if name not in skip and not (os.path.isfile(full)
-                                     or os.path.isdir(full)):
+        if _ignored_name(name):
             skip.add(name)
+        elif os.path.isdir(full):
+            if _ignored_dir(dirpath, name):
+                skip.add(name)
+        else:
+            size = _regular_size(full)
+            if size is None:
+                skip.add(name)
+            elif limit is not None and size > limit:
+                skip.add(name)
+                if too_big is not None:
+                    too_big.append((full, size))
     return skip
 
 
 def _copy_content(src: str, dst: str) -> str:
-    """Copy a file's bytes and its execute bit - nothing else. (Not copy2:
-    the mirror must never inherit a read-only mode, or the next snap could
-    not replace it. But a hook script that loses its +x in the snapshot
-    comes back from `undo` unable to run.) git records the bit from the
-    mirror's mode; Windows has no such bit and git does not track one."""
+    """Copy a file's bytes and its permission bits - nothing else, and never
+    more access than the source gives (a 0600 file is not mirrored 0644).
+    The owner can always read and replace the copy, so the mirror never
+    inherits a read-only mode that the next snap could not get past. git
+    records only one bit from the copy's mode, the owner's execute bit, and a
+    hook script that loses its +x in the snapshot comes back from `undo`
+    unable to run. Windows has only a read-only flag and no execute bit."""
     shutil.copyfile(src, dst)
     try:
-        executable = os.stat(src).st_mode & stat.S_IXUSR
-        os.chmod(dst, 0o755 if executable else 0o644)
+        mode = os.stat(src).st_mode
+        if os.name == "nt":
+            os.chmod(dst, 0o755 if mode & stat.S_IXUSR else 0o644)
+        else:
+            os.chmod(dst, (mode & 0o777) | 0o600)
     except OSError:
         pass
     return dst
@@ -676,9 +799,23 @@ def _set_executable(path: str, executable: bool) -> None:
         pass
 
 
+def _composed(name: str) -> str:
+    return unicodedata.normalize("NFC", name)
+
+
 def _check_staged(files_dir: str, kinds: dict[str, str]) -> None:
     """Refuse to commit a snapshot that lacks something it mirrored: every
-    file under files/ (and every watched file) must be in the index."""
+    file under files/ (and every watched file) must be in the index, under
+    the name the mirror gives it.
+
+    Names are compared exactly - in particular NOT ignoring case: _snap
+    rebuilds the index from the mirror every time, so a name that differs
+    only in case is another file, one git did not record. The one rewrite of
+    a name that is expected is Unicode composition: macOS keeps a name like
+    e-acute decomposed on disk (e + U+0301) and git, with
+    core.precomposeunicode, records it composed (U+00E9). A name that
+    differs from an index entry only that way is accepted - once per index
+    entry, so two files cannot hide behind one."""
     mirrored = set()
     for root, _dirs, names in os.walk(files_dir):
         for name in names:
@@ -689,6 +826,15 @@ def _check_staged(files_dir: str, kinds: dict[str, str]) -> None:
     staged = {p for p in
               _git(REPO_DIR, "ls-files", "-z", "--", "files").split("\0") if p}
     missing = sorted(mirrored - staged)
+    if missing:
+        spare = collections.Counter(_composed(p) for p in staged - mirrored)
+        unmatched = []
+        for name in missing:
+            if spare[_composed(name)] > 0:
+                spare[_composed(name)] -= 1
+            else:
+                unmatched.append(name)
+        missing = unmatched
     if missing:
         raise StewardError(
             f"snapshot incomplete: git did not record {len(missing)} of the "
@@ -702,7 +848,16 @@ def snap(project_root: str, message: str) -> str:
         return _snap(project_root, message)
 
 
-def _snap(project_root: str, message: str) -> str:
+def snap_report(project_root: str, message: str) -> tuple[str, list]:
+    """snap(), plus the files it left out for being over max_file_bytes():
+    (sha, [(path, size), ...]) in path order."""
+    too_big: list = []
+    with locked():
+        sha = _snap(project_root, message, too_big)
+    return sha, sorted(set(too_big))
+
+
+def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     if not repo_ready():
         init_repo()
     _ensure_attributes()
@@ -737,7 +892,9 @@ def _snap(project_root: str, message: str) -> str:
             # Symlinks are followed: the mirror holds the content behind
             # them (restore() never writes it back through the link).
             shutil.copytree(ap, dest, copy_function=_copy_content,
-                            ignore=_not_copied, dirs_exist_ok=True)
+                            ignore=functools.partial(_not_copied,
+                                                     too_big=too_big),
+                            dirs_exist_ok=True)
         elif not os.path.lexists(dest):
             _copy_content(ap, dest)
     # No timestamp in the manifest: identical content must produce an
@@ -751,6 +908,16 @@ def _snap(project_root: str, message: str) -> str:
         json.dump({"project_root": _norm_root(project_root),
                    "files": manifest, "kinds": kinds,
                    "watch": watch_list()}, f, indent=2)
+    # The index is rebuilt from the mirror on every snapshot, never updated
+    # in place. On a case-insensitive file system (Windows, macOS) git sees
+    # a file or directory renamed by case alone (Notes.md -> notes.md) as
+    # the entry it already has: the old-case path stays in the index (the
+    # file "still exists") and the new-case name is never added, so the
+    # snapshot would hold the wrong name - or, with the check below, be
+    # refused for good. Starting from an empty index makes the tree what
+    # the mirror holds, spelled the way the mirror spells it. Whatever an
+    # earlier, refused snapshot left in the index goes with it.
+    _git(REPO_DIR, "read-tree", "--empty")
     # -f: the snapshot must hold EVERY mirrored file. Without it `git add`
     # obeys the ignore rules - the user's global ignore file, but also a
     # .gitignore that was itself mirrored out of a watched directory - and
@@ -1033,12 +1200,16 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
 
 def iter_files(paths: list[str]):
     """Yield every regular file under the watched paths (directories
-    walked, IGNORE_PATTERNS applied; pipes, sockets, devices and dangling
-    links skipped), in a stable order.
+    walked, IGNORE_PATTERNS applied, virtual environments and build output
+    left out, files inside a directory over max_file_bytes() left out; pipes,
+    sockets, devices and dangling links skipped), in a stable order. This is
+    the set snap() mirrors: what is compared with a snapshot must be what
+    went into it.
 
     Symlinked directories are walked (snap() mirrors what is behind
     them, so the live tree must see the same files), with a guard so a
     link back into the tree cannot loop forever."""
+    limit = max_file_bytes()
     for ap in paths:
         if os.path.isdir(ap):
             seen: set[str] = set()
@@ -1046,7 +1217,7 @@ def iter_files(paths: list[str]):
                 seen.add(os.path.realpath(root))
                 keep = []
                 for d in sorted(dirs):
-                    if _ignored_name(d):
+                    if _ignored_dir(root, d):
                         continue
                     full = os.path.join(root, d)
                     if os.path.islink(full) and os.path.realpath(full) in seen:
@@ -1057,7 +1228,8 @@ def iter_files(paths: list[str]):
                     full = os.path.join(root, fn)
                     # regular files only (links followed): the callers
                     # open() what they get, and a named pipe never returns
-                    if not _ignored_name(fn) and os.path.isfile(full):
+                    size = None if _ignored_name(fn) else _regular_size(full)
+                    if size is not None and (limit is None or size <= limit):
                         yield full
         elif os.path.isfile(ap):
             yield ap
@@ -1172,7 +1344,7 @@ def _links_under(top: str) -> list[str]:
     """Every symlink (to a file or a dir) inside the directory top."""
     links = []
     for root, dirs, files in os.walk(top):
-        dirs[:] = [d for d in dirs if not _ignored_name(d)]
+        dirs[:] = [d for d in dirs if not _ignored_dir(root, d)]
         for name in dirs + files:
             full = os.path.join(root, name)
             if os.path.islink(full):
@@ -1503,16 +1675,30 @@ def _self_cmd() -> str:
 
 HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact"
 HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap -m "session start"'
-# Any hook command that runs sessionsteward — ours from another (moved,
-# recreated) venv, or a bare `sessionsteward ...` written by an older
-# version. merge_hooks rewrites these in place rather than appending a
-# second, stale-plus-fresh pair.
-_STEWARD_CMD_RE = re.compile(
-    r"(?:^|[\s/\\\"'])sessionsteward(?:\.exe)?(?:\s|$)")
+# The arguments each event's hook has when sessionsteward wrote it.
+_HOOK_ARGS = {"PreCompact": ["precompact"],
+              "SessionStart": ["snap", "-m", "session start"]}
 
 
-def _invokes_steward(cmd) -> bool:
-    return isinstance(cmd, str) and bool(_STEWARD_CMD_RE.search(cmd))
+def _is_ours(event: str, cmd) -> bool:
+    """Did sessionsteward write this hook command for this event? Exactly
+    that, and nothing that merely mentions it: the bare `sessionsteward ...`
+    the first version wrote, or `<any python> -m sessionsteward ...` (ours
+    from another, moved or recreated, environment). merge_hooks rewrites
+    these in place rather than appending a second, stale-plus-fresh pair;
+    every other hook is the user's - `cd ~/code/sessionsteward && git pull`,
+    `sessionsteward snap -m checkpoint` - and is never touched."""
+    if not isinstance(cmd, str):
+        return False
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return False
+    args = _HOOK_ARGS[event]
+    return (words == ["sessionsteward", *args]
+            or (len(words) == len(args) + 3
+                and words[1:3] == ["-m", "sessionsteward"]
+                and words[3:] == args))
 
 
 def build_hooks_json() -> dict:
@@ -1549,10 +1735,11 @@ def merge_hooks(settings: dict) -> dict:
     """Merge our hooks into a settings dict without clobbering anything.
 
     Existing keys, events and other tools' hook entries are preserved.
-    Per event, the first existing hook that already runs sessionsteward
-    (from any interpreter path, or an old bare command) is rewritten to
-    the current command and further copies are dropped; our entry is
-    appended only when none exists. Re-running is idempotent. Raises
+    Per event, the first existing hook that sessionsteward itself wrote
+    (see _is_ours: from any interpreter path, or an old bare command) is
+    rewritten to the current command and further copies are dropped; our
+    entry is appended only when none exists, and a hook of the user's own is
+    never changed, whatever it says. Re-running is idempotent. Raises
     SettingsError for a `hooks` value of an unexpected shape (it cannot be
     merged into without replacing something the user wrote).
     """
@@ -1576,7 +1763,7 @@ def merge_hooks(settings: dict) -> dict:
                 continue
             kept = []
             for h in e["hooks"]:
-                if isinstance(h, dict) and _invokes_steward(h.get("command")):
+                if isinstance(h, dict) and _is_ours(event, h.get("command")):
                     if found:
                         continue  # stale duplicate
                     h["command"] = cmd

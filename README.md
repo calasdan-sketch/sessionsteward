@@ -59,7 +59,7 @@ sessionsteward watch --remove AGENTS.md    # stop watching a path, defaults incl
 
 sessionsteward snap -m "before refactor"   # snapshot now
 sessionsteward precompact                  # snapshot before compaction
-sessionsteward watch                       # daemon: auto-snapshot on change
+sessionsteward watch [--interval SECONDS]  # daemon: auto-snapshot on change (polls every 5 s)
 
 sessionsteward log                         # list snapshots (this project only, local time)
 sessionsteward diff                        # what changed (e.g. what compaction dropped)
@@ -129,15 +129,16 @@ were moved there, never by the age of the file, and never including what the
 restore in progress has just put there); paths that are already at the
 snapshot's state are left alone (`unchanged .claude`) rather than swapped.
 **What a snapshot holds:** the bytes of every regular file under the watched
-paths, and whether it is executable (a hook script comes back runnable).
+paths (bar the ignored names and the oversized files described below), and
+whether it is executable (a hook script comes back runnable).
 Nothing else is recorded: not other permission bits, owners or timestamps;
 not empty directories; not symlinks (a link is stored as the content behind
 it, and a restore keeps a link that is in place but never recreates one that
 is gone); not special files (a named pipe, socket or device is skipped,
 never read - reading a pipe would block for ever - and a restore never
 writes onto one: `skipped ... is not a regular file`); not the ignored names
-listed below (so a skill you cloned into `.claude/skills/` loses its `.git`
-when `.claude` is restored). A restore
+or oversized files listed below (so a skill you cloned into `.claude/skills/`
+loses its `.git` when `.claude` is restored). A restore
 replaces a watched directory as a whole, so whatever a snapshot cannot hold
 is *not* carried over - it stays in the trash copy the restore names
 (`moved .claude -> ~/.sessionsteward/trash/...`). A change that only toggles
@@ -169,6 +170,34 @@ empty directory. Snapshots taken by 0.1.0 do not say file or directory; for
 those a path with no stored content is refused only when restoring it would
 replace live content.
 
+**Windows and macOS (case-insensitive file systems).** A file or directory
+renamed by case alone (`Notes.md` to `notes.md`) is snapshotted under its new
+name. Git treats such a rename as the entry it already has - it keeps the
+old-case path and never records the new one - so the snapshots repo's index
+is rebuilt from the files being mirrored on every snapshot instead of being
+updated in place. Version 0.1.1 (which refused every snapshot, `undo` and
+`restore` after such a rename, leaving a clobbered CLAUDE.md unrecoverable)
+left exactly that state behind; the next `snap` of 0.1.2 heals it, and a
+SessionStart hook is enough. The check that a snapshot holds every mirrored
+file compares names exactly - a name that differs in case is a different
+file - apart from one allowance: a name macOS keeps decomposed on disk (an
+accented letter as a letter plus a combining mark) counts as the file git
+recorded in composed form. A watch-list entry that spells a watched path in
+another case (`watch --add claude.md` next to the default `CLAUDE.md`) names
+that same path: it is stored once, under whichever spelling comes first in
+the list (before 0.1.2 it made every snapshot fail with `snapshot
+incomplete` until the entry was removed). Two files that merely differ by
+case, on a file system that allows it, stay two. One limit remains: a
+project is identified by its path as it is spelled, so the same folder
+reached as `C:\Users\Dan\Proj` and as `c:\users\dan\proj` is two projects
+with two histories (`undo` from the second says `nothing to restore`); start
+sessionsteward from the same spelling every time, or pass `--root`. The tests
+reproduce the rename on any OS by telling git to ignore case, and again on
+the file system itself wherever the temp directory is case-insensitive; they
+have been run on Linux over a case-insensitive FUSE mount (ciopfs), not on a
+Windows or macOS machine, and the macOS allowance is tested with hand-made
+names only.
+
 **Your git setup stays out of it.** The snapshots repo is private, and
 every git command sessionsteward runs names that repo outright (a broken
 `.git` there is an error, never an excuse to use whatever repository your
@@ -197,16 +226,42 @@ moment the process ends, even under `kill -9`, so it can never go stale.
 A second command simply waits its turn (up to 30 seconds; set
 `SESSIONSTEWARD_LOCK_TIMEOUT` to change that) and then fails with a one-line
 `error: another sessionsteward is still working …`, exit 2. The `watch`
-daemon keeps going when a snapshot fails (busy lock, a git hiccup, a file
-that vanished mid-copy): it prints a `warning: … will retry` line on stderr
-and tries again on the next tick. A snapshot whose `manifest.json` cannot be
-read (older versions could commit one when two snaps raced) is skipped by
-`log`/`undo` instead of breaking them for every project, and refused by
-`restore`.
+daemon polls every `--interval` seconds (5 unless you say otherwise; from 0.1
+to 86400 - anything else, `nan` and `0` included, is a one-line
+`error: --interval must be ...`, exit 2). It keeps going when a snapshot fails
+(busy lock, a git hiccup, a file that vanished mid-copy): it prints a
+`warning: … will retry` line on stderr and tries again on the next tick.
+A snapshot whose `manifest.json` cannot be read (older versions could
+commit one when two snaps raced) is skipped by `log`/`undo` instead of
+breaking them for every project, and refused by `restore`.
 
 Ignored on every snap and by the watch daemon: `*.log`, `*transcript*`,
 `__pycache__`, `.git`, `node_modules` (transcripts would otherwise balloon
-the snapshots repo).
+the snapshots repo) and - directories only, so a script called `build` is
+kept - Python virtual environments (`.venv`, or any directory with a
+`pyvenv.cfg`) and the `dist`, `build` and `target` directories that sit next
+to a build manifest (`package.json`, `pyproject.toml`, `setup.py`,
+`setup.cfg`, `Cargo.toml`, `pom.xml`, `build.gradle`, `build.gradle.kts`,
+`build.sbt`, `CMakeLists.txt`, `Makefile`, `meson.build`, `go.mod` or
+`tsconfig.json`); a `rules/build/` of yours is never left out because of its
+name.
+
+A file found inside a watched directory that is bigger than 10 MB is left out
+too: `init`, `snap`, `precompact` and the `watch` daemon say so in one
+`warning:` line on stderr that names it, and `SESSIONSTEWARD_MAX_FILE_MB`
+changes the limit (`0` lifts it). A file you name yourself with `watch --add`
+is never left out for its size. None of the things left out comes back with a
+restore of the directory they sit in: when a restore replaces that
+directory, the old one - with them in it - goes to the trash
+(`moved .claude -> ...`).
+
+**Who can read the store.** `~/.sessionsteward` (the snapshots repo, the
+trash, the config and the lock) is created readable by you alone (mode 0700),
+and an older one that other users could enter is tightened the next time a
+command that writes runs; a mirrored file never gets more access than your
+own (a 0600 file is mirrored 0600). Everything you watch is copied, so a
+secret in `CLAUDE.local.md` is in the store too. Windows has no such mode:
+the folder inherits the permissions of your profile.
 
 Mirrors live under `~/.sessionsteward/snapshots/files/` at their
 project-relative path (`__home/…` for files elsewhere under your home
@@ -235,11 +290,16 @@ writes (`watch --add`) and those get the same protection.
 The hooks call the Python that ran `install-hooks` by absolute path
 (`"/path/to/python" -m sessionsteward ...`), because hook shells don't load
 your aliases or activate your venv — re-run `install-hooks --write` if you
-move or recreate that environment: any hook that runs sessionsteward is
-rewritten in place (older bare `sessionsteward ...` hooks too), never
-duplicated. `--write` merges into the existing settings file without
-clobbering your other hooks, and re-running is a no-op (nothing is written
-when the hooks are already there).
+move or recreate that environment: the hooks sessionsteward wrote itself
+(`sessionsteward precompact` and `sessionsteward snap -m "session start"` as
+the first version wrote them, or the same commands run as
+`<python> -m sessionsteward ...` by any interpreter) are rewritten in place,
+never duplicated. Every other hook is yours and is left alone, even one that
+mentions sessionsteward (`cd ~/code/sessionsteward && git pull`,
+`sessionsteward snap -m checkpoint`); `--write` adds the two hooks beside
+it. It merges into the existing settings file without clobbering your other
+hooks, and re-running is a no-op (nothing is written when the hooks are
+already there).
 
 `--write` never guesses at a settings file it cannot read: one that is not
 strict JSON (a comment, a trailing comma, a truncated file, broken UTF-8) or
@@ -290,10 +350,15 @@ python3 -m unittest discover -s tests   # temp dirs only; never touches ~/.sessi
 ```
 
 Every test runs against a temporary HOME; the newer ones also give git a
-private config and remove every `GIT_*` variable. Two tests (read-only
-files/dirs) are skipped when run as root,
-where permission bits don't bind; tests that need POSIX features (symlinks,
-named pipes, execute bits, shell-script hooks) are skipped on Windows.
+private config and remove every `GIT_*` variable. The tests for read-only
+files and directories are skipped when run as root, where permission bits
+don't bind; tests that need POSIX features (symlinks, named pipes, execute
+and permission bits, shell-script hooks) are skipped on Windows; the tests
+that rename a file by case alone, or list a path in another case, on the
+file system itself are skipped wherever the temp directory is case-sensitive
+(set `TMPDIR` to a case-insensitive mount to run them on Linux: ciopfs,
+mounted with `-o use_ino` so that both spellings of a file report one file
+id, as NTFS and APFS do).
 
 ## License
 

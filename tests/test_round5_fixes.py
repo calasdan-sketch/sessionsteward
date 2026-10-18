@@ -534,7 +534,7 @@ class TestWatchSurvivesContention(Base):
             ticks["snaps"] += 1
             if ticks["snaps"] == 1:
                 raise core_mod.GitError("git add -A -f failed: index.lock")
-            return "a" * 40
+            return "a" * 40, []
 
         def stop_after_a_few(_seconds):
             ticks["sleeps"] += 1
@@ -542,10 +542,10 @@ class TestWatchSurvivesContention(Base):
                 raise KeyboardInterrupt
 
         with mock.patch.object(core_mod, "file_mtimes", changing), \
-                mock.patch.object(core_mod, "snap", flaky_snap), \
+                mock.patch.object(core_mod, "snap_report", flaky_snap), \
                 mock.patch.object(cli_mod, "time",
                                   mock.Mock(sleep=stop_after_a_few)):
-            code, out, err = self.cli("watch", "--interval", "0.01")
+            code, out, err = self.cli("watch", "--interval", "0.1")
         self.assertEqual(code, 0, err)
         self.assertGreaterEqual(ticks["snaps"], 2)
         self.assertIn("will retry", err)

@@ -1135,7 +1135,8 @@ class TestSteward(unittest.TestCase):
 
     def test_git_failure_is_a_clean_error(self):
         # A stale .git/index.lock made `git add` fail -> RuntimeError
-        # traceback. Must be `error: git add -A -f failed: ...`, exit 2.
+        # traceback. Must be `error: git <command> failed: ...`, exit 2 (the
+        # first git command to meet the lock is the one that is named).
         self._cli("init")
         lock = os.path.join(core_mod.REPO_DIR, ".git", "index.lock")
         with open(lock, "w") as f:
@@ -1144,8 +1145,7 @@ class TestSteward(unittest.TestCase):
             f.write("more\n")
         code, out, err = self._cli_err(self.proj, "snap", "-m", "x")
         self.assertEqual(code, 2)
-        self.assertIn("error: git add -A -f failed", err)
-        self.assertIn("index.lock", err)
+        self.assertRegex(err, r"^error: git \S+.* failed: .*index\.lock")
         self.assertNotIn("Traceback", err)
 
     def test_identical_dir_not_swapped_and_trash_pruned(self):

@@ -37,9 +37,15 @@ import time
 from . import core as core_mod
 from . import diet as diet_mod
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+# `watch --interval`, in seconds: a daemon that polls more often than this
+# only burns CPU walking the watched files, and one that sleeps for more than
+# a day (or for ever) is not watching.
+MIN_INTERVAL = 0.1
+MAX_INTERVAL = 86400.0
 
 
 def _harden_streams() -> None:
@@ -130,6 +136,33 @@ def _print_restored(restored: list[str], root: str) -> None:
             print(f"  restored {_short(r, root)}")
 
 
+def _warn(message: str) -> None:
+    """A warning on stderr (stdout is what a hook feeds the agent). Not being
+    able to print one never fails the command that already did its work."""
+    try:
+        print(f"warning: {message}", file=sys.stderr)
+    except OSError:
+        pass
+
+
+def _warn_too_big(too_big: list, root: str) -> None:
+    """One line about the files a snapshot left out for being over the size
+    limit - a file that is silently missing from a snapshot is a file that
+    `undo` cannot bring back."""
+    if not too_big:
+        return
+    limit = core_mod.max_file_bytes()
+    over = f"over the {limit / 1048576:g} MB limit" if limit else "too big"
+    path, size = too_big[0]
+    first = f"{_short(path, root)} ({size / 1048576:.1f} MB)"
+    if len(too_big) == 1:
+        what = f"not snapshotted, {over}: {first}"
+    else:
+        what = (f"{len(too_big)} files {over} were not snapshotted "
+                f"(first: {first})")
+    _warn(f"{what}; SESSIONSTEWARD_MAX_FILE_MB changes the limit")
+
+
 def cmd_init(args) -> int:
     repo = core_mod.init_repo()
     print(f"snapshots repo: {repo}")
@@ -139,8 +172,9 @@ def cmd_init(args) -> int:
     elif core_mod.watched_paths(args.root):
         # A first snapshot right away, so `undo` has somewhere to go the
         # moment the agent first clobbers a file.
-        sha = core_mod.snap(args.root, "initial snapshot")
+        sha, too_big = core_mod.snap_report(args.root, "initial snapshot")
         print(f"snapshot {sha[:7]} (initial)")
+        _warn_too_big(too_big, args.root)
     else:
         print(f"nothing to snapshot yet: no watched file exists in "
               f"{os.path.abspath(args.root)}")
@@ -165,16 +199,19 @@ def _guard(root: str, sha: str) -> None:
 
 
 def cmd_snap(args) -> int:
-    sha = core_mod.snap(args.root, args.message or "manual snapshot")
+    sha, too_big = core_mod.snap_report(args.root,
+                                        args.message or "manual snapshot")
     print(f"snapshot {sha[:7]}")
+    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
 
 def cmd_precompact(args) -> int:
-    sha = core_mod.snap(args.root, "pre-compaction snapshot")
+    sha, too_big = core_mod.snap_report(args.root, "pre-compaction snapshot")
     print(f"pre-compaction snapshot {sha[:7]} — "
           f"`sessionsteward diff {sha[:7]}` after, to see what was dropped")
+    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
@@ -375,8 +412,10 @@ def cmd_watch(args) -> int:
             try:
                 now = core_mod.file_mtimes(core_mod.watched_paths(args.root))
                 if now != mtimes:
-                    sha = core_mod.snap(args.root, "auto: files changed")
+                    sha, too_big = core_mod.snap_report(
+                        args.root, "auto: files changed")
                     print(f"change detected -> snapshot {sha[:7]}")
+                    _warn_too_big(too_big, args.root)
                     _guard(args.root, sha)
                     mtimes = now
                 last_problem = None
@@ -398,6 +437,21 @@ def cmd_watch(args) -> int:
     return 0
 
 
+def _poll_interval(text) -> float:
+    """`watch --interval` as seconds: a finite number from MIN_INTERVAL to
+    MAX_INTERVAL. Anything else (negative, zero, nan, inf, text, a value
+    time.sleep cannot take) is an error, never a traceback or a busy loop."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        value = float("nan")
+    if not MIN_INTERVAL <= value <= MAX_INTERVAL:   # false for nan, too
+        raise core_mod.StewardError(
+            f"--interval must be a number of seconds from {MIN_INTERVAL:g} "
+            f"to {MAX_INTERVAL:g} (got {text!r})")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sessionsteward", description=__doc__)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -414,8 +468,9 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--remove", nargs="+", default=None,
                     help="Drop paths from the watch list, defaults "
                          "included (then exit).")
-    wa.add_argument("--interval", type=float, default=5.0,
-                    help="Poll seconds for the daemon.")
+    wa.add_argument("--interval", default="5", metavar="SECONDS",
+                    help=f"Poll seconds for the daemon, from {MIN_INTERVAL:g} "
+                         f"to {MAX_INTERVAL:g} (default 5).")
     sn = sub.add_parser("snap", help="Snapshot now.")
     sn.add_argument("-m", "--message", default=None)
     sub.add_parser("precompact", help="Snapshot before compaction.")
@@ -469,6 +524,8 @@ def main(argv=None) -> int:
     writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
         or (args.cmd == "watch" and (args.add or args.remove))
     try:
+        if args.cmd == "watch":
+            args.interval = _poll_interval(args.interval)
         with core_mod.locked() if writes else contextlib.nullcontext():
             rc = cmds[args.cmd](args)
         if sys.stdout is not None:

@@ -94,6 +94,12 @@ b81d0e4  2026-10-16 09:12  auto: files changed
 2f0c9aa  2026-10-16 08:40  session start
 ```
 
+`diff` prints every added (`+`) and removed (`-`) line between two snapshots
+across all watched files, file headers left out, at most 200 lines (it says
+how many more there are); when the only differences have no lines to show
+(a binary file, or just a file mode) it says `no line changes` instead of
+`(no changes)`.
+
 Files are named as you know them: project-relative (`CLAUDE.md`,
 `.claude/rules/testing.md`), `~/.claude/CLAUDE.md`, or absolute. The
 "`undo` to recover" hint appears only while your files *are* that
@@ -108,16 +114,34 @@ don't bury the good one. After `undo`/`restore` your watched files *are*
 the target snapshot: whatever is watched now but didn't exist in it is
 moved to `~/.sessionsteward/trash/` — never deleted, **directories
 included** — and a file that cannot be written (read-only, or a directory
-now sits in its place) is reported as `skipped … (left untouched)` with
-exit code 1 while the rest is restored. Symlinks are never written
+now sits in its place), or a path that cannot be moved to the trash, is
+reported as `skipped … (left untouched)` with exit code 1 while the rest is
+restored (a directory that was moved to the trash and could not be replaced
+is moved back, never left missing). Symlinks are never written
 through: the link stays where it is, and when what is behind it differs
 from the snapshot that is `skipped … is a symlink` (exit 1). A path added
 with `watch --add` *after* a snapshot was taken is outside that snapshot's
 scope — restoring it leaves the path alone and says so (`kept NOTES.md:
 not watched when snapshot a3f9c21 was taken`); every snapshot records its
 watch list for this.
-The trash keeps the newest 20 entries; paths that are already at the
+The trash keeps the 20 most recently trashed entries (ordered by when they
+were moved there, never by the age of the file, and never including what the
+restore in progress has just put there); paths that are already at the
 snapshot's state are left alone (`unchanged .claude`) rather than swapped.
+**What a snapshot holds:** the bytes of every regular file under the watched
+paths, and whether it is executable (a hook script comes back runnable).
+Nothing else is recorded: not other permission bits, owners or timestamps;
+not empty directories; not symlinks (a link is stored as the content behind
+it, and a restore keeps a link that is in place but never recreates one that
+is gone); not special files (a named pipe, socket or device is skipped,
+never read - reading a pipe would block for ever - and a restore never
+writes onto one: `skipped ... is not a regular file`); not the ignored names
+listed below (so a skill you cloned into `.claude/skills/` loses its `.git`
+when `.claude` is restored). A restore
+replaces a watched directory as a whole, so whatever a snapshot cannot hold
+is *not* carried over - it stays in the trash copy the restore names
+(`moved .claude -> ~/.sessionsteward/trash/...`). A change that only toggles
+a file's executable bit is recorded by `snap`, but `undo` does not revert it.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
 default: cwd): snapshots record their project root (one repo is shared by
 all your projects and the whole history is scanned, so another project's
@@ -131,6 +155,54 @@ and says so). Undoing or restoring with unsaved changes — a state that
 matches no snapshot — first snapshots it as `pre-undo`/`pre-restore`, so
 every undo is reversible: redo is `restore` of that snapshot (or of the
 snapshot you came from).
+
+Every watched file is stored whatever git's ignore rules say: a global
+ignore file, or a `.gitignore` inside `.claude/`, never hides one from a
+snapshot (a snapshot that git left a mirrored file out of is not committed
+at all: `error: snapshot incomplete`). Each snapshot also records whether a
+watched path was a file or a directory, and `undo`/`restore` check the
+snapshot against that list *before* they touch a single file: a snapshot
+that cannot supply everything it lists (a torn one, as older versions could
+commit when two snaps raced) is refused — `error: refusing to restore
+snapshot …`, exit 1, nothing changed — instead of replacing a file with an
+empty directory. Snapshots taken by 0.1.0 do not say file or directory; for
+those a path with no stored content is refused only when restoring it would
+replace live content.
+
+**Your git setup stays out of it.** The snapshots repo is private, and
+every git command sessionsteward runs names that repo outright (a broken
+`.git` there is an error, never an excuse to use whatever repository your
+home directory is) and drops the `GIT_*` environment variables that could
+point git somewhere else (`GIT_DIR`, `GIT_INDEX_FILE`, ... - git sets
+several of them for its own hooks and aliases) or stamp another identity on
+a snapshot (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`). On its own command line
+only, it also overrides the parts of *your* git configuration that would
+change a snapshot or stop one from being made: commit signing, hooks
+(`core.hooksPath`, and hooks a template dir copies into a new repo), a
+global ignore file, `core.fsmonitor`, automatic gc and colour. Your config
+files are never edited, and the variables that only say where they live
+(`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`) or where
+git's programs are (`GIT_EXEC_PATH`) are kept. `diff` prints a plain unified
+diff whatever your colour, external-diff or rename settings are. A snapshots
+repo whose first commit never happened (a failed `init`) is finished by the
+next command; one git cannot read is reported - `error: the snapshots repo
+... cannot be used`, exit 2 - and left alone.
+
+**One writer at a time.** All your projects, hooks and the `watch` daemon
+share one snapshots repo, so every command that writes (`init`, `snap`,
+`precompact`, `undo`, `restore`, `watch --add/--remove`, and each snapshot
+the daemon takes) first takes a lock — a file lock on
+`~/.sessionsteward/steward.lock`, dropped by the operating system the
+moment the process ends, even under `kill -9`, so it can never go stale.
+A second command simply waits its turn (up to 30 seconds; set
+`SESSIONSTEWARD_LOCK_TIMEOUT` to change that) and then fails with a one-line
+`error: another sessionsteward is still working …`, exit 2. The `watch`
+daemon keeps going when a snapshot fails (busy lock, a git hiccup, a file
+that vanished mid-copy): it prints a `warning: … will retry` line on stderr
+and tries again on the next tick. A snapshot whose `manifest.json` cannot be
+read (older versions could commit one when two snaps raced) is skipped by
+`log`/`undo` instead of breaking them for every project, and refused by
+`restore`.
 
 Ignored on every snap and by the watch daemon: `*.log`, `*transcript*`,
 `__pycache__`, `.git`, `node_modules` (transcripts would otherwise balloon
@@ -166,13 +238,28 @@ your aliases or activate your venv — re-run `install-hooks --write` if you
 move or recreate that environment: any hook that runs sessionsteward is
 rewritten in place (older bare `sessionsteward ...` hooks too), never
 duplicated. `--write` merges into the existing settings file without
-clobbering your other hooks, and re-running is a no-op.
+clobbering your other hooks, and re-running is a no-op (nothing is written
+when the hooks are already there).
+
+`--write` never guesses at a settings file it cannot read: one that is not
+strict JSON (a comment, a trailing comma, a truncated file, broken UTF-8) or
+whose `hooks` is not the usual shape is **refused** — `error: …`, exit 2, the
+file untouched — and the hooks JSON is printed so you can paste it in by
+hand. A UTF-8 BOM is accepted (and not written back). When it does write, it
+writes atomically, keeps your previous file as `settings.json.bak` (the
+state just before the latest write), keeps your line endings and
+indentation, and writes through a symlinked `settings.json` instead of
+replacing the link.
 
 Note that what a SessionStart or PreCompact hook prints on stdout is
 added to Claude's context. sessionsteward keeps it to one line
-(`snapshot a3f9c21`) plus any guard warnings, and reports problems (git
-missing, a stale `index.lock`, a corrupt config) as a single `error: …`
-line on stderr with exit code 2 — never a traceback.
+(`snapshot a3f9c21`) plus any guard warnings, and reports the problems it
+knows about as a single `error: …` line on stderr instead of a traceback:
+exit code 2 for git (missing, unusable, a stale `index.lock`), a corrupt
+config or manifest, or a busy lock; exit code 1 when the operating system
+refuses a read or write (an unwritable home directory, a full disk, a file
+where a directory belongs). Only a bug in sessionsteward itself can still
+print a traceback.
 
 ## Context diet
 
@@ -199,11 +286,14 @@ transcripts and logs are watched for undo but never counted.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 71 tests, temp dirs only
+python3 -m unittest discover -s tests   # temp dirs only; never touches ~/.sessionsteward
 ```
 
-Two tests (read-only files/dirs) are skipped when run as root, where
-permission bits don't bind; the symlink test is skipped on Windows.
+Every test runs against a temporary HOME; the newer ones also give git a
+private config and remove every `GIT_*` variable. Two tests (read-only
+files/dirs) are skipped when run as root,
+where permission bits don't bind; tests that need POSIX features (symlinks,
+named pipes, execute bits, shell-script hooks) are skipped on Windows.
 
 ## License
 

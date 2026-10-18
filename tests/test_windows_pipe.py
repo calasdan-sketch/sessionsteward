@@ -9,6 +9,7 @@ import errno
 import io
 import sys
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 
 from sessionsteward import cli as cli_mod
@@ -71,22 +72,30 @@ class TestWindowsClosedPipe(unittest.TestCase):
 
     def test_einval_off_windows_is_still_an_error(self):
         gone: list[int] = []
-        with self.assertRaises(OSError):
-            self._call_raising(False, _einval(), gone)
+        rc, err = self._call_failing(False, _einval(), gone)
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", err)
         self.assertEqual(gone, [])
 
     def test_einval_naming_a_file_is_not_a_pipe(self):
         gone: list[int] = []
-        with self.assertRaises(OSError):
-            self._call_raising(True, _einval("somefile.txt"), gone)
+        rc, err = self._call_failing(True, _einval("somefile.txt"), gone)
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", err)
+        self.assertIn("somefile.txt", err)
         self.assertEqual(gone, [])
 
-    def _call_raising(self, windows, exc, gone):
+    def _call_failing(self, windows, exc, gone):
+        """An OSError that is not "the reader went away" is an `error:` line
+        and exit 1 - not a quiet exit 0, and not a traceback."""
+        err = io.StringIO()
         with mock.patch.object(cli_mod, "_WINDOWS", windows), \
                 mock.patch.object(cli_mod, "_stdout_gone", lambda: gone.append(1)), \
-                mock.patch.object(sys, "stdout", _DeadPipe(exc)):
+                mock.patch.object(sys, "stdout", _DeadPipe(exc)), \
+                redirect_stderr(err):
             with mock.patch.object(cli_mod, "cmd_log", lambda a: print("hello") or 0):
                 rc = cli_mod.main(["log"])
+        return rc, err.getvalue()
 
 
 if __name__ == "__main__":

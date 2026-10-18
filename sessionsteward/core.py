@@ -3,6 +3,7 @@
 Layout inside the snapshots repo:
   files/<rel>          mirrored watched files (only this snapshot's project)
   manifest.json        {"project_root": ..., "files": {rel: abspath},
+                        "kinds": {rel: "file" | "dir"},
                         "watch": [the watch list in force]} for the snap
 
 rel is the path relative to the project root; files outside the project
@@ -14,11 +15,14 @@ anything.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import fnmatch
 import hashlib
 import io
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -27,7 +31,17 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+
+try:  # POSIX: advisory whole-file locks
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:  # Windows: byte-range locks
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None
 
 REPO_DIR = os.path.expanduser("~/.sessionsteward/snapshots")
 CONFIG_PATH = os.path.expanduser("~/.sessionsteward/config.json")
@@ -58,7 +72,40 @@ IGNORE_PATTERNS = ["*.log", "*transcript*", "__pycache__", ".git",
 # be byte-exact too: with core.quotePath (git's default) a non-ASCII name
 # such as commands/Καλάς.md is listed as "\316\232..." and never matches
 # the name on disk.
-GIT = ["git", "-c", "core.autocrlf=false", "-c", "core.quotePath=false"]
+#
+# The same goes for the rest of YOUR git configuration that could change
+# what a snapshot is, or stop one from being made in this private repo:
+# signing (a commit that needs a passphrase or a missing gpg fails), hooks
+# (your core.hooksPath, or hooks a template dir copied into the new repo),
+# a global ignore file, a file-system monitor (it may start a daemon that
+# keeps the repo busy), automatic gc/maintenance (it detaches and outlives
+# the command that started it) and colour. Every internal git call
+# overrides them on its own command line; your config files are not touched.
+_GIT_CONFIG = (
+    ("core.autocrlf", "false"),
+    ("core.quotePath", "false"),
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),   # git's own spelling of "no such dir"
+    ("core.excludesFile", ""),
+    ("commit.gpgsign", "false"),
+    ("tag.gpgsign", "false"),
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+    ("color.ui", "false"),
+)
+GIT = ["git"] + [arg for key, value in _GIT_CONFIG
+                 for arg in ("-c", f"{key}={value}")]
+
+# GIT_* variables that only say WHICH config files git reads or where its
+# own programs live: your git is set up through them, so they are kept.
+# Every other GIT_* variable is dropped from the environment of the git
+# calls: GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY...
+# would point git at a repository that is not ours (git exports several of
+# them to its hooks and aliases), GIT_AUTHOR_* / GIT_COMMITTER_* would
+# stamp their identity and dates on our commits, and GIT_CONFIG_COUNT /
+# GIT_CONFIG_PARAMETERS would inject configuration.
+_GIT_ENV_KEEP = frozenset({"GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL",
+                           "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"})
 
 # Written to <repo>/.git/info/attributes (highest attribute precedence):
 # a global `* text=auto` attributes file, or a .gitattributes inside a
@@ -84,6 +131,20 @@ class CrossProjectError(StewardError):
     """Raised when a snapshot belongs to a different project root."""
 
 
+class LockTimeoutError(StewardError):
+    """Raised when another sessionsteward kept the lock too long."""
+
+
+class SettingsError(StewardError):
+    """The Claude Code settings file cannot be merged into without risking
+    the user's settings; it was left untouched."""
+
+
+class SnapshotDamagedError(StewardError):
+    """Raised when a restore would replace live files with something the
+    snapshot cannot provably supply (a torn or incomplete snapshot)."""
+
+
 def _ignored_name(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
@@ -94,18 +155,142 @@ def _norm_root(root: str | None) -> str | None:
     return os.path.abspath(os.path.expanduser(root))
 
 
+# ---------------------------------------------------------------------------
+# One writer at a time
+# ---------------------------------------------------------------------------
+# Every project, hook, `watch` daemon and manual command shares ONE snapshots
+# repo (one index, one files/ mirror, one manifest.json). Two processes in it
+# at once collided on git's index.lock, and - worse - one deleted files/
+# while the other was adding them, committing a snapshot whose tree lacked
+# files (or a half-written manifest). Everything that writes takes this lock.
+#
+# The lock is an OS-level file lock (flock on POSIX, msvcrt.locking on
+# Windows) on a file NEXT TO the snapshots repo (never inside the work tree
+# `git add -A` commits from). The OS drops it when the process dies, even
+# under `kill -9`, so there is no stale lock to clean up.
+
+LOCK_TIMEOUT = 30.0   # seconds to wait for another sessionsteward
+_LOCK_BUSY = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK,
+              getattr(errno, "EDEADLOCK", errno.EDEADLK)}
+_held = threading.local()   # per thread: how deep the nested `locked()` is
+
+
+def lock_path() -> str:
+    return os.path.join(os.path.dirname(REPO_DIR) or ".", "steward.lock")
+
+
+def _lock_timeout() -> float:
+    raw = os.environ.get("SESSIONSTEWARD_LOCK_TIMEOUT")
+    try:
+        value = float(raw) if raw else LOCK_TIMEOUT
+    except ValueError:
+        return LOCK_TIMEOUT
+    return value if value == value and value >= 0 else LOCK_TIMEOUT
+
+
+def _try_lock(fd: int) -> bool:
+    """One non-blocking attempt: True = acquired, False = held elsewhere.
+    Anything else wrong with locking is an error, never a silent no-lock."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            raise StewardError("this platform has no file locking "
+                               "(fcntl or msvcrt), so snapshots cannot be "
+                               "serialised safely")
+    except OSError as e:
+        if e.errno in _LOCK_BUSY:
+            return False
+        raise StewardError(f"cannot lock {lock_path()}: "
+                           f"{e.strerror or e}") from None
+    return True
+
+
+def _unlock(fd: int) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass  # closing the descriptor releases it anyway
+
+
+@contextlib.contextmanager
+def locked(timeout: float | None = None):
+    """Hold the sessionsteward lock for the duration of the block. Waits up
+    to `timeout` seconds (default 30, SESSIONSTEWARD_LOCK_TIMEOUT overrides)
+    for another sessionsteward, then raises LockTimeoutError. Re-entrant:
+    commands that call other locking functions (undo -> snap) nest freely."""
+    depth = getattr(_held, "depth", 0)
+    if depth:
+        _held.depth = depth + 1
+        try:
+            yield
+        finally:
+            _held.depth -= 1
+        return
+    path = lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        wait = _lock_timeout() if timeout is None else timeout
+        deadline = time.monotonic() + wait
+        while not _try_lock(fd):
+            if time.monotonic() >= deadline:
+                raise LockTimeoutError(
+                    f"another sessionsteward is still working in {REPO_DIR} "
+                    f"(waited {wait:g}s for {path}); try again in a moment")
+            time.sleep(0.02 + random.random() * 0.06)
+        _held.depth = 1
+        try:
+            yield
+        finally:
+            _held.depth = 0
+            _unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _git_env() -> dict[str, str]:
+    """Your environment minus the GIT_* variables that would redirect or
+    reconfigure our git calls (see _GIT_ENV_KEEP). Windows upper-cases
+    variable names; the comparison does too."""
+    return {k: v for k, v in os.environ.items()
+            if not k.upper().startswith("GIT_") or k.upper() in _GIT_ENV_KEEP}
+
+
+def _is_snapshots_repo(repo: str) -> bool:
+    return os.path.abspath(repo) == os.path.abspath(REPO_DIR)
+
+
 def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProcess:
     """subprocess.run of a git command with the failure modes that are not
-    git's own exit code turned into GitError: no git on PATH, a hang."""
+    git's own exit code turned into GitError: no git on PATH, a hang.
+
+    The snapshots repo is named outright (--git-dir/--work-tree): without
+    that, git "discovers" a repository by walking up from the directory,
+    and past a .git it finds unusable that is whatever repository the home
+    directory happens to be (a dotfiles repo) - which would then receive our
+    `add -A` and our commits."""
+    where = ["-C", repo]
+    if _is_snapshots_repo(repo):
+        where += ["--git-dir", os.path.join(repo, ".git"), "--work-tree", repo]
     try:
-        return subprocess.run([*GIT, "-C", repo, *args], capture_output=True,
-                              timeout=60, **kw)
+        return subprocess.run([*GIT, *where, *args], capture_output=True,
+                              timeout=60, env=_git_env(), **kw)
     except FileNotFoundError:
         raise GitError("git not found — sessionsteward needs git on PATH "
                        "(https://git-scm.com/downloads)") from None
     except subprocess.TimeoutExpired:
         raise GitError(f"git {' '.join(args)} did not finish within 60s") \
             from None
+    except OSError as e:   # not executable, wrong format, out of processes
+        raise GitError(f"cannot run git: {e.strerror or e}") from None
 
 
 def _git(repo: str, *args: str) -> str:
@@ -120,7 +305,24 @@ def _git(repo: str, *args: str) -> str:
 
 
 def repo_ready() -> bool:
-    return os.path.isdir(os.path.join(REPO_DIR, ".git"))
+    """True when the snapshots repo exists AND has its first commit. A repo
+    that `git init` created but whose first commit never happened (signing,
+    a rejecting hook, a crash between the two steps) is not ready: init_repo()
+    finishes it. A repo git cannot read at all raises GitError - guessing
+    would mean committing into something we do not understand."""
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        return False
+    p = _run_git(REPO_DIR, ("rev-parse", "--verify", "--quiet",
+                            "HEAD^{commit}"))
+    if p.returncode == 0:
+        return True
+    refs = _run_git(REPO_DIR, ("for-each-ref", "--count=1"))
+    if refs.returncode == 0 and not refs.stdout.strip():
+        return False   # initialised, never committed to
+    detail = ' '.join((refs.stderr or p.stderr).decode(
+        "utf-8", "replace").split())[:160] or "its HEAD cannot be read"
+    raise GitError(f"the snapshots repo {REPO_DIR} cannot be used ({detail}); "
+                   f"nothing was changed - move it aside to start over")
 
 
 def _ensure_attributes() -> None:
@@ -139,16 +341,19 @@ def _ensure_attributes() -> None:
 
 
 def init_repo() -> str:
-    os.makedirs(REPO_DIR, exist_ok=True)
-    if not repo_ready():
-        _git(REPO_DIR, "init", "-qb", "main")
-        _git(REPO_DIR, "config", "user.email", "sessionsteward@local")
-        _git(REPO_DIR, "config", "user.name", "sessionsteward")
-        _git(REPO_DIR, "commit", "-q", "--allow-empty", "-m", "init")
-    _ensure_attributes()
-    if not os.path.exists(CONFIG_PATH):
-        save_config({"watch": []})
-    return REPO_DIR
+    with locked():
+        os.makedirs(REPO_DIR, exist_ok=True)
+        if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+            _git(REPO_DIR, "init", "-qb", "main")
+        if not repo_ready():   # new, or left without its first commit
+            _git(REPO_DIR, "config", "--local", "user.email",
+                 "sessionsteward@local")
+            _git(REPO_DIR, "config", "--local", "user.name", "sessionsteward")
+            _git(REPO_DIR, "commit", "-q", "--allow-empty", "-m", "init")
+        _ensure_attributes()
+        if not os.path.exists(CONFIG_PATH):
+            save_config({"watch": []})
+        return REPO_DIR
 
 
 def load_config() -> dict:
@@ -244,7 +449,9 @@ def auto_memory_dir(project_root: str) -> str | None:
                             "--git-common-dir", "--show-toplevel"),
                      encoding="utf-8", errors="surrogateescape")
         if p.returncode == 0:
-            common, top = (p.stdout.splitlines() + ["", ""])[:2]
+            # split on "\n" only: str.splitlines() also splits on U+2028 and
+            # the like, which a directory name may contain
+            common, top = (p.stdout.split("\n") + ["", ""])[:2]
             if common.strip():
                 candidates.append(os.path.dirname(os.path.abspath(common)))
             if top.strip():
@@ -280,7 +487,10 @@ def _watched_entries(project_root: str) -> list[tuple[str, str]]:
     seen: set[str] = set()
     for rel in watch_list():
         p = _expand_watch_entry(rel, project_root)
-        if p and os.path.exists(p):
+        # A regular file or a directory (or a link to one). A named pipe,
+        # socket or device cannot be snapshotted - reading a pipe blocks
+        # for ever - so it is as good as absent.
+        if p and (os.path.isfile(p) or os.path.isdir(p)):
             ap = os.path.abspath(p)
             if ap not in seen:
                 seen.add(ap)
@@ -422,8 +632,77 @@ def _remove_mirror(path: str) -> None:
             retry(os.unlink, path, None)
 
 
+def _not_copied(dirpath: str, names: list[str]) -> set[str]:
+    """copytree's ignore: the IGNORE_PATTERNS, and everything that is not a
+    regular file or a directory once links are followed. Copying a named
+    pipe blocks for ever or fails, a socket or a device cannot be copied at
+    all; a dangling link has nothing behind it."""
+    skip = set(shutil.ignore_patterns(*IGNORE_PATTERNS)(dirpath, names))
+    for name in names:
+        full = os.path.join(dirpath, name)
+        if name not in skip and not (os.path.isfile(full)
+                                     or os.path.isdir(full)):
+            skip.add(name)
+    return skip
+
+
+def _copy_content(src: str, dst: str) -> str:
+    """Copy a file's bytes and its execute bit - nothing else. (Not copy2:
+    the mirror must never inherit a read-only mode, or the next snap could
+    not replace it. But a hook script that loses its +x in the snapshot
+    comes back from `undo` unable to run.) git records the bit from the
+    mirror's mode; Windows has no such bit and git does not track one."""
+    shutil.copyfile(src, dst)
+    try:
+        executable = os.stat(src).st_mode & stat.S_IXUSR
+        os.chmod(dst, 0o755 if executable else 0o644)
+    except OSError:
+        pass
+    return dst
+
+
+def _set_executable(path: str, executable: bool) -> None:
+    """Make path's execute bits match the snapshot's file mode (100755 or
+    100644). The bit is added wherever the file is readable, the way
+    `chmod +x` would; Windows files have no such bit."""
+    if os.name == "nt":
+        return
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        want = (mode | ((mode & 0o444) >> 2)) if executable else mode & ~0o111
+        if want != mode:
+            os.chmod(path, want)
+    except OSError:
+        pass
+
+
+def _check_staged(files_dir: str, kinds: dict[str, str]) -> None:
+    """Refuse to commit a snapshot that lacks something it mirrored: every
+    file under files/ (and every watched file) must be in the index."""
+    mirrored = set()
+    for root, _dirs, names in os.walk(files_dir):
+        for name in names:
+            full = os.path.join(root, name)
+            mirrored.add(os.path.relpath(full, REPO_DIR).replace(os.sep, "/"))
+    mirrored.update(f"files/{rel}" for rel, kind in kinds.items()
+                    if kind == "file")
+    staged = {p for p in
+              _git(REPO_DIR, "ls-files", "-z", "--", "files").split("\0") if p}
+    missing = sorted(mirrored - staged)
+    if missing:
+        raise StewardError(
+            f"snapshot incomplete: git did not record {len(missing)} of the "
+            f"mirrored file(s) (first: {missing[0]}) - nothing was committed")
+
+
 def snap(project_root: str, message: str) -> str:
-    """Copy watched files into the repo and commit. Returns commit sha."""
+    """Copy watched files into the repo and commit. Returns commit sha.
+    Serialised with every other sessionsteward process (see locked())."""
+    with locked():
+        return _snap(project_root, message)
+
+
+def _snap(project_root: str, message: str) -> str:
     if not repo_ready():
         init_repo()
     _ensure_attributes()
@@ -436,6 +715,12 @@ def snap(project_root: str, message: str) -> str:
         rel = _rel(ap, project_root)
         plan.append((rel, ap, _mirror_path(files_dir, rel)))
     manifest = {rel: ap for rel, ap, _ in plan}
+    # What each watched path IS: a path with a manifest entry but nothing in
+    # the tree is an empty directory only if it was one. (A file that git
+    # silently skipped used to look exactly like that, and `undo` then
+    # turned the live file into an empty directory.)
+    kinds = {rel: ("dir" if os.path.isdir(ap) else "file")
+             for rel, ap, _ in plan}
     # files/ holds exactly this snapshot's files: stale mirrors of other
     # projects (the repo is shared) would otherwise ride along in every
     # commit and show up in `diff`.
@@ -444,18 +729,17 @@ def snap(project_root: str, message: str) -> str:
     os.makedirs(files_dir)
     for rel, ap, dest in plan:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        # copyfile, not copy2/copytree's default: the mirror must never
+        # _copy_content, not copy2/copytree's default: the mirror must never
         # inherit read-only modes, or the next snap cannot replace it.
         # (dirs_exist_ok / the lexists check: a watched file inside a
         # watched dir, e.g. ~/.claude/CLAUDE.md with ~ as the project.)
         if os.path.isdir(ap):
             # Symlinks are followed: the mirror holds the content behind
             # them (restore() never writes it back through the link).
-            shutil.copytree(ap, dest, copy_function=shutil.copyfile,
-                            ignore=shutil.ignore_patterns(*IGNORE_PATTERNS),
-                            ignore_dangling_symlinks=True, dirs_exist_ok=True)
+            shutil.copytree(ap, dest, copy_function=_copy_content,
+                            ignore=_not_copied, dirs_exist_ok=True)
         elif not os.path.lexists(dest):
-            shutil.copyfile(ap, dest)
+            _copy_content(ap, dest)
     # No timestamp in the manifest: identical content must produce an
     # identical tree so the re-snap below is skipped. (It used to carry
     # "at"; two hooks snapping the same clobbered state seconds apart
@@ -465,8 +749,14 @@ def snap(project_root: str, message: str) -> str:
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump({"project_root": _norm_root(project_root),
-                   "files": manifest, "watch": watch_list()}, f, indent=2)
-    _git(REPO_DIR, "add", "-A")
+                   "files": manifest, "kinds": kinds,
+                   "watch": watch_list()}, f, indent=2)
+    # -f: the snapshot must hold EVERY mirrored file. Without it `git add`
+    # obeys the ignore rules - the user's global ignore file, but also a
+    # .gitignore that was itself mirrored out of a watched directory - and
+    # silently leaves matching files out of the tree.
+    _git(REPO_DIR, "add", "-A", "-f")
+    _check_staged(files_dir, kinds)
     # Skip the commit when nothing changed FOR THIS PROJECT: compare the
     # index tree with the tree of this project's newest snapshot, not with
     # global HEAD — the repo is shared, and with two projects snapping in
@@ -484,9 +774,12 @@ def snap(project_root: str, message: str) -> str:
     return _git(REPO_DIR, "rev-parse", "HEAD").strip()
 
 
-def _manifests_at(shas: list[str]) -> dict[str, dict]:
+def _manifests_at(shas: list[str], strict: bool = False) -> dict[str, dict]:
     """{sha: manifest} for many snapshots in one git call (cat-file
-    --batch); a commit without manifest.json maps to {}."""
+    --batch); a commit without manifest.json maps to {}. A manifest that
+    cannot be parsed (a torn write from an older version) maps to {} too -
+    one broken snapshot must not take log/undo/snap down for every project
+    - unless strict, which raises StewardError."""
     if not shas:
         return {}
     p = _run_git(REPO_DIR, ("cat-file", "--batch"),
@@ -508,18 +801,20 @@ def _manifests_at(shas: list[str]) -> dict[str, dict]:
         try:
             out[sha] = json.loads(raw.decode("utf-8", "surrogateescape"))
         except ValueError as e:
-            raise StewardError(f"snapshot {sha[:7]} has a corrupt "
-                               f"manifest.json ({e})")
+            if strict:
+                raise StewardError(f"snapshot {sha[:7]} has a corrupt "
+                                   f"manifest.json ({e})") from None
+            out[sha] = {}
     return out
 
 
-def _manifest_at(sha: str) -> dict:
+def _manifest_at(sha: str, strict: bool = False) -> dict:
     try:
         full = _git(REPO_DIR, "rev-parse", "--verify", "--quiet",
                     f"{sha}^{{commit}}").strip()
     except GitError:
         return {}
-    return _manifests_at([full]).get(full, {})
+    return _manifests_at([full], strict).get(full, {})
 
 
 def log(limit: int = 20, project_root: str | None = None) -> list[dict]:
@@ -531,12 +826,15 @@ def log(limit: int = 20, project_root: str | None = None) -> list[dict]:
     whole history is scanned — the repo is shared between projects, so
     this project's snapshots may sit behind any number of others'.
     """
-    args = ["log", "--pretty=format:%H|%ad|%s", "--date=iso-local"]
+    # NUL-separated (-z, %x00): a subject may hold any character but NUL -
+    # a newline-split listing broke on U+2028, U+0085, ... in a message
+    args = ["log", "-z", "--pretty=format:%H%x00%ad%x00%s", "--date=iso-local"]
     if project_root is None:
         args.insert(1, f"-{limit}")
     out = _git(REPO_DIR, *args)
     want = _norm_root(project_root)
-    rows = [line.split("|", 2) for line in out.splitlines() if line]
+    fields = out.split("\0")
+    rows = [fields[i:i + 3] for i in range(0, len(fields) - 2, 3)]
     manifests = _manifests_at([r[0] for r in rows]) if want else {}
     snaps = []
     for sha, date, msg in rows:
@@ -576,10 +874,33 @@ def _move_to_trash(ap: str, trash_dir: str) -> str:
     return dest
 
 
-def prune_trash(trash_dir: str, keep: int | None = None) -> list[str]:
+# _move_to_trash names an entry <name>.<epoch seconds>[.<n>]
+_TRASH_STAMP = re.compile(r"\.(\d{9,})(?:\.(\d{1,4}))?$")
+
+
+def _trashed_at(name: str, path: str) -> tuple[float, int]:
+    """When a trash entry was put there: the stamp in its name. Not its
+    mtime - a moved path keeps the mtime it had, which says nothing about
+    when it was trashed (a directory untouched for a year would look like
+    the oldest entry the moment it arrived). Entries without a stamp fall
+    back to their mtime."""
+    m = _TRASH_STAMP.search(name)
+    if m:
+        return float(m.group(1)), int(m.group(2) or 1)
+    try:
+        return os.lstat(path).st_mtime, 0
+    except OSError:
+        return 0.0, 0
+
+
+def prune_trash(trash_dir: str, keep: int | None = None,
+                protect: tuple[str, ...] | list[str] = ()) -> list[str]:
     """Delete all but the newest `keep` (default TRASH_KEEP) trash
-    entries. Returns the removed entries."""
+    entries, newest = trashed last. Entries named in `protect` (what the
+    running restore has just put there) are never deleted. Returns the
+    removed entries."""
     keep = TRASH_KEEP if keep is None else keep
+    protected = {os.path.abspath(p) for p in protect}
     try:
         names = os.listdir(trash_dir)
     except OSError:
@@ -587,13 +908,13 @@ def prune_trash(trash_dir: str, keep: int | None = None) -> list[str]:
     entries = []
     for name in names:
         p = os.path.join(trash_dir, name)
-        try:
-            entries.append((os.lstat(p).st_mtime, p))
-        except OSError:
-            pass
+        stamp, n = _trashed_at(name, p)
+        entries.append((stamp, n, name, p))
     entries.sort(reverse=True)
     removed = []
-    for _, p in entries[keep:]:
+    for _stamp, _n, _name, p in entries[keep:]:
+        if os.path.abspath(p) in protected:
+            continue
         try:
             _remove_mirror(p)
             removed.append(p)
@@ -602,15 +923,85 @@ def prune_trash(trash_dir: str, keep: int | None = None) -> list[str]:
     return removed
 
 
+def _tree_blobs(sha: str) -> dict[str, str]:
+    """{path under files/: git file mode} for every file in snapshot sha.
+    NUL-separated, so no file name can confuse the parse."""
+    out = _git(REPO_DIR, "ls-tree", "-r", "-z", sha, "--", "files")
+    blobs = {}
+    for rec in out.split("\0"):
+        meta, _, path = rec.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "blob" and path.startswith("files/"):
+            blobs[path[len("files/"):]] = parts[0]
+    return blobs
+
+
+def _has_live_content(ap: str) -> bool:
+    """Would replacing the live path ap lose anything but ignored names?
+    (A symlink is never replaced by a restore, so it never counts.)"""
+    if os.path.islink(ap):
+        return False
+    if os.path.isdir(ap):
+        return next(iter_files([ap]), None) is not None
+    return os.path.lexists(ap)
+
+
+def _snapshot_problems(sha: str, manifest: dict) -> list[str]:
+    """Everything that stops snapshot sha from being restored faithfully:
+    watched paths its manifest records that its tree cannot supply (or
+    supplies as the wrong type). Empty list = safe to restore.
+
+    A path with a manifest entry and no tree entry is legitimate only as an
+    empty directory, which new snapshots say explicitly (manifest "kinds").
+    For a snapshot without that information the entry is ambiguous - it may
+    be an empty directory, or a file git never recorded - so it is accepted
+    only when nothing live would be replaced by it."""
+    files = manifest.get("files") or {}
+    if not files:
+        return []
+    kinds = manifest.get("kinds") or {}
+    blobs = _tree_blobs(sha)
+    dirs = set()
+    for path in blobs:
+        parts = path.split("/")
+        dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+    problems = []
+    for rel, ap in files.items():
+        name = display_rel(rel)
+        is_file, is_dir = rel in blobs, rel in dirs
+        kind = kinds.get(rel)
+        if kind == "file":
+            if is_dir:
+                problems.append(f"{name} is recorded as a file but the "
+                                f"snapshot holds a directory there")
+            elif not is_file:
+                problems.append(f"{name} is recorded as a file but the "
+                                f"snapshot has no content for it")
+        elif kind == "dir":
+            if is_file:
+                problems.append(f"{name} is recorded as a directory but the "
+                                f"snapshot holds a file there")
+        elif kind is not None:
+            problems.append(f"{name} has an unknown type {kind!r}")
+        elif not is_file and not is_dir and _has_live_content(ap):
+            problems.append(f"{name} has no content in the snapshot (taken "
+                            f"by an older version?) and restoring it would "
+                            f"replace the live {name} with an empty "
+                            f"directory")
+    return problems
+
+
 def check_restore(sha: str, project_root: str | None = None) -> dict:
     """Validate that sha is restorable for project_root.
 
     Returns the snapshot's manifest. Raises NothingToRestoreError for a
     manifest-less snapshot (e.g. the `init` commit) or an unknown sha,
-    and CrossProjectError when project_root is given and the snapshot
-    belongs to a different project.
+    CrossProjectError when project_root is given and the snapshot belongs
+    to a different project, and SnapshotDamagedError when the snapshot
+    cannot supply everything its manifest records (checked BEFORE any live
+    file is touched).
     """
-    manifest = _manifest_at(sha)
+    manifest = _manifest_at(sha, strict=True)
     if not manifest:
         p = _run_git(REPO_DIR, ("rev-parse", "--verify", "--quiet",
                                 f"{sha}^{{commit}}"))
@@ -627,6 +1018,12 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
                 f"refusing cross-project restore: snapshot {sha[:7]} "
                 f"belongs to project {manifest.get('project_root')!r}, "
                 f"not the current project {want!r}")
+    problems = _snapshot_problems(sha, manifest)
+    if problems:
+        raise SnapshotDamagedError(
+            f"refusing to restore snapshot {sha[:7]}: it is incomplete - "
+            + "; ".join(problems) + ". Nothing was changed; "
+            "`sessionsteward log` lists the other snapshots")
     return manifest
 
 
@@ -635,8 +1032,9 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def iter_files(paths: list[str]):
-    """Yield every file under the watched paths (directories walked,
-    IGNORE_PATTERNS applied), in a stable order.
+    """Yield every regular file under the watched paths (directories
+    walked, IGNORE_PATTERNS applied; pipes, sockets, devices and dangling
+    links skipped), in a stable order.
 
     Symlinked directories are walked (snap() mirrors what is behind
     them, so the live tree must see the same files), with a guard so a
@@ -656,9 +1054,12 @@ def iter_files(paths: list[str]):
                     keep.append(d)
                 dirs[:] = keep
                 for fn in sorted(files):
-                    if not _ignored_name(fn):
-                        yield os.path.join(root, fn)
-        elif os.path.exists(ap):
+                    full = os.path.join(root, fn)
+                    # regular files only (links followed): the callers
+                    # open() what they get, and a named pipe never returns
+                    if not _ignored_name(fn) and os.path.isfile(full):
+                        yield full
+        elif os.path.isfile(ap):
             yield ap
 
 
@@ -691,9 +1092,9 @@ def snapshot_tree(sha: str, manifest: dict | None = None) -> dict[str, str]:
     if not files:
         return {}
     out = {}
-    listing = _git(REPO_DIR, "ls-tree", "-r", sha, "--",
+    listing = _git(REPO_DIR, "ls-tree", "-r", "-z", sha, "--",
                    *(f"files/{rel}" for rel in files))
-    for line in listing.splitlines():
+    for line in listing.split("\0"):   # -z: names arrive unquoted
         meta, _, path = line.partition("\t")
         parts = meta.split()
         if len(parts) < 3 or parts[1] != "blob":
@@ -812,6 +1213,43 @@ def _keep_links(live_dir: str, staged: str, snap_tree: dict[str, str],
     return lines
 
 
+def _swap_via_trash(ap: str, put_in_place, trash_dir: str,
+                    report: list[str], trashed: list[str]) -> bool:
+    """Replace the live path ap: move it to the trash, then call
+    put_in_place() to create the new one. Never leaves a watched path empty:
+    if the move fails nothing was touched, and if putting the new one in
+    place fails the old one is moved back. True = ap now holds the new
+    content; False = it holds what it held before (reported as skipped)."""
+    dest = None
+    if os.path.lexists(ap):
+        try:
+            dest = _move_to_trash(ap, trash_dir)
+        except OSError as e:
+            report.append(f"skipped {ap}: could not move it to the trash "
+                          f"({e.strerror or e}) (left untouched)")
+            return False
+        report.append(f"moved {ap} -> {dest}")
+        trashed.append(dest)
+    try:
+        put_in_place()
+    except OSError as e:
+        why = e.strerror or e
+        if dest is None:
+            report.append(f"skipped {ap}: {why} (left untouched)")
+            return False
+        try:
+            shutil.move(dest, ap)
+        except OSError:
+            report.append(f"skipped {ap}: {why}; the previous version is "
+                          f"in {dest}")
+            return False
+        report.remove(f"moved {ap} -> {dest}")
+        trashed.remove(dest)
+        report.append(f"skipped {ap}: {why} (left untouched)")
+        return False
+    return True
+
+
 def restore(sha: str, trash_dir: str | None = None,
             project_root: str | None = None) -> list[str]:
     """Restore watched files from a snapshot, so that afterwards the
@@ -823,14 +1261,22 @@ def restore(sha: str, trash_dir: str | None = None,
     (`kept …`); symlinks are never written through (`skipped …`).
 
     Raises NothingToRestoreError for a manifest-less snapshot (e.g. the
-    `init` commit) and CrossProjectError when project_root is given and
-    the snapshot belongs to a different project.
+    `init` commit), CrossProjectError when project_root is given and the
+    snapshot belongs to a different project, and SnapshotDamagedError
+    (before anything is touched) when the snapshot cannot supply what its
+    manifest lists. Serialised with every other sessionsteward process.
     """
+    with locked():
+        return _restore(sha, trash_dir, project_root)
+
+
+def _restore(sha: str, trash_dir: str | None,
+             project_root: str | None) -> list[str]:
     manifest = check_restore(sha, project_root)
     _ensure_attributes()  # `git archive` below honours attributes
     restored = []
     trash_dir = trash_dir or TRASH_DIR
-    moved = False
+    trashed: list[str] = []   # what this restore put in the trash
     files = manifest["files"]
     root = _norm_root(project_root if project_root is not None
                       else manifest.get("project_root"))
@@ -853,11 +1299,17 @@ def restore(sha: str, trash_dir: str | None = None,
             restored.append(f"kept {ap}: not watched when snapshot "
                             f"{sha[:7]} was taken")
             continue
-        dest = _move_to_trash(ap, trash_dir)
+        try:
+            dest = _move_to_trash(ap, trash_dir)
+        except OSError as e:
+            restored.append(f"skipped {ap}: could not move it to the trash "
+                            f"({e.strerror or e}) (left untouched)")
+            continue
         restored.append(f"moved {ap} -> {dest}")
-        moved = True
+        trashed.append(dest)
     snap_tree = snapshot_tree(sha, manifest)
     algo = _blob_algo(snap_tree)
+    modes = _tree_blobs(sha)   # git file mode of every file in the snapshot
     for rel, ap in files.items():
         data, is_dir = _read_snapshot_file(sha, rel)
         if os.path.islink(ap):
@@ -898,17 +1350,22 @@ def restore(sha: str, trash_dir: str | None = None,
                     continue
                 if os.path.isdir(ap):
                     restored.extend(_keep_links(ap, src, snap_tree, algo))
-                if os.path.lexists(ap):
-                    # Never delete: move the existing path (dir, file or
-                    # link) to trash before restoring the snapshot copy.
-                    dest = _move_to_trash(ap, trash_dir)
-                    restored.append(f"moved {ap} -> {dest}")
-                    moved = True
-                os.rename(src, ap)
-                restored.append(ap)
+                # Never delete: the existing path (dir, file or link) goes
+                # to trash before the snapshot copy takes its place - and
+                # comes back if that fails.
+                if _swap_via_trash(ap, lambda: os.rename(src, ap), trash_dir,
+                                   restored, trashed):
+                    restored.append(ap)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         elif data is not None:
+            if os.path.lexists(ap) and not (os.path.isfile(ap)
+                                            or os.path.isdir(ap)):
+                # opening a named pipe for writing waits for a reader
+                restored.append(f"skipped {ap}: is not a regular file (a "
+                                f"named pipe, socket or device; left "
+                                f"untouched)")
+                continue
             if os.path.isfile(ap):
                 try:
                     with open(ap, "rb") as f:
@@ -929,6 +1386,7 @@ def restore(sha: str, trash_dir: str | None = None,
                 restored.append(f"skipped {ap}: {e.strerror or e} "
                                 f"(left untouched)")
                 continue
+            _set_executable(ap, modes.get(rel) == "100755")
             restored.append(ap)
         else:
             # Recorded in the manifest but nothing in the tree: a watched
@@ -940,19 +1398,11 @@ def restore(sha: str, trash_dir: str | None = None,
             if os.path.isdir(ap) and live_tree([ap], algo) == {}:
                 restored.append(f"unchanged {ap}")
                 continue
-            try:
-                if os.path.lexists(ap):
-                    dest = _move_to_trash(ap, trash_dir)
-                    restored.append(f"moved {ap} -> {dest}")
-                    moved = True
-                os.makedirs(ap)
-            except OSError as e:
-                restored.append(f"skipped {ap}: {e.strerror or e} "
-                                f"(left untouched)")
-                continue
-            restored.append(ap)
-    if moved:
-        prune_trash(trash_dir)
+            if _swap_via_trash(ap, lambda: os.makedirs(ap), trash_dir,
+                               restored, trashed):
+                restored.append(ap)
+    if trashed:
+        prune_trash(trash_dir, protect=trashed)
     return restored
 
 
@@ -970,10 +1420,10 @@ def _sizes(sha: str) -> dict[str, int]:
     if not rels:
         return {}
     out = {}
-    for line in _git(REPO_DIR, "ls-tree", "-r", "-l", sha, "--",
-                     *(f"files/{rel}" for rel in rels)).splitlines():
+    for line in _git(REPO_DIR, "ls-tree", "-r", "-l", "-z", sha, "--",
+                     *(f"files/{rel}" for rel in rels)).split("\0"):
         meta, _, path = line.partition("\t")
-        size = meta.split()[-1]
+        size = (meta.split() or [""])[-1]
         if size.isdigit():
             out[path[len("files/"):]] = int(size)
     return out
@@ -1016,7 +1466,13 @@ def guard_lines(sha: str, prev_sha: str, hint: str | None = "undo") -> list[str]
 
 
 def diff(sha1: str, sha2: str) -> str:
-    return _git(REPO_DIR, "diff", f"{sha1}..{sha2}", "--", "files/")
+    # Plain unified diff whatever your git config says: no colour (escape
+    # codes hid every line from the +/- filter), no external diff tool or
+    # textconv filter (their output is not a diff), and no rename detection
+    # (a renamed file would show as "similarity index 100%" and no lines).
+    return _git(REPO_DIR, "diff", "--no-color", "--no-ext-diff",
+                "--no-textconv", "--no-renames", f"{sha1}..{sha2}", "--",
+                "files/")
 
 
 def file_mtimes(paths: list[str]) -> dict[str, float]:
@@ -1096,12 +1552,23 @@ def merge_hooks(settings: dict) -> dict:
     Per event, the first existing hook that already runs sessionsteward
     (from any interpreter path, or an old bare command) is rewritten to
     the current command and further copies are dropped; our entry is
-    appended only when none exists. Re-running is idempotent.
+    appended only when none exists. Re-running is idempotent. Raises
+    SettingsError for a `hooks` value of an unexpected shape (it cannot be
+    merged into without replacing something the user wrote).
     """
     ours = build_hooks_json()["hooks"]
-    hooks = settings.setdefault("hooks", {})
+    hooks = settings.get("hooks")
+    if hooks is None:
+        hooks = settings["hooks"] = {}
+    elif not isinstance(hooks, dict):
+        raise SettingsError('"hooks" in the settings file is not an object')
     for event, entries in ours.items():
-        existing = hooks.setdefault(event, [])
+        existing = hooks.get(event)
+        if existing is None:
+            existing = hooks[event] = []
+        elif not isinstance(existing, list):
+            raise SettingsError(f'"hooks.{event}" in the settings file is '
+                                f'not a list')
         cmd = entries[0]["hooks"][0]["command"]
         found = False
         for e in list(existing):
@@ -1124,18 +1591,86 @@ def merge_hooks(settings: dict) -> dict:
     return settings
 
 
-def write_hooks_file(settings_path: str) -> str:
-    """Merge hooks into the settings file at settings_path. Returns it."""
+def _parse_settings(raw: bytes | None, path: str) -> dict:
+    """The settings dict in raw (None / blank = no settings yet). Anything
+    that is not a strict-JSON object - a comment, a trailing comma, broken
+    UTF-8, a truncated file - raises SettingsError: guessing would mean
+    rewriting the file without the settings we could not read."""
+    if raw is None:
+        return {}
     try:
-        with open(settings_path, encoding="utf-8") as f:
-            settings = json.load(f)
-    except (OSError, ValueError):
-        settings = {}
+        text = raw.decode("utf-8-sig")   # tolerates the BOM Windows tools add
+    except UnicodeDecodeError as e:
+        raise SettingsError(f"{path} is not valid UTF-8 ({e.reason} at byte "
+                            f"{e.start}); it was not modified") from None
+    if not text.strip():
+        return {}
+    try:
+        settings = json.loads(text)
+    except ValueError as e:
+        raise SettingsError(f"{path} is not strict JSON ({e}) - comments "
+                            f"and trailing commas are not allowed; it was "
+                            f"not modified") from None
     if not isinstance(settings, dict):
-        settings = {}
-    merge_hooks(settings)
-    os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
-    with open(settings_path, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
+        raise SettingsError(f"{path} does not hold a JSON object; it was "
+                            f"not modified")
+    return settings
+
+
+def write_hooks_file(settings_path: str) -> str:
+    """Merge our hooks into the Claude Code settings file at settings_path.
+    Returns settings_path.
+
+    The user's settings are never lost: a file that cannot be read as a
+    strict-JSON object, or whose `hooks` have an unexpected shape, is
+    refused with SettingsError and left exactly as it was. Writing is
+    atomic (a temp file beside it, then replace), keeps the previous
+    content as <name>.bak, writes through a symlinked settings.json (dotfile
+    managers) instead of replacing the link, and keeps the file's line
+    endings and indentation. When the hooks are already installed nothing
+    is written at all.
+    """
+    real = os.path.realpath(settings_path)
+    try:
+        with open(real, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = None
+    except OSError as e:
+        raise SettingsError(f"cannot read {settings_path}: "
+                            f"{e.strerror or e}") from None
+    settings = _parse_settings(raw, settings_path)
+    before = json.dumps(settings, sort_keys=True)
+    try:
+        merge_hooks(settings)
+    except SettingsError as e:
+        raise SettingsError(f"{settings_path}: {e}; it was not modified") \
+            from None
+    if raw is not None and json.dumps(settings, sort_keys=True) == before:
+        return settings_path
+    text = (raw or b"").decode("utf-8-sig")
+    indent = re.search(r"^([ \t]+)\S", text, re.M)
+    newline = "\r\n" if b"\r\n" in (raw or b"") else "\n"
+    data = (json.dumps(settings, indent=indent.group(1) if indent else 2,
+                       ensure_ascii=False) + "\n"
+            ).replace("\n", newline).encode("utf-8")
+    tmp = f"{real}.steward-{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(real) or ".", exist_ok=True)
+        if raw is not None and raw.strip():
+            with open(real + ".bak", "wb") as f:
+                f.write(raw)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        if raw is not None:
+            try:
+                shutil.copymode(real, tmp)
+            except OSError:
+                pass
+        os.replace(tmp, real)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise SettingsError(f"could not write {settings_path}: "
+                            f"{e.strerror or e}") from None
     return settings_path

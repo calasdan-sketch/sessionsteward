@@ -906,11 +906,11 @@ class TestSteward(unittest.TestCase):
         # `--date=iso` printed the recorded offset; the log now renders
         # snapshot times in the user's local zone (--date=iso-local).
         when = "2025-01-01T12:00:00+09:00"
-        for var in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
-            old = os.environ.get(var)
-            os.environ[var] = when
-            self.addCleanup(_restore_var, var, old)
         self._cli("init")  # takes the initial snapshot
+        # Give it a known time. (GIT_AUTHOR_DATE in the environment used to
+        # do this; it is deliberately not passed on to our git calls now.)
+        core_mod._git(core_mod.REPO_DIR, "commit", "-q", "--amend",
+                      "--no-edit", "--date", when)
         epoch = datetime.datetime.fromisoformat(when).timestamp()
         want = time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
         self.assertEqual(core_mod.log(1, project_root=self.proj)[0]["date"][:16],
@@ -1135,7 +1135,7 @@ class TestSteward(unittest.TestCase):
 
     def test_git_failure_is_a_clean_error(self):
         # A stale .git/index.lock made `git add` fail -> RuntimeError
-        # traceback. Must be `error: git add -A failed: ...`, exit 2.
+        # traceback. Must be `error: git add -A -f failed: ...`, exit 2.
         self._cli("init")
         lock = os.path.join(core_mod.REPO_DIR, ".git", "index.lock")
         with open(lock, "w") as f:
@@ -1144,7 +1144,7 @@ class TestSteward(unittest.TestCase):
             f.write("more\n")
         code, out, err = self._cli_err(self.proj, "snap", "-m", "x")
         self.assertEqual(code, 2)
-        self.assertIn("error: git add -A failed", err)
+        self.assertIn("error: git add -A -f failed", err)
         self.assertIn("index.lock", err)
         self.assertNotIn("Traceback", err)
 
@@ -1230,13 +1230,22 @@ class TestSteward(unittest.TestCase):
             self.assertEqual(f.read(), broken)  # not replaced
         self.assertIn("NOTES.md", broken)  # the watch list is still there
 
-    def test_corrupt_manifest_is_a_clean_error(self):
+    def test_corrupt_manifest_is_skipped_by_log_and_refused_by_restore(self):
+        # One snapshot with a broken manifest.json must not take `log` down
+        # for every project (it used to: "corrupt manifest.json", exit 2,
+        # forever); it is skipped there, and restoring IT is a clean error.
         self._cli("init")
         with open(os.path.join(core_mod.REPO_DIR, "manifest.json"), "w") as f:
             f.write("not json")
         core_mod._git(core_mod.REPO_DIR, "add", "-A")
         core_mod._git(core_mod.REPO_DIR, "commit", "-q", "-m", "tampered")
+        bad = core_mod._git(core_mod.REPO_DIR, "rev-parse", "HEAD").strip()
         code, out, err = self._cli_err(self.proj, "log")
+        self.assertEqual(code, 0, err)
+        self.assertIn("initial snapshot", out)
+        self.assertNotIn("tampered", out)
+        self.assertNotIn("Traceback", err)
+        code, out, err = self._cli_err(self.proj, "restore", bad[:7])
         self.assertEqual(code, 2)
         self.assertIn("corrupt manifest.json", err)
         self.assertNotIn("Traceback", err)

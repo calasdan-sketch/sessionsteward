@@ -26,16 +26,18 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
+import subprocess
 import sys
 import time
 
 from . import core as core_mod
 from . import diet as diet_mod
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
@@ -199,6 +201,31 @@ def cmd_log(args) -> int:
     return 0
 
 
+def _changed_lines(text: str) -> list[str]:
+    """The added and removed lines of a unified diff, without its file
+    headers. Headers are recognised by where they are (between `diff --git`
+    and the first `@@`), not by how they start: a changed line that itself
+    begins with `--` or `++` - a removed markdown rule or front-matter
+    fence, `---` - looks exactly like a header. Only "\n" splits the text
+    (str.splitlines also splits on U+2028 and friends, which may sit inside
+    a changed line); a CR before it belongs to a CRLF file's line ending."""
+    changed = []
+    in_hunk = False
+    for line in text.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line[:1] in ("+", "-"):
+            changed.append(line)
+    return changed
+
+
+DIFF_LINE_LIMIT = 200
+
+
 def cmd_diff(args) -> int:
     if not core_mod.repo_ready():
         print("no snapshots yet")
@@ -215,9 +242,17 @@ def cmd_diff(args) -> int:
         print("only one snapshot — nothing to diff")
         return 0
     out = core_mod.diff(sha1, sha2)
-    kept = [ln for ln in out.splitlines() if ln[:1] in "+-"
-            and not ln.startswith(("+++", "---"))]
-    sys.stdout.write("\n".join(kept[:200]) + ("\n" if kept else "(no changes)\n"))
+    kept = _changed_lines(out)
+    if not kept:
+        # nothing to show as lines is not the same as nothing changed
+        sys.stdout.write("(no line changes - binary files or file modes "
+                         "only)\n" if out.strip() else "(no changes)\n")
+        return 0
+    text = "\n".join(kept[:DIFF_LINE_LIMIT])
+    if len(kept) > DIFF_LINE_LIMIT:
+        text += (f"\n... {len(kept) - DIFF_LINE_LIMIT} more changed "
+                 f"line(s) not shown")
+    sys.stdout.write(text + "\n")
     return 0
 
 
@@ -227,7 +262,7 @@ def _restore_errors(fn):
     except core_mod.NothingToRestoreError as e:
         print(e)
         return None, 1
-    except core_mod.CrossProjectError as e:
+    except (core_mod.CrossProjectError, core_mod.SnapshotDamagedError) as e:
         print(f"error: {e}")
         return None, 1
 
@@ -304,7 +339,17 @@ def cmd_install_hooks(args) -> int:
     wiring = (f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
               f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
     if args.write:
-        path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
+        try:
+            path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
+        except core_mod.SettingsError as e:
+            # Never guess at a file we could not read: say so, leave it
+            # alone, and print what to add by hand.
+            print(f"error: {e}", file=sys.stderr)
+            print(f'Add this to the "hooks" section of {CLAUDE_SETTINGS} '
+                  f"by hand, or fix the file and re-run with --write:")
+            print(json.dumps(core_mod.build_hooks_json(), indent=2))
+            print(wiring)
+            return 2
         print(f"merged hooks into {path} (existing settings preserved; "
               f"re-running is a no-op)")
         print(wiring)
@@ -323,15 +368,31 @@ def cmd_watch(args) -> int:
     core_mod.init_repo()
     print(f"watching for changes (every {args.interval}s, Ctrl-C to stop)…")
     mtimes = core_mod.file_mtimes(core_mod.watched_paths(args.root))
+    last_problem = None
     try:
         while True:
             time.sleep(args.interval)
-            now = core_mod.file_mtimes(core_mod.watched_paths(args.root))
-            if now != mtimes:
-                sha = core_mod.snap(args.root, "auto: files changed")
-                print(f"change detected -> snapshot {sha[:7]}")
-                _guard(args.root, sha)
-                mtimes = now
+            try:
+                now = core_mod.file_mtimes(core_mod.watched_paths(args.root))
+                if now != mtimes:
+                    sha = core_mod.snap(args.root, "auto: files changed")
+                    print(f"change detected -> snapshot {sha[:7]}")
+                    _guard(args.root, sha)
+                    mtimes = now
+                last_problem = None
+            except (core_mod.StewardError, OSError) as e:
+                # A daemon outlives a busy lock, a git hiccup or a file
+                # that vanished mid-copy: say so once per distinct problem
+                # and try again on the next tick (mtimes is unchanged, so
+                # the change is still pending). A reader that went away is
+                # not a problem to retry - main() handles that.
+                if isinstance(e, OSError) and _pipe_gone(e):
+                    raise
+                problem = str(e)
+                if problem != last_problem:
+                    print(f"warning: snapshot failed ({problem}); will retry "
+                          f"in {args.interval:g}s", file=sys.stderr)
+                last_problem = problem
     except KeyboardInterrupt:
         print("\nstopped.")
     return 0
@@ -378,6 +439,19 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _fail(exc: BaseException, code: int) -> int:
+    """`error: <one line>` on stderr (a hook's output is read by the agent,
+    and a multi-line message is a traceback in all but name); exit `code`."""
+    message = " ".join(str(exc).split())
+    if len(message) > 300:
+        message = message[:297] + "..."
+    try:
+        print(f"error: {message}", file=sys.stderr)
+    except OSError:
+        pass  # nowhere to say it
+    return code
+
+
 def main(argv=None) -> int:
     _harden_streams()
     args = build_parser().parse_args(argv)
@@ -389,22 +463,31 @@ def main(argv=None) -> int:
     }
     if args.cmd == "watch" and (args.add or args.remove):
         cmds["watch"] = cmd_watch_edit
+    # Commands that write take the lock for their whole run, so e.g. `undo`
+    # cannot interleave with a hook's snap. `watch` (the daemon) locks only
+    # around each snapshot it takes; read-only commands never wait.
+    writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
+        or (args.cmd == "watch" and (args.add or args.remove))
     try:
-        rc = cmds[args.cmd](args)
+        with core_mod.locked() if writes else contextlib.nullcontext():
+            rc = cmds[args.cmd](args)
         if sys.stdout is not None:
             sys.stdout.flush()  # a closed pipe surfaces here, not at exit
         return rc
     except OSError as e:
-        if not _pipe_gone(e):
-            raise
-        _stdout_gone()
-        return 0
+        if _pipe_gone(e):
+            _stdout_gone()
+            return 0
+        # the system refused a read or write (an unwritable home directory,
+        # a full disk, a file where a directory belongs): one line, exit 1
+        return _fail(e, 1)
     except (core_mod.StewardError, RuntimeError) as e:
         # git missing, a stale .git/index.lock, a corrupt config or
         # manifest: one line on stderr, exit 2 — never a traceback (as a
         # SessionStart hook that would be pasted into the agent's context).
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+        return _fail(e, 2)
+    except subprocess.SubprocessError as e:
+        return _fail(e, 1)
 
 
 if __name__ == "__main__":

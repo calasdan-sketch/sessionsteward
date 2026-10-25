@@ -640,7 +640,6 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
         "sessionsteward snap -m checkpoint",
         "sessionsteward log",
         "python -m sessionsteward diff",
-        "/usr/local/bin/sessionsteward precompact",
         'python -u -m sessionsteward snap -m "session start"',
         "echo sessionsteward precompact",
         "sessionsteward precompact --root /somewhere/else",

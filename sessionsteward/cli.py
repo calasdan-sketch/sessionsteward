@@ -151,6 +151,18 @@ def _warn_too_big(too_big: list, root: str) -> None:
     if not too_big:
         return
     limit = core_mod.max_file_bytes()
+    # Two reasons share the list: a file over the per-file limit, and a file
+    # that fit the limit but was refused for the per-snapshot cap.
+    capped = [(p, n) for p, n in too_big if limit is None or n <= limit]
+    too_big = [(p, n) for p, n in too_big if (p, n) not in capped]
+    if capped:
+        cap = core_mod.max_snapshot_bytes()
+        _warn(f"{len(capped)} file(s) were not snapshotted: one snapshot "
+              f"holds at most {cap / 1048576:g} MB (first: "
+              f"{_short(capped[0][0], root)}); "
+              f"SESSIONSTEWARD_MAX_SNAPSHOT_MB changes the cap")
+    if not too_big:
+        return
     over = f"over the {limit / 1048576:g} MB limit" if limit else "too big"
     path, size = too_big[0]
     first = f"{_short(path, root)} ({size / 1048576:.1f} MB)"
@@ -202,6 +214,8 @@ def cmd_watch_edit(args) -> int:
     core_mod.init_repo()
     cfg = core_mod.edit_watch_list(core_mod.load_config(),
                                    add=args.add or [], remove=args.remove or [])
+    if args.follow_links is not None:
+        cfg["follow_links"] = args.follow_links
     core_mod.save_config(cfg)
     print("watching: " + ", ".join(core_mod.watch_list(cfg)))
     return 0
@@ -321,6 +335,8 @@ def _restore_errors(fn):
 
 
 def cmd_undo(args) -> int:
+    if args.steps < 1:
+        raise core_mod.StewardError("--steps must be 1 or more")
     if not core_mod.repo_ready():
         print("no snapshots yet")
         return 2
@@ -345,7 +361,7 @@ def cmd_undo(args) -> int:
         print(f"already at the oldest snapshot ({snaps[pos]['sha'][:7]}) — "
               f"nothing to undo to; `sessionsteward restore <sha>` goes forward")
         return 0
-    steps = max(1, args.steps)
+    steps = args.steps
     last = len(snaps) - 1
     target_i = min(pos + steps, last)
     target = snaps[target_i]
@@ -489,6 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--remove", nargs="+", default=None,
                     help="Drop paths from the watch list, defaults "
                          "included (then exit).")
+    wa.add_argument("--follow-links", dest="follow_links", default=None,
+                    action="store_true",
+                    help="Let snapshots follow links that lead outside a "
+                         "watched folder (off by default; then exit).")
+    wa.add_argument("--no-follow-links", dest="follow_links",
+                    action="store_false", help="Turn --follow-links off.")
     wa.add_argument("--interval", default="5", metavar="SECONDS",
                     help=f"Poll seconds for the daemon, from {MIN_INTERVAL:g} "
                          f"to {MAX_INTERVAL:g} (default 5).")
@@ -537,18 +559,20 @@ def main(argv=None) -> int:
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
         "install-hooks": cmd_install_hooks,
     }
-    if args.cmd == "watch" and (args.add or args.remove):
+    editing = args.cmd == "watch" and bool(
+        args.add or args.remove or args.follow_links is not None)
+    if editing:
         cmds["watch"] = cmd_watch_edit
     # Commands that write take the lock for their whole run, so e.g. `undo`
     # cannot interleave with a hook's snap. `watch` (the daemon) locks only
     # around each snapshot it takes; read-only commands never wait.
     writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
-        or (args.cmd == "watch" and (args.add or args.remove))
+        or editing
     try:
         if args.cmd == "watch":
             args.interval = _poll_interval(args.interval)
         if args.cmd in ("init", "snap", "precompact", "undo", "restore") \
-                or (args.cmd == "watch" and not (args.add or args.remove)):
+                or (args.cmd == "watch" and not editing):
             _warn_unwatchable(args.root)   # not for the edit that fixes it
         with core_mod.locked() if writes else contextlib.nullcontext():
             rc = cmds[args.cmd](args)

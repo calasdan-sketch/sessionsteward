@@ -565,19 +565,30 @@ class TestSteward(unittest.TestCase):
         for cmd in (core_mod.HOOK_PRECOMPACT_CMD,
                     core_mod.HOOK_SESSIONSTART_CMD):
             self.assertFalse(cmd.startswith("sessionsteward"), cmd)
-            if os.name == "nt":
-                self.assertTrue(cmd.startswith(f'"{sys.executable}" '), cmd)
-            else:
-                self.assertEqual(shlex.split(cmd)[:3],
-                                 [sys.executable, "-m", "sessionsteward"])
+            first = shlex.split(cmd)[0]
+            self.assertTrue(os.path.isabs(first), cmd)
+            script = core_mod._console_script()
+            if script:   # installed: the console script, never `python -m`
+                self.assertEqual(first, script)
+                self.assertNotIn(" -m ", cmd)
+            else:        # run from a checkout: isolated mode, no cwd on path
+                self.assertEqual(shlex.split(cmd)[:4],
+                                 [sys.executable, "-I", "-m", "sessionsteward"])
 
     def test_hook_cmd_quotes_paths_with_spaces(self):
         from unittest import mock
         exe = r"C:\Program Files\Python 3\python.exe"
         with mock.patch.object(core_mod.sys, "executable", exe), \
-                mock.patch.object(core_mod.os, "name", "nt"):
+                mock.patch.object(core_mod.os, "name", "nt"), \
+                mock.patch.object(core_mod, "_console_script",
+                                  return_value=None):
             self.assertEqual(core_mod._self_cmd(),
-                             f'"{exe}" -m sessionsteward')
+                             f'"{exe}" -I -m sessionsteward')
+        script = r"C:\Program Files\Python 3\Scripts\sessionsteward.exe"
+        with mock.patch.object(core_mod.os, "name", "nt"), \
+                mock.patch.object(core_mod, "_console_script",
+                                  return_value=script):
+            self.assertEqual(core_mod._self_cmd(), f'"{script}"')
 
     def test_install_hooks_upgrades_legacy_bare_command(self):
         settings_path = os.path.join(self._tmp, "settings.json")
@@ -1643,6 +1654,12 @@ class TestSteward(unittest.TestCase):
         commands = os.path.join(self.proj, ".claude", "commands")
         os.symlink(os.path.join(shared, "cmds"), commands)
         settings = os.path.join(self.proj, ".claude", "settings.json")
+        # a link out of the watched folder is only followed on request
+        # (SESSIONSTEWARD_FOLLOW_LINKS, see TestRound9LinksAndHooks)
+        patcher = mock.patch.dict(os.environ,
+                                  {"SESSIONSTEWARD_FOLLOW_LINKS": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self._cli("init")
         a_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
         # what is behind the links is seen, so the live tree matches

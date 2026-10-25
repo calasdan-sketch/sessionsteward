@@ -5,7 +5,7 @@ files — `CLAUDE.md`, `.claude/`, `AGENTS.md`, `~/.claude/CLAUDE.md`, Claude
 Code's auto-memory directory — and `sessionsteward undo` brings them back.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/sessionsteward
+pip install sessionsteward
 sessionsteward init                      # one-time: snapshots repo + first snapshot
 sessionsteward install-hooks --write     # snapshot on every Claude Code session start and before compaction
 sessionsteward undo                      # the agent clobbered CLAUDE.md? back it comes
@@ -36,10 +36,10 @@ Zero dependencies — Python 3.10+ stdlib only (uses your system's git; if
 git is missing every command says so in one line and exits 2).
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/sessionsteward
+pip install sessionsteward
 ```
 
-Or from a clone (console script `sessionsteward`):
+Or from source (console script `sessionsteward`):
 
 ```bash
 git clone https://github.com/calasdan-sketch/sessionsteward && cd sessionsteward
@@ -47,8 +47,13 @@ pip install .
 ```
 
 pip installs the `sessionsteward` command on every OS. Install it before
-running `install-hooks`: the hooks call the installed package with the
-interpreter you ran it from.
+running `install-hooks`: the hooks call that command by its absolute path.
+
+**Upgrading from 0.1.3 or earlier: re-run `sessionsteward install-hooks
+--write` once.** Older versions wrote the hooks as `python -m
+sessionsteward ...`, which runs code from the project folder if a cloned
+repository carries its own `sessionsteward/` package (see
+[SECURITY.md](SECURITY.md)). Re-running rewrites them in place.
 
 ## Usage
 
@@ -334,6 +339,20 @@ PowerShell 5's `>` writes, gets a hint to save it as UTF-8; a UTF-8
 byte-order mark is fine); or a `watch` or `unwatch` that is not a list of
 paths (`"watch": "NOTES.md"` is refused, not read letter by letter).
 
+## Links
+
+Symlinks inside a watched folder are followed (the snapshot holds the content
+behind them) with these limits: a link to the watched folder itself, to one
+of its parents, or to a folder already walked is skipped (no loops); walks go
+at most 64 folders deep; one snapshot holds at most 500 MB of walked files
+(`SESSIONSTEWARD_MAX_SNAPSHOT_MB`, 0 = no cap), with a warning naming what was
+left out; and **a link that leads outside the watched folder is skipped**, so
+`.claude/out -> ~/.ssh` cannot copy your keys into the snapshot store. If you
+keep real content behind such links (a dotfiles repo), opt in with
+`sessionsteward watch --follow-links` (or `SESSIONSTEWARD_FOLLOW_LINKS=1`);
+`--no-follow-links` turns it off. A watched entry that is itself a link is
+always followed.
+
 ## Claude Code hooks
 
 ```bash
@@ -347,14 +366,21 @@ compaction dropped) and **SessionStart** → `sessionsteward snap -m "session
 start"`. Point the steward at the same files your agent's memory hook
 writes (`watch --add`) and those get the same protection.
 
-The hooks call the Python that ran `install-hooks` by absolute path
-(`"/path/to/python" -m sessionsteward ...`), because hook shells don't load
-your aliases or activate your venv — re-run `install-hooks --write` if you
-move or recreate that environment: the hooks sessionsteward wrote itself
-(`sessionsteward precompact` and `sessionsteward snap -m "session start"` as
-the first version wrote them, or the same commands run as
-`<python> -m sessionsteward ...` by any interpreter) are rewritten in place,
-never duplicated. Every other hook is yours and is left alone, even one that
+The hooks call the installed `sessionsteward` command by absolute path
+(for example `/path/to/venv/bin/sessionsteward snap ...`), because hook
+shells don't load your aliases or activate your venv. They deliberately do
+not use `python -m sessionsteward`: Claude Code runs hooks with the project
+as the working directory, and `python -m` would then import a
+`sessionsteward/` package from the project, so a repository you just cloned
+could run code at session start. (Only when the command cannot be found does
+`install-hooks` fall back to `python -I -m sessionsteward`, where `-I` keeps
+the project folder off the import path.) Each hook has a 30 second timeout.
+Re-run `install-hooks --write` if you move or recreate that environment, and
+once after upgrading from 0.1.3 or earlier: the hooks sessionsteward wrote
+itself (`sessionsteward precompact` and `sessionsteward snap -m "session
+start"` as the first version wrote them, the same commands run as
+`<python> -m sessionsteward ...`, or run by the console script's path) are
+rewritten in place, never duplicated. Every other hook is yours and is left alone, even one that
 mentions sessionsteward (`cd ~/code/sessionsteward && git pull`,
 `sessionsteward snap -m checkpoint`); `--write` adds the two hooks beside
 it. It merges into the existing settings file without clobbering your other
@@ -407,7 +433,7 @@ transcripts and logs are watched for undo but never counted.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # temp dirs only; never touches ~/.sessionsteward
+python -m unittest discover -s tests   # temp dirs only; never touches ~/.sessionsteward
 ```
 
 Every test runs against a temporary HOME; the newer ones also give git a

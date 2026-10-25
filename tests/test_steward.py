@@ -547,8 +547,11 @@ class TestSteward(unittest.TestCase):
         self.assertEqual(merged["hooks"]["Stop"][0]["hooks"][0]["command"],
                          "echo stop")
         # our hooks added
+        # (whatever form the hook command has: the installed console script
+        # when there is one next to this Python, `python -I -m ...` if not)
         cmds = json.dumps(merged["hooks"])
-        self.assertIn("-m sessionsteward precompact", cmds)
+        self.assertIn(json.dumps(core_mod.HOOK_PRECOMPACT_CMD)[1:-1], cmds)
+        self.assertIn(json.dumps(core_mod.HOOK_SESSIONSTART_CMD)[1:-1], cmds)
         self.assertIn("session start", cmds)
         # idempotent: second run adds no duplicates
         before = json.dumps(merged["hooks"], sort_keys=True)
@@ -570,7 +573,7 @@ class TestSteward(unittest.TestCase):
             script = core_mod._console_script()
             if script:   # installed: the console script, never `python -m`
                 self.assertEqual(first, script)
-                self.assertNotIn(" -m ", cmd)
+                self.assertNotIn("-m sessionsteward", cmd)
             else:        # run from a checkout: isolated mode, no cwd on path
                 self.assertEqual(shlex.split(cmd)[:4],
                                  [sys.executable, "-I", "-m", "sessionsteward"])

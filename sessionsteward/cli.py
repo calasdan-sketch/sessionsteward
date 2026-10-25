@@ -174,6 +174,35 @@ def _warn_too_big(too_big: list, root: str) -> None:
     _warn(f"{what}; SESSIONSTEWARD_MAX_FILE_MB changes the limit")
 
 
+def _warn_left_out(skipped: dict, root: str) -> None:
+    """Warn about what a snapshot's walk left behind without being asked to:
+    links that lead outside a watched folder and folders below the depth
+    limit. (A link to a folder already walked, an ignored name and a virtual
+    environment are left out on purpose and are not mentioned.) `undo` and
+    `restore` leave such items where they are, so nothing is lost - they are
+    simply not protected by the snapshot."""
+    outside = skipped.get("outside") or []
+    if outside:
+        first = _short(outside[0], root)
+        _warn(f"{len(outside)} link(s) leading outside the watched folders "
+              f"were not snapshotted (first: {first}); "
+              f"`sessionsteward watch --follow-links` includes them")
+    deep = skipped.get("deep") or []
+    if deep:
+        _warn(f"{len(deep)} folder(s) more than {core_mod.MAX_WALK_DEPTH} "
+              f"levels deep were not snapshotted (first: "
+              f"{_short(deep[0], root)})")
+
+
+def _snap_and_warn(root: str, message: str) -> str:
+    """snap_report() plus every warning about what it left out."""
+    skipped: dict = {}
+    sha, too_big = core_mod.snap_report(root, message, skipped)
+    _warn_too_big(too_big, root)
+    _warn_left_out(skipped, root)
+    return sha
+
+
 def _warn_unwatchable(root: str) -> None:
     """One warning per watch-list entry that cannot be watched (`.`, `~`: see
     core.unwatchable_reason), naming the command that drops it. The command
@@ -198,9 +227,8 @@ def cmd_init(args) -> int:
     elif core_mod.watched_paths(args.root):
         # A first snapshot right away, so `undo` has somewhere to go the
         # moment the agent first clobbers a file.
-        sha, too_big = core_mod.snap_report(args.root, "initial snapshot")
+        sha = _snap_and_warn(args.root, "initial snapshot")
         print(f"snapshot {sha[:7]} (initial)")
-        _warn_too_big(too_big, args.root)
     else:
         print(f"nothing to snapshot yet: no watched file exists in "
               f"{os.path.abspath(args.root)}")
@@ -229,19 +257,16 @@ def _guard(root: str, sha: str) -> None:
 
 
 def cmd_snap(args) -> int:
-    sha, too_big = core_mod.snap_report(args.root,
-                                        args.message or "manual snapshot")
+    sha = _snap_and_warn(args.root, args.message or "manual snapshot")
     print(f"snapshot {sha[:7]}")
-    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
 
 def cmd_precompact(args) -> int:
-    sha, too_big = core_mod.snap_report(args.root, "pre-compaction snapshot")
+    sha = _snap_and_warn(args.root, "pre-compaction snapshot")
     print(f"pre-compaction snapshot {sha[:7]} — "
           f"`sessionsteward diff {sha[:7]}` after, to see what was dropped")
-    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
@@ -404,7 +429,21 @@ def cmd_diet(args) -> int:
     return 0
 
 
+def _warn_fallback_hooks() -> None:
+    """The hooks cannot name an installed command: say what that means."""
+    if core_mod._console_script() is not None:
+        return
+    _warn("the `sessionsteward` command was not found next to this Python "
+          "(you are running from a source checkout?), so the hooks run "
+          "`python -I -m sessionsteward`. The -I stops a cloned project "
+          "from running its own code at session start, but it also means "
+          "the hooks work only while sessionsteward is installed for that "
+          "Python (`pip install .` or `pip install -e .` in the checkout); "
+          "otherwise they fail silently at every session start")
+
+
 def cmd_install_hooks(args) -> int:
+    _warn_fallback_hooks()
     wiring = (f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
               f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
     if args.write:
@@ -444,10 +483,8 @@ def cmd_watch(args) -> int:
             try:
                 now = core_mod.file_mtimes(core_mod.watched_paths(args.root))
                 if now != mtimes:
-                    sha, too_big = core_mod.snap_report(
-                        args.root, "auto: files changed")
+                    sha = _snap_and_warn(args.root, "auto: files changed")
                     print(f"change detected -> snapshot {sha[:7]}")
-                    _warn_too_big(too_big, args.root)
                     _guard(args.root, sha)
                     mtimes = now
                 last_problem = None

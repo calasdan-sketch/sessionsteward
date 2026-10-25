@@ -33,7 +33,11 @@ undone 1 step(s) -> a3f9c21  before letting the agent edit memory
 ## Install
 
 Zero dependencies — Python 3.10+ stdlib only (uses your system's git; if
-git is missing every command says so in one line and exits 2).
+git is missing every command says so in one line and exits 2). Any git that
+can `init`, `add` and `commit` works; `diff` uses `--end-of-options`, which
+git added in 2.24 (2019), and with an older git it leaves that option out
+(snapshot ids are checked first, so nothing that looks like an option reaches
+git either way).
 
 ```bash
 pip install sessionsteward
@@ -164,11 +168,14 @@ it, and a restore keeps a link that is in place but never recreates one that
 is gone); not special files (a named pipe, socket or device is skipped,
 never read - reading a pipe would block for ever - and a restore never
 writes onto one: `skipped ... is not a regular file`); not the ignored names
-or oversized files listed below (so a skill you cloned into `.claude/skills/`
-loses its `.git` when `.claude` is restored). A restore
-replaces a watched directory as a whole, so whatever a snapshot cannot hold
-is *not* carried over - it stays in the trash copy the restore names
-(`moved .claude -> ~/.sessionsteward/trash/...`). A change that only toggles
+or oversized files listed below. A restore replaces a watched directory as
+a whole (the old one goes to the trash), but what a snapshot never holds is
+**put back where it was**: ignored names (a skill's own `.git`, `node_modules`,
+a virtual environment, logs), links that lead outside the folder, folders
+deeper than 64 levels, files over the size limit or the snapshot cap, and
+anything that is not a regular file. Each is reported as `kept …: not part of
+any snapshot (left in place)`. Only files a snapshot could have held, and
+that were not in it, go to the trash. A change that only toggles
 a file's executable bit or narrows its permissions is recorded by `snap`, but
 `undo` does not revert it.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
@@ -308,9 +315,9 @@ changes the limit (`0` lifts it, and so does a number too big to count, such
 as `1e305`). A file you name yourself with `watch --add` is never left out
 for its size, even where it lies inside a watched folder, and is never
 reported as left out; naming the folder does not name the files in it. None
-of the things left out comes back with a restore of the directory they sit
-in: when a restore replaces that directory, the old one - with them in it -
-goes to the trash (`moved .claude -> ...`).
+of the things left out is in a snapshot, so `undo` cannot bring one back if
+you delete it yourself; a restore does not take them away (it leaves them in
+place, see above).
 
 **Who can read the store.** `~/.sessionsteward` (the snapshots repo, the
 trash, the config and the lock) is created readable by you alone (mode 0700),
@@ -345,9 +352,16 @@ Symlinks inside a watched folder are followed (the snapshot holds the content
 behind them) with these limits: a link to the watched folder itself, to one
 of its parents, or to a folder already walked is skipped (no loops); walks go
 at most 64 folders deep; one snapshot holds at most 500 MB of walked files
-(`SESSIONSTEWARD_MAX_SNAPSHOT_MB`, 0 = no cap), with a warning naming what was
-left out; and **a link that leads outside the watched folder is skipped**, so
-`.claude/out -> ~/.ssh` cannot copy your keys into the snapshot store. If you
+(`SESSIONSTEWARD_MAX_SNAPSHOT_MB`, 0 = no cap); and **a link that leads
+outside the watched folder is skipped**, so
+`.claude/out -> ~/.ssh` cannot copy your keys into the snapshot store. Windows
+junctions count as links (also on a Python that cannot tell them from folders:
+anything that resolves outside the watched folder is treated alike). Loops and
+repeats are skipped quietly; the other three - a file or folder over the
+limits, a link leading outside, a folder deeper than 64 levels - are named in
+one `warning:` line each on stderr, with a count and the first one, every time
+a snapshot leaves something out. A restore leaves those items where they are.
+If you
 keep real content behind such links (a dotfiles repo), opt in with
 `sessionsteward watch --follow-links` (or `SESSIONSTEWARD_FOLLOW_LINKS=1`);
 `--no-follow-links` turns it off. A watched entry that is itself a link is
@@ -372,9 +386,12 @@ shells don't load your aliases or activate your venv. They deliberately do
 not use `python -m sessionsteward`: Claude Code runs hooks with the project
 as the working directory, and `python -m` would then import a
 `sessionsteward/` package from the project, so a repository you just cloned
-could run code at session start. (Only when the command cannot be found does
-`install-hooks` fall back to `python -I -m sessionsteward`, where `-I` keeps
-the project folder off the import path.) Each hook has a 30 second timeout.
+could run code at session start. (Only when the command cannot be found - a run from a source checkout -
+does `install-hooks` fall back to `python -I -m sessionsteward`, where `-I`
+keeps the project folder off the import path. It says so in a `warning:`
+line, because that form works only while sessionsteward is installed for that
+Python, so run `pip install .` in the checkout first; otherwise the hooks
+fail silently.) Each hook has a 30 second timeout.
 Re-run `install-hooks --write` if you move or recreate that environment, and
 once after upgrading from 0.1.3 or earlier: the hooks sessionsteward wrote
 itself (`sessionsteward precompact` and `sessionsteward snap -m "session

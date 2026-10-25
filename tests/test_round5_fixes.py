@@ -535,7 +535,7 @@ class TestWatchSurvivesContention(Base):
             ticks["n"] += 1
             return {"x": ticks["n"]}
 
-        def flaky_snap(root, message):
+        def flaky_snap(root, message, skipped=None):
             ticks["snaps"] += 1
             if ticks["snaps"] == 1:
                 raise core_mod.GitError("git add -A -f failed: index.lock")
@@ -1375,13 +1375,11 @@ class TestSpecialFilesAreSkippedNotRead(Base):
         p = self.child("undo")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(slurp(os.path.join(self.dot, "notes.md")), b"notes\n")
-        # a snapshot cannot hold a pipe, so the swapped-out directory (with
-        # the pipe in it) is what the trash keeps
-        kept = [n for n in os.listdir(core_mod.TRASH_DIR)
-                if n.startswith(".claude.")]
-        self.assertEqual(len(kept), 1, kept)
-        self.assertTrue(os.path.exists(os.path.join(core_mod.TRASH_DIR, kept[0],
-                                                    "events.fifo")))
+        # a snapshot cannot hold a pipe, so the restore leaves it where it
+        # is (it was never in the snapshot; the swapped-out directory in the
+        # trash no longer has it)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(
+            os.path.join(self.dot, "events.fifo")).st_mode))
 
     def test_a_pipe_where_a_watched_file_belongs_is_never_written_to(self):
         self.assertEqual(self.cli("init")[0], 0)

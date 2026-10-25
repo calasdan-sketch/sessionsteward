@@ -448,7 +448,7 @@ class TestWhatTheMirrorTakes(Base):
             self.assertIn(f"files/.claude/skills/x/{name}", listed(), name)
         self.assert_matches_the_live_files()
 
-    def test_restore_leaves_a_virtual_environment_in_the_trash_copy(self):
+    def test_restore_leaves_a_virtual_environment_where_it_is(self):
         write(os.path.join(self.dot, ".venv", "keep.txt"), "mine\n")
         write(os.path.join(self.dot, "rules.md"), "v1\n")
         self.init()
@@ -458,13 +458,15 @@ class TestWhatTheMirrorTakes(Base):
         code, out, err = self.cli("undo")
         self.assertEqual(code, 0, out + err)
         self.assertEqual(slurp(os.path.join(self.dot, "rules.md")), b"v2\n")
-        # not part of a snapshot, so not carried over by the restore ...
-        self.assertFalse(os.path.exists(os.path.join(self.dot, ".venv")))
-        # ... but never lost: it is in the trash copy the restore names
+        # not part of a snapshot, so the restore does not take it away: it
+        # is put back into the restored folder (and says so)
+        self.assertEqual(slurp(os.path.join(self.dot, ".venv", "keep.txt")),
+                         b"mine\n")
+        self.assertIn("kept", out)
         trashed = [e for e in self.trash_entries() if e.startswith(".claude.")]
         self.assertEqual(len(trashed), 1, self.trash_entries())
-        self.assertTrue(os.path.isfile(os.path.join(
-            core_mod.TRASH_DIR, trashed[0], ".venv", "keep.txt")))
+        self.assertFalse(os.path.exists(os.path.join(
+            core_mod.TRASH_DIR, trashed[0], ".venv")))
 
     # -- the size limit ----------------------------------------------------
     def limit(self, megabytes):

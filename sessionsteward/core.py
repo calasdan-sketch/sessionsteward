@@ -1194,16 +1194,21 @@ def snap(project_root: str, message: str) -> str:
         return _snap(project_root, message)
 
 
-def snap_report(project_root: str, message: str) -> tuple[str, list]:
+def snap_report(project_root: str, message: str,
+                skipped: dict | None = None) -> tuple[str, list]:
     """snap(), plus the files it left out for being over max_file_bytes():
-    (sha, [(path, size), ...]) in path order."""
+    (sha, [(path, size), ...]) in path order. ``skipped``, when given, is
+    filled with the other things a snapshot silently leaves behind:
+    skipped["outside"] = links that lead outside a watched folder,
+    skipped["deep"] = folders below MAX_WALK_DEPTH levels (sorted paths)."""
     too_big: list = []
     with locked():
-        sha = _snap(project_root, message, too_big)
+        sha = _snap(project_root, message, too_big, skipped)
     return sha, sorted(set(too_big))
 
 
-def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
+def _snap(project_root: str, message: str, too_big: list | None = None,
+          skipped: dict | None = None) -> str:
     if not repo_ready():
         init_repo()
     _ensure_attributes()
@@ -1249,10 +1254,14 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
                         os.chmod(t, (os.stat(d).st_mode & 0o777) | 0o700)
                     except OSError:
                         pass
-            for full, _size in _walk_files(ap, budget, too_big, mirror_dir):
+            for full, _size in _walk_files(ap, budget, too_big, mirror_dir,
+                                           skipped):
                 _copy_content(full, os.path.join(dest, os.path.relpath(full, ap)))
         elif not os.path.lexists(dest):
             _copy_content(ap, dest)
+    if skipped is not None:
+        for key in list(skipped):
+            skipped[key] = sorted(set(skipped[key]))
     if too_big is not None:
         too_big.extend(budget.skipped)   # refused for the snapshot cap
     if too_big:
@@ -1630,8 +1639,35 @@ def _inside(real: str, root_real: str) -> bool:
     return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
 
 
+_REPARSE_MOUNT_POINT = 0xA0000003   # IO_REPARSE_TAG_MOUNT_POINT: a junction
+
+
+def _is_link(path: str) -> bool:
+    """A symlink, or - on Windows - an NTFS junction. os.path.islink() is
+    False for a junction (Python before 3.12 cannot see one, and 3.12+ has
+    os.path.isjunction for it), but os.walk follows it like a link, so a
+    junction pointing at a parent loops and one pointing at ~/.ssh copies
+    your keys: both must be treated exactly like symlinks."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        try:
+            if isjunction(path):
+                return True
+        except (OSError, ValueError):
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+        except (OSError, ValueError):
+            return False
+        return getattr(st, "st_reparse_tag", 0) == _REPARSE_MOUNT_POINT
+    return False
+
+
 def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
-                on_dir=None):
+                on_dir=None, skips: dict | None = None):
     """Yield (path, size) for every regular file under the watched directory
     ap, in a stable order: IGNORE_PATTERNS, virtual environments and build
     output left out; pipes, sockets, devices and dangling links skipped;
@@ -1643,7 +1679,10 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
     followed, depth is capped, and so is the total (budget). A link
     (file or directory) that leads outside ap is skipped unless
     follow_external_links(). on_dir(path), when given, is called for ap and
-    each directory walked, before its files."""
+    each directory walked, before its files. skips, when given, collects
+    what the walk left out that the user did not ask to have left out:
+    skips["outside"] (links leading outside ap) and skips["deep"]
+    (directories below MAX_WALK_DEPTH levels), as lists of paths."""
     limit = max_file_bytes()
     root_real = os.path.realpath(ap)
     outside_ok = follow_external_links()
@@ -1655,17 +1694,31 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
         keep = []
         too_deep = root.rstrip(os.sep).count(os.sep) - base_depth >= MAX_WALK_DEPTH
         for d in sorted(dirs):
-            if too_deep or _ignored_dir(root, d):
+            if _ignored_dir(root, d):
                 continue
             full = os.path.join(root, d)
-            if os.path.islink(full):
+            if too_deep:
+                if skips is not None:
+                    skips.setdefault("deep", []).append(full)
+                continue
+            if _is_link(full):
                 real = os.path.realpath(full)
                 nreal = os.path.normcase(real)
                 if nreal in seen or _inside(root_real, real):
                     continue   # a loop, or somewhere already walked
                 if not outside_ok and not _inside(real, root_real):
+                    if skips is not None:
+                        skips.setdefault("outside", []).append(full)
                     continue
                 seen.add(nreal)
+            elif not outside_ok and not _inside(os.path.realpath(full),
+                                                root_real):
+                # Not a link as far as this Python can tell, yet it resolves
+                # to somewhere else (a junction an old Python cannot see, or
+                # a path with a link above it): the same rule applies.
+                if skips is not None:
+                    skips.setdefault("outside", []).append(full)
+                continue
             keep.append(d)
         dirs[:] = keep
         for fn in sorted(files):
@@ -1675,8 +1728,10 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
             size = _regular_size(full)
             if size is None:
                 continue
-            if (not outside_ok and os.path.islink(full)
+            if (not outside_ok and _is_link(full)
                     and not _inside(os.path.realpath(full), root_real)):
+                if skips is not None:
+                    skips.setdefault("outside", []).append(full)
                 continue
             if limit is not None and size > limit:
                 if too_big is not None:
@@ -1861,7 +1916,7 @@ def _links_under(top: str) -> list[str]:
         dirs[:] = [d for d in dirs if not _ignored_dir(root, d)]
         for name in dirs + files:
             full = os.path.join(root, name)
-            if os.path.islink(full):
+            if _is_link(full):
                 links.append(full)
     return links
 
@@ -1897,6 +1952,63 @@ def _keep_links(live_dir: str, staged: str, snap_tree: dict[str, str],
             lines.append(f"skipped {link}: is a symlink (left untouched, "
                          f"never written through)")
     return lines
+
+
+def unsnapshotted_items(top: str) -> list[str]:
+    """The top-most paths under the watched folder ``top`` that a snapshot
+    walk leaves out: ignored names (logs, caches, a virtual environment, a
+    skill's own .git), links leading outside, folders below the depth limit,
+    files over the size limit or the snapshot cap, and anything that is not a
+    regular file. A snapshot cannot hold them, so a restore must not take
+    them away. Links that ARE walked are not listed (_keep_links looks after
+    those)."""
+    walked: set[str] = set()
+    yielded: set[str] = set()
+    for full, _size in _walk_files(top, _Budget(), None,
+                                   lambda d: walked.add(os.path.normcase(d))):
+        yielded.add(os.path.normcase(full))
+    out: list[str] = []
+
+    def visit(directory: str) -> None:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            return
+        for name in names:
+            full = os.path.join(directory, name)
+            key = os.path.normcase(full)
+            if os.path.isdir(full):
+                if key in walked:
+                    if not os.path.islink(full):
+                        visit(full)
+                else:
+                    out.append(full)
+            elif key not in yielded:
+                out.append(full)
+    visit(top)
+    return out
+
+
+def _carry_unsnapshotted(live: str, trashed: str, items: list[str],
+                         report: list[str]) -> None:
+    """Put the items (listed under the live folder ``live``, whose old copy
+    is now ``trashed``) back where they were, unless the restored folder
+    already has something by that name. Reports each one."""
+    for item in items:
+        sub = os.path.relpath(item, live)
+        src = os.path.join(trashed, sub)
+        dst = os.path.join(live, sub)
+        if not os.path.lexists(src) or os.path.lexists(dst):
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+        except OSError as e:
+            report.append(f"skipped {dst}: could not put it back from the "
+                          f"trash ({e.strerror or e}); it is in {src}")
+            continue
+        report.append(f"kept {dst}: not part of any snapshot (left in "
+                      f"place)")
 
 
 def _unpack_folder(archive: bytes, prefix: str, dest: str) -> None:
@@ -2074,8 +2186,10 @@ def _restore(sha: str, trash_dir: str | None,
                     restored.append(f"skipped {ap}: could not extract "
                                     f"snapshot {sha[:7]}{why} (left untouched)")
                     continue
-                if os.path.isdir(ap):
+                leftovers = []
+                if os.path.isdir(ap) and not os.path.islink(ap):
                     restored.extend(_keep_links(ap, src, snap_tree, algo))
+                    leftovers = unsnapshotted_items(ap)
                 _apply_modes(src, ap, rel, bits)
                 # Never delete: the existing path (dir, file or link) goes
                 # to trash before the snapshot copy takes its place - and
@@ -2083,6 +2197,8 @@ def _restore(sha: str, trash_dir: str | None,
                 if _swap_via_trash(ap, lambda: os.rename(src, ap), trash_dir,
                                    restored, trashed):
                     restored.append(ap)
+                    if leftovers and trashed:
+                        _carry_unsnapshotted(ap, trashed[-1], leftovers, restored)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         elif data is not None:
@@ -2219,9 +2335,39 @@ def diff(sha1: str, sha2: str) -> str:
     # codes hid every line from the +/- filter), no external diff tool or
     # textconv filter (their output is not a diff), and no rename detection
     # (a renamed file would show as "similarity index 100%" and no lines).
+    option_end = ("--end-of-options",) if _git_has_end_of_options() else ()
     return _git(REPO_DIR, "diff", "--no-color", "--no-ext-diff",
-                "--no-textconv", "--no-renames", "--end-of-options",
+                "--no-textconv", "--no-renames", *option_end,
                 f"{sha1}..{sha2}", "--", "files/")
+
+
+#: git added --end-of-options in 2.24 (November 2019).
+_GIT_END_OF_OPTIONS = (2, 24)
+
+
+@functools.lru_cache(maxsize=1)
+def _git_version() -> tuple[int, ...] | None:
+    """The installed git's version as numbers, e.g. (2, 43, 0), or None when
+    it cannot be read."""
+    try:
+        p = _run_git(REPO_DIR if os.path.isdir(REPO_DIR) else os.getcwd(),
+                     ("--version",))
+    except StewardError:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?",
+                  p.stdout.decode("utf-8", "replace"))
+    if p.returncode != 0 or not m:
+        return None
+    return tuple(int(g) for g in m.groups() if g is not None)
+
+
+def _git_has_end_of_options() -> bool:
+    """Does this git know --end-of-options (2.24+)? An older git gets the
+    command without it: the ids are checked by _require_snapshot_id first, so
+    nothing that looks like an option can reach it either way. A git whose
+    version cannot be read is assumed to be recent."""
+    version = _git_version()
+    return version is None or version >= _GIT_END_OF_OPTIONS
 
 
 def file_mtimes(paths: list[str]) -> dict[str, float]:

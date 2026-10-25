@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5
+
+- Release workflow: the step that checks the tag against the version never ran (its script was folded into one line by the YAML, so a wrong tag could still publish). It is now a script, `.github/scripts/release_check.py`, that compares the tag with the version in the built files and refuses a tag whose commit is not on `main`. CI builds the source archive and runs the tests from the unpacked archive; Python 3.14 is in the CI matrix.
+- Tests no longer fail when the `sessionsteward` command is installed next to the Python that runs them.
+- A snapshot now says what it leaves behind that you did not ask it to: links leading outside a watched folder and folders more than 64 levels deep are counted in a `warning:` line (next to the existing size warnings).
+- `undo` and `restore` no longer take away what a snapshot cannot hold. A restore still replaces a watched folder as a whole, but ignored names (a skill's own `.git`, `node_modules`, a virtual environment), links leading outside, files over the size limit and other things no snapshot contains are put back where they were (`kept …: not part of any snapshot`). Before, they ended up only in the trash.
+- Windows junctions are treated like symlinks, and anything that resolves outside the watched folder is treated alike on a Python that cannot see a junction.
+- `install-hooks` warns when it falls back to `python -I -m sessionsteward` (a source checkout): that works only while the package is installed.
+- `diff` works with git older than 2.24 (no `--end-of-options`); README states the requirement.
+
 ## 0.1.4
 
 Security release. **Re-run `sessionsteward install-hooks --write` after

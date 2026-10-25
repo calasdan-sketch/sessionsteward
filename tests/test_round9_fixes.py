@@ -116,7 +116,9 @@ class TestHooksDoNotRunCodeFromTheProject(Base):
         for event, want in (("PreCompact", core_mod.HOOK_PRECOMPACT_CMD),
                             ("SessionStart", core_mod.HOOK_SESSIONSTART_CMD)):
             entries = merged["hooks"][event]
-            self.assertEqual(len(entries), 1, entries)   # not appended
+            # not appended (SessionStart also gets the 0.2.0 "compact" hook)
+            self.assertEqual(len(entries), 2 if event == "SessionStart" else 1,
+                             entries)
             hook = entries[0]["hooks"][0]
             self.assertEqual(hook["command"], want)
             self.assertEqual(hook["timeout"], 30)

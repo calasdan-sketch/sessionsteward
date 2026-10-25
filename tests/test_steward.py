@@ -916,7 +916,7 @@ class TestSteward(unittest.TestCase):
                          ["echo other", core_mod.HOOK_PRECOMPACT_CMD])
         self.assertEqual(
             core_mod._hook_commands(settings["hooks"]["SessionStart"]),
-            [core_mod.HOOK_SESSIONSTART_CMD])
+            [core_mod.HOOK_SESSIONSTART_CMD, core_mod.HOOK_REMIND_CMD])
         before = json.dumps(settings, sort_keys=True)
         core_mod.merge_hooks(settings)
         self.assertEqual(json.dumps(settings, sort_keys=True), before)

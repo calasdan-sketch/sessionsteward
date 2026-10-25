@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sessionsteward"
-version = "0.1.5"
+version = "0.2.0"
 description = "Undo for CLAUDE.md: git-snapshots your agent memory files and brings them back."
 readme = "README.md"
 requires-python = ">=3.10"

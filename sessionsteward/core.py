@@ -41,6 +41,8 @@ import threading
 import time
 import unicodedata
 
+from . import secretscan
+
 try:  # POSIX: advisory whole-file locks
     import fcntl
 except ImportError:  # Windows
@@ -359,7 +361,8 @@ def _is_snapshots_repo(repo: str) -> bool:
     return os.path.abspath(repo) == os.path.abspath(REPO_DIR)
 
 
-def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProcess:
+def _run_git(repo: str, args: tuple[str, ...], env_extra: dict | None = None,
+             **kw) -> subprocess.CompletedProcess:
     """subprocess.run of a git command with the failure modes that are not
     git's own exit code turned into GitError: no git on PATH, a hang.
 
@@ -372,8 +375,10 @@ def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProc
     if _is_snapshots_repo(repo):
         where += ["--git-dir", os.path.join(repo, ".git"), "--work-tree", repo]
     try:
+        env = _git_env()
+        env.update(env_extra or {})
         return subprocess.run([*GIT, *where, *args], capture_output=True,
-                              timeout=60, env=_git_env(), **kw)
+                              timeout=60, env=env, **kw)
     except FileNotFoundError:
         raise GitError("git not found — sessionsteward needs git on PATH "
                        "(https://git-scm.com/downloads)") from None
@@ -1221,6 +1226,20 @@ def _snap(project_root: str, message: str, too_big: list | None = None,
         rel = _rel(ap, project_root)
         plan.append((rel, ap, _mirror_path(files_dir, rel)))
         entry_of.setdefault(rel, entry)
+    # A watched FILE that looks like it holds a secret is not copied (a
+    # file inside a watched folder is left out by the walk below). It is
+    # also not in the manifest, so a restore never touches it.
+    if skipped is None:
+        skipped = {}
+    withheld: list[str] = []
+    if secretscan.enabled():
+        for item in list(plan):
+            rel, ap, _dest = item
+            if os.path.isfile(ap) and secretscan.file_kinds(ap):
+                plan.remove(item)
+                entry_of.pop(rel, None)
+                skipped.setdefault("secret", []).append(ap)
+                withheld.append(rel)
     manifest = {rel: ap for rel, ap, _ in plan}
     # What each watched path IS: a path with a manifest entry but nothing in
     # the tree is an empty directory only if it was one. (A file that git
@@ -1259,9 +1278,15 @@ def _snap(project_root: str, message: str, too_big: list | None = None,
                 _copy_content(full, os.path.join(dest, os.path.relpath(full, ap)))
         elif not os.path.lexists(dest):
             _copy_content(ap, dest)
-    if skipped is not None:
-        for key in list(skipped):
-            skipped[key] = sorted(set(skipped[key]))
+    for key in list(skipped):
+        skipped[key] = sorted(set(skipped[key]))
+    for rel, ap, _dest in plan:
+        if kinds[rel] == "dir":
+            prefix = ap.rstrip(os.sep) + os.sep
+            withheld.extend(
+                rel + "/" + path[len(prefix):].replace(os.sep, "/")
+                for path in skipped.get("secret", [])
+                if path.startswith(prefix))
     if too_big is not None:
         too_big.extend(budget.skipped)   # refused for the snapshot cap
     if too_big:
@@ -1285,6 +1310,8 @@ def _snap(project_root: str, message: str, too_big: list | None = None,
     if modes:
         document["modes"] = modes
     document["watch"] = watch_list()
+    if withheld:
+        document["withheld"] = sorted(set(withheld))
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump(document, f, indent=2)
@@ -1681,12 +1708,14 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
     follow_external_links(). on_dir(path), when given, is called for ap and
     each directory walked, before its files. skips, when given, collects
     what the walk left out that the user did not ask to have left out:
-    skips["outside"] (links leading outside ap) and skips["deep"]
-    (directories below MAX_WALK_DEPTH levels), as lists of paths."""
+    skips["outside"] (links leading outside ap), skips["deep"]
+    (directories below MAX_WALK_DEPTH levels) and skips["secret"] (files
+    that look like they hold a secret: see secretscan), as lists of paths."""
     limit = max_file_bytes()
     root_real = os.path.realpath(ap)
     outside_ok = follow_external_links()
     seen = {os.path.normcase(root_real)}
+    scan_secrets = secretscan.enabled()
     base_depth = ap.rstrip(os.sep).count(os.sep)
     for root, dirs, files in os.walk(ap, followlinks=True):
         if on_dir is not None:
@@ -1737,6 +1766,12 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
                 if too_big is not None:
                     too_big.append((full, size))
                 continue
+            if scan_secrets and secretscan.file_kinds(full, size):
+                # Left out like an ignored file (and listed, so the command
+                # can say so): the text that matched is never kept.
+                if skips is not None:
+                    skips.setdefault("secret", []).append(full)
+                continue
             if budget.take(full, size):
                 yield full, size
 
@@ -1763,6 +1798,8 @@ def iter_files(paths: list[str]):
             for full, _size in _walk_files(ap, budget):
                 yield full
         elif os.path.isfile(ap):
+            if secretscan.enabled() and secretscan.file_kinds(ap):
+                continue   # not in the snapshot, so not in the comparison
             yield ap
 
 
@@ -2280,9 +2317,13 @@ def shrunk(sha: str, prev_sha: str, ratio: float = 0.5) -> list[tuple]:
     that disappeared altogether (new_size None).
     Returns [(rel, old_size, new_size)]."""
     old, new = _sizes(prev_sha), _sizes(sha)
+    # A file left out of the newer snapshot on purpose (it looked like it
+    # held a secret) is not a deleted file.
+    withheld = set(_manifest_at(sha).get("withheld") or [])
     hits = [(rel, old[rel], new[rel]) for rel in sorted(new)
             if rel in old and new[rel] < old[rel] * (1 - ratio)]
-    hits += [(rel, old[rel], None) for rel in sorted(old) if rel not in new]
+    hits += [(rel, old[rel], None) for rel in sorted(old)
+             if rel not in new and rel not in withheld]
     return hits
 
 
@@ -2431,12 +2472,31 @@ def _self_cmd() -> str:
 
 HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact"
 HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap -m "session start"'
-# The arguments each event's hook has when sessionsteward wrote it.
-_HOOK_ARGS = {"PreCompact": ["precompact"],
-              "SessionStart": ["snap", "-m", "session start"]}
+HOOK_REMIND_CMD = f"{_self_cmd()} remind"
+HOOK_GUARD_CMD = f"{_self_cmd()} guard hook"
+
+#: Every hook sessionsteward installs: (event, matcher, arguments after the
+#: command, the full command). The matchers are Claude Code's: SessionStart
+#: "compact" is the session that continues after a compaction; the guard's
+#: PreToolUse matcher names the file-editing tools; FileChanged takes the
+#: literal file names to watch (see guardhook.py for what each can do).
+HOOK_SPECS = (
+    ("PreCompact", "", ["precompact"], HOOK_PRECOMPACT_CMD),
+    ("SessionStart", "", ["snap", "-m", "session start"],
+     HOOK_SESSIONSTART_CMD),
+    ("SessionStart", "compact", ["remind"], HOOK_REMIND_CMD),
+    ("PreToolUse", "Write|Edit|MultiEdit", ["guard", "hook"],
+     HOOK_GUARD_CMD),
+    ("FileChanged", "CLAUDE.md|CLAUDE.local.md|AGENTS.md", ["guard", "hook"],
+     HOOK_GUARD_CMD),
+)
+# The arguments each event's first hook has when sessionsteward wrote it.
+_HOOK_ARGS = {}
+for _event, _matcher, _args, _cmd in HOOK_SPECS:
+    _HOOK_ARGS.setdefault(_event, _args)
 
 
-def _is_ours(event: str, cmd) -> bool:
+def _is_ours(event: str, cmd, args=None) -> bool:
     """Did sessionsteward write this hook command for this event? Exactly
     that, and nothing that merely mentions it: the bare `sessionsteward ...`
     the first version wrote, `<any python> [-I] -m sessionsteward ...` (the
@@ -2452,7 +2512,7 @@ def _is_ours(event: str, cmd) -> bool:
         words = shlex.split(cmd)
     except ValueError:
         return False
-    args = _HOOK_ARGS[event]
+    args = _HOOK_ARGS[event] if args is None else args
     if words[-len(args):] != args:
         return False
     head = words[:-len(args)]
@@ -2467,22 +2527,13 @@ def _is_ours(event: str, cmd) -> bool:
 
 def build_hooks_json() -> dict:
     """The hooks payload for Claude Code's settings.json `hooks` section."""
-    return {
-        "hooks": {
-            "PreCompact": [
-                {"matcher": "",
-                 "hooks": [{"type": "command",
-                            "command": HOOK_PRECOMPACT_CMD,
-                            "timeout": HOOK_TIMEOUT_SECONDS}]}
-            ],
-            "SessionStart": [
-                {"matcher": "",
-                 "hooks": [{"type": "command",
-                            "command": HOOK_SESSIONSTART_CMD,
-                            "timeout": HOOK_TIMEOUT_SECONDS}]}
-            ],
-        }
-    }
+    hooks: dict = {}
+    for event, matcher, _args, cmd in HOOK_SPECS:
+        hooks.setdefault(event, []).append(
+            {"matcher": matcher,
+             "hooks": [{"type": "command", "command": cmd,
+                        "timeout": HOOK_TIMEOUT_SECONDS}]})
+    return {"hooks": hooks}
 
 
 def _hook_commands(entries: list) -> list[str]:
@@ -2509,27 +2560,26 @@ def merge_hooks(settings: dict) -> dict:
     SettingsError for a `hooks` value of an unexpected shape (it cannot be
     merged into without replacing something the user wrote).
     """
-    ours = build_hooks_json()["hooks"]
     hooks = settings.get("hooks")
     if hooks is None:
         hooks = settings["hooks"] = {}
     elif not isinstance(hooks, dict):
         raise SettingsError('"hooks" in the settings file is not an object')
-    for event, entries in ours.items():
+    for event, matcher, args, cmd in HOOK_SPECS:
         existing = hooks.get(event)
         if existing is None:
             existing = hooks[event] = []
         elif not isinstance(existing, list):
             raise SettingsError(f'"hooks.{event}" in the settings file is '
                                 f'not a list')
-        cmd = entries[0]["hooks"][0]["command"]
         found = False
         for e in list(existing):
             if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
                 continue
             kept = []
             for h in e["hooks"]:
-                if isinstance(h, dict) and _is_ours(event, h.get("command")):
+                if isinstance(h, dict) and _is_ours(event, h.get("command"),
+                                                    args):
                     if found:
                         continue  # stale duplicate
                     h["command"] = cmd
@@ -2541,7 +2591,9 @@ def merge_hooks(settings: dict) -> dict:
             elif e["hooks"]:
                 existing.remove(e)  # we emptied it
         if not found:
-            existing.append(entries[0])
+            existing.append({"matcher": matcher,
+                             "hooks": [{"type": "command", "command": cmd,
+                                        "timeout": HOOK_TIMEOUT_SECONDS}]})
     return settings
 
 

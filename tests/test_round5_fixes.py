@@ -719,7 +719,9 @@ class TestInstallHooksWriteNeverClobbers(Base):
         self.put(json.dumps({"hooks": {"PreToolUse": [mine]}}).encode())
         self.assertEqual(self.cli("install-hooks", "--write")[0], 0)
         merged = json.loads(slurp(self.settings))
-        self.assertEqual(merged["hooks"]["PreToolUse"], [mine])
+        # (ours is added after it: the shrink guard's PreToolUse hook)
+        self.assertEqual(merged["hooks"]["PreToolUse"][0], mine)
+        self.assertEqual(len(merged["hooks"]["PreToolUse"]), 2)
 
 
 class TestGitEnvironmentCannotRedirectOrBreakUs(Base):

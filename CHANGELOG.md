@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- Shrink guard in the session: `install-hooks --write` now also adds a `PreToolUse` hook (Write, Edit, MultiEdit) that, before an edit would make a watched file more than 50% smaller, takes a snapshot and asks you (or warns Claude, or refuses: `guard set --mode`), and a `FileChanged` hook for `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` that warns you after any change. `guard status` and `guard set --percent N --mode ask|warn|block`. The README lists what each event cannot do.
+- Reminder after a compaction: a `SessionStart` hook with the matcher `compact` adds a short note to Claude's context (`sessionsteward remind`). `PostCompact` is not used because its output is discarded.
+- Secrets are left out of snapshots: a file that looks like it holds a key, token or password is skipped with a warning that names the file and the kind of secret, never the secret. `undo` and `restore` leave such a file alone. `SESSIONSTEWARD_SECRET_SCAN=0` turns it off.
+- `sessionsteward why <older> [newer]`: which instruction lines are no longer anywhere in their file between two snapshots, per file.
+- `sessionsteward prune [--keep N] [--days D] [--save] [--yes]`: remove old snapshots by a keep-N / keep-D-days rule; reports first, never runs by itself.
+- Hooks already installed keep working; run `install-hooks --write` again to add the new ones.
+
 ## 0.1.5
 
 - Release workflow: the step that checks the tag against the version never ran (its script was folded into one line by the YAML, so a wrong tag could still publish). It is now a script, `.github/scripts/release_check.py`, that compares the tag with the version in the built files and refuses a tag whose commit is not on `main`. CI builds the source archive and runs the tests from the unpacked archive; Python 3.14 is in the CI matrix.

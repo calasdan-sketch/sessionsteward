@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- `auto_memory_dir` also tries the real path of the repository and the spelling the project was started in (macOS /var vs /private/var, Windows short 8.3 names), since git reports one and Claude Code names the folder after the other. Tests: the entry-composition test, which emulates a normalising file system, is skipped where the real file system already is one; one path check compares real paths.
+
 - Shrink guard in the session: `install-hooks --write` now also adds a `PreToolUse` hook (Write, Edit, MultiEdit) that, before an edit would make a watched file more than 50% smaller, takes a snapshot and asks you (or warns Claude, or refuses: `guard set --mode`), and a `FileChanged` hook for `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` that warns you after any change. `guard status` and `guard set --percent N --mode ask|warn|block`. The README lists what each event cannot do.
 - Reminder after a compaction: a `SessionStart` hook with the matcher `compact` adds a short note to Claude's context (`sessionsteward remind`). `PostCompact` is not used because its output is discarded.
 - Secrets are left out of snapshots: a file that looks like it holds a key, token or password is skipped with a warning that names the file and the kind of secret, never the secret. `undo` and `restore` leave such a file alone. `SESSIONSTEWARD_SECRET_SCAN=0` turns it off.

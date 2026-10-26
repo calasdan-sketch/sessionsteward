@@ -995,11 +995,11 @@ class TestSteward(unittest.TestCase):
         names = core_mod._git(core_mod.REPO_DIR, "ls-tree", "-r",
                               "--name-only", "HEAD").splitlines()
         self.assertIn(f"files/{rel}", names)
-        files_dir = os.path.realpath(os.path.join(core_mod.REPO_DIR, "files"))
+        repo_real = os.path.realpath(core_mod.REPO_DIR)   # macOS /private/var, Windows long names
+        files_dir = os.path.join(repo_real, "files")
         for n in names:
             real = os.path.realpath(os.path.join(core_mod.REPO_DIR, n))
-            self.assertTrue(real.startswith(os.path.join(core_mod.REPO_DIR, "")),
-                            n)
+            self.assertTrue(real.startswith(os.path.join(repo_real, "")), n)
         self.assertFalse(os.path.exists(os.path.join(
             os.path.dirname(tmp), "outside2")))  # no stray mirror either
         # the file is actually protected: clobber -> undo brings it back

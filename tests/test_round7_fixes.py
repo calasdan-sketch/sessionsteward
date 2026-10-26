@@ -866,6 +866,10 @@ class TestEntrySpellingEmulated(EntrySpelling, Base):
         return CaseInsensitiveLookups(self._tmp)
 
 
+@unittest.skipIf(case_insensitive(tempfile.gettempdir()),
+                 "the lookup is emulated for file systems that do not fold names; "
+                 "on macOS and Windows the real file system already does, and the "
+                 "names it lists differ (APFS keeps, NTFS does not normalise)")
 class TestEntryComposition(Base):
     """The same wedge with a name spelled composed in the watch list and
     decomposed on disk (macOS lists names decomposed and finds either). Only

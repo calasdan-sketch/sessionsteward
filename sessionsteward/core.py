@@ -559,6 +559,41 @@ def _project_slug(path: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
+def _spellings(candidates: list[str], root: str) -> list[str]:
+    """Every way the same folders may be written. git reports a real path
+    (macOS /private/var/..., Windows long names) while Claude Code named the
+    project folder after the path it was started in (/var/..., 8.3 short
+    names). For each candidate: its real path, and the parent of `root` (as
+    given) that is the same folder."""
+    out: list[str] = []
+
+    def add(p):
+        if p and p not in out:
+            out.append(p)
+    parents = []
+    cur = root
+    while True:
+        parents.append(cur)
+        up = os.path.dirname(cur)
+        if up == cur:
+            break
+        cur = up
+    for cand in candidates:
+        add(cand)
+        try:
+            real = os.path.realpath(cand)
+        except (OSError, ValueError):
+            continue
+        add(real)
+        for anc in parents:
+            try:
+                if os.path.realpath(anc) == real:
+                    add(anc)
+            except (OSError, ValueError):
+                pass
+    return out
+
+
 def auto_memory_dir(project_root: str) -> str | None:
     """Claude Code's auto-memory directory for project_root
     (~/.claude/projects/<project>/memory), or None when none exists.
@@ -587,6 +622,7 @@ def auto_memory_dir(project_root: str) -> str | None:
     except GitError:
         pass
     candidates.append(root)
+    candidates = _spellings(candidates, root)
     projects = os.path.join(_claude_config_dir(), "projects")
     for cand in candidates:
         d = os.path.join(projects, _project_slug(cand), "memory")

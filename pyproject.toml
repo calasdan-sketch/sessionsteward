@@ -35,3 +35,6 @@ Changelog = "https://github.com/calasdan-sketch/sessionsteward/blob/main/CHANGEL
 
 [project.scripts]
 sessionsteward = "sessionsteward.cli:main"
+
+[tool.setuptools.package-data]
+sessionsteward = ["py.typed"]

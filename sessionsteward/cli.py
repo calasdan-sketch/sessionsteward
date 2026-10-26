@@ -40,6 +40,7 @@ import time
 from . import __version__
 from . import core as core_mod
 from . import diet as diet_mod
+from . import doctor as doctor_mod
 from . import guardhook as guard_mod
 from . import retention as retention_mod
 from . import secretscan as secret_mod
@@ -466,6 +467,17 @@ def cmd_why(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    findings = doctor_mod.run_doctor(CLAUDE_SETTINGS)
+    sys.stdout.write(doctor_mod.render_doctor(findings))
+    return 1 if any(lvl == doctor_mod.FAIL for lvl, _ in findings) else 0
+
+
+def cmd_config(args) -> int:
+    sys.stdout.write(doctor_mod.render_config(doctor_mod.config_show()))
+    return 0
+
+
 def cmd_remind(args) -> int:
     return guard_mod.run_remind(args.root)
 
@@ -692,6 +704,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Lines to show per file (default %(default)s).")
     sub.add_parser("remind", help="(a hook) the note Claude gets after a "
                                   "compaction.")
+    sub.add_parser("doctor", help="Check git, the hooks (do they point at "
+                                  "this install?) and the lock wait.")
+    cf = sub.add_parser("config", help="Show the settings in force and where "
+                                       "each comes from.")
+    csub = cf.add_subparsers(dest="config_cmd", required=True)
+    csub.add_parser("show", help="Print every setting and its source.")
     gd = sub.add_parser("guard", help="The shrink guard: status, settings, "
                                       "and the hook command.")
     gsub = gd.add_subparsers(dest="guard_cmd", required=True)
@@ -744,7 +762,14 @@ def main(argv=None) -> int:
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
         "install-hooks": cmd_install_hooks, "why": cmd_why,
         "remind": cmd_remind, "guard": cmd_guard, "prune": cmd_prune,
+        "doctor": cmd_doctor, "config": cmd_config,
     }
+    # The commands Claude Code runs as hooks wait less for the lock and log
+    # what they skipped (see core.hook_mode).
+    core_mod.hook_mode(
+        args.cmd in ("precompact", "remind")
+        or (args.cmd == "guard" and args.guard_cmd == "hook")
+        or (args.cmd == "snap" and args.message == "session start"))
     editing = args.cmd == "watch" and bool(
         args.add or args.remove or args.follow_links is not None)
     if editing:

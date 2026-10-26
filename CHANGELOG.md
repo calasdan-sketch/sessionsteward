@@ -2,8 +2,12 @@
 
 ## 0.2.0
 
+- Restore trust: every destination in a snapshot's manifest must be on the current watch list (and belong to its name), and the manifest's SHA-256, recorded outside the repository at snapshot time, must match; otherwise the restore is refused before any file is touched.
+- Secret scan reads the whole file in pieces (up to 500 MB, not 2 MB), flags long all-letter `password = ...` values, decodes once, and measures the file it opened.
+- A daily automatic prune (newest 200 per project and the last 90 days, or your saved rule) and `git gc --auto`; `SESSIONSTEWARD_AUTO_PRUNE=0` turns it off.
+- The shrink guard's default `ask` runs as `warn` when there is no terminal; a hook waits at most 10 s for the lock and logs a skip to `~/.sessionsteward/hook.log`.
+- `sessionsteward doctor` (hooks point at this install?) and `config show` (value and source); the compaction reminder lists lines lost since the pre-compaction snapshot; `projects/*/*.jsonl` transcripts are not snapshotted.
 - `auto_memory_dir` also tries the real path of the repository and the spelling the project was started in (macOS /var vs /private/var, Windows short 8.3 names), since git reports one and Claude Code names the folder after the other. Tests: the entry-composition test, which emulates a normalising file system, is skipped where the real file system already is one; one path check compares real paths.
-
 - Shrink guard in the session: `install-hooks --write` now also adds a `PreToolUse` hook (Write, Edit, MultiEdit) that, before an edit would make a watched file more than 50% smaller, takes a snapshot and asks you (or warns Claude, or refuses: `guard set --mode`), and a `FileChanged` hook for `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` that warns you after any change. `guard status` and `guard set --percent N --mode ask|warn|block`. The README lists what each event cannot do.
 - Reminder after a compaction: a `SessionStart` hook with the matcher `compact` adds a short note to Claude's context (`sessionsteward remind`). `PostCompact` is not used because its output is discarded.
 - Secrets are left out of snapshots: a file that looks like it holds a key, token or password is skipped with a warning that names the file and the kind of secret, never the secret. `undo` and `restore` leave such a file alone. `SESSIONSTEWARD_SECRET_SCAN=0` turns it off.

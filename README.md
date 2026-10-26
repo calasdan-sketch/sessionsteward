@@ -4,6 +4,10 @@
 files — `CLAUDE.md`, `.claude/`, `AGENTS.md`, `~/.claude/CLAUDE.md`, Claude
 Code's auto-memory directory — and `sessionsteward undo` brings them back.
 
+**Limits:** It snapshots the memory files you list and restores them; it does not stop an agent from writing a bad file, and it trusts the snapshot folder it makes (below).
+
+**Trust model.** `restore` and `undo` write only to paths on your *current* watch list: a snapshot whose manifest names anything else (say `~/.ssh/authorized_keys`) is refused before a file is touched, and a manifest whose SHA-256 differs from the one recorded outside the repository when the snapshot was taken is refused too. Someone who can already edit your files, `~/.sessionsteward` and the watch list can still forge a snapshot: this stops a tampered snapshot repository, not a hostile user. **Secret scan:** each file is read whole (in pieces, up to 500 MB) for the shapes of common keys and `password = ...` values; it is a pattern check, not a guarantee.
+
 ```bash
 pip install sessionsteward
 sessionsteward init                      # one-time: snapshots repo + first snapshot
@@ -419,8 +423,9 @@ password in a web address, `password = <long mixed value>`) is **skipped**:
 not copied, named in a `warning:` with the kind of secret (never the secret),
 and left alone by `undo` and `restore`. Remove the secret from the file and
 the next snapshot includes it. This is a pattern check: it does not know
-every token format, it can flag a harmless sample key, and it reads at most
-the first 2 MB of a file. `SESSIONSTEWARD_SECRET_SCAN=0` (or `"secret_scan":
+every token format, it can flag a harmless sample key, and it reads the
+whole file (up to 500 MB). A `password = ...` value of 20 or more letters
+with no digit (a passphrase) is flagged too. `SESSIONSTEWARD_SECRET_SCAN=0` (or `"secret_scan":
 false` in `~/.sessionsteward/config.json`) turns it off. Snapshots made by
 older versions may already contain a secret; `why` hides such lines, and the
 snapshot itself is still in the history until `prune` removes it.
@@ -462,7 +467,25 @@ flags the saved rule is used, and without a saved rule 50 snapshots and 30
 days. Without `--yes` nothing is changed. It **cannot be undone**, and the
 ids of the snapshots after the first one removed change (it rebuilds the
 history from the kept snapshots, same files, messages and dates), so look at
-`sessionsteward log` again afterwards. It never runs by itself.
+`sessionsteward log` again afterwards. `prune` itself never runs by itself, but once a day, after a
+snapshot, an automatic prune keeps the newest 200 snapshots of each project
+and everything from the last 90 days (or your saved rule) and runs `git gc
+--auto`. `SESSIONSTEWARD_AUTO_PRUNE=0` or `"auto_prune": false` in config.json
+turns it off.
+
+## doctor, config show and the hooks
+
+`sessionsteward doctor` checks git, whether each installed hook points at this
+install (and still exists), the lock wait against the hook timeout, and
+`~/.sessionsteward/hook.log`. `sessionsteward config show` prints each setting
+and where it comes from. A hook waits at most 10 s for the lock (Claude Code
+stops a hook after 30 s) and writes a line to hook.log when it gives up. With
+no terminal to ask on (CI, cron, a container) the shrink guard's *default*
+`ask` runs as `warn`; a mode you set yourself is used as set (a `claude -p`
+started from a terminal still has one, and is not detected). After a
+compaction the reminder also lists the instruction lines gone since the
+pre-compaction snapshot. Session transcripts
+(`projects/*/*.jsonl`) are never snapshotted.
 
 ## Claude Code hooks
 

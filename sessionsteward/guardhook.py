@@ -77,6 +77,47 @@ def settings() -> tuple[int, str]:
     return (DEFAULT_PERCENT if percent is None else percent), mode
 
 
+def mode_source() -> str:
+    """Where the mode comes from: "env", "config" or "default"."""
+    if os.environ.get("SESSIONSTEWARD_GUARD_MODE") in MODES:
+        return "env"
+    try:
+        section = core.load_config().get("guard")
+    except core.StewardError:
+        section = None
+    if isinstance(section, dict) and section.get("mode") in MODES:
+        return "config"
+    return "default"
+
+
+def has_terminal() -> bool:
+    """Can a person be asked? True when this process has a controlling
+    terminal (/dev/tty on POSIX, the console on Windows). A hook run by
+    `claude -p` in CI, cron or a container has none. (A `claude -p` started
+    from a terminal still has one: this cannot tell, and says so in the
+    README.)"""
+    try:
+        if os.name == "nt":
+            fd = os.open("CONIN$", os.O_RDWR)
+        else:
+            fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def effective_mode() -> tuple[str, str]:
+    """(mode to use, note). The default "ask" becomes "warn" when nobody can
+    be asked: Claude Code answers an unanswerable "ask" by refusing the
+    edit, which would stop a headless run for a setting you never chose.
+    A mode you set yourself (environment or config) is always used as set."""
+    _percent_, mode = settings()
+    if mode == "ask" and mode_source() == "default" and not has_terminal():
+        return "warn", " (no terminal to ask on, so the default `ask` was run as `warn`)"
+    return mode, ""
+
+
 def _percent(value) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -243,7 +284,8 @@ def before_edit(payload: dict) -> dict | None:
     if len(current) < MIN_BYTES:
         return None
     new = resulting_size(tool, tool_input, current)
-    percent, mode = settings()
+    percent, _configured = settings()
+    mode, mode_note = effective_mode()
     if new is None or new >= len(current) * (1 - percent / 100):
         return None
     name = _name(path, root)
@@ -267,7 +309,8 @@ def before_edit(payload: dict) -> dict | None:
                         f"they agree.")
     if mode == "warn":
         return _pretool(None, "", f"sessionsteward: {what}.{backup} Check "
-                        f"that nothing the user relies on is being lost.")
+                        f"that nothing the user relies on is being lost."
+                        f"{mode_note}")
     return _pretool("ask", f"sessionsteward: {what}.{backup}")
 
 
@@ -303,6 +346,32 @@ def after_change(payload: dict) -> dict | None:
             f"`sessionsteward restore {sha[:7]}` brings the old version back."}
 
 
+def _lost_since_precompact(root: str, limit: int = 5) -> str:
+    """" Lines gone since the pre-compaction snapshot ..." (from `why`), or
+    "" when there is no such snapshot, nothing was lost, or anything fails.
+    Lines that look like secrets are already hidden by why."""
+    try:
+        from . import why as why_mod
+        snaps = core.log(20, project_root=root)
+        pre = next((s for s in snaps
+                    if s["message"].startswith("pre-compaction snapshot")), None)
+        if pre is None or pre["sha"] == snaps[0]["sha"]:
+            return ""
+        result = why_mod.compare(pre["sha"], snaps[0]["sha"], root)
+    except Exception:   # noqa: BLE001 - a note, never a failure
+        return ""
+    lost = [(f["name"], line) for f in result["files"]
+            for line in f["lost"]]
+    if not lost:
+        return ""
+    shown = "; ".join(f"{name}: {why_mod._cut(line)}" for name, line in lost[:limit])
+    more = f" (and {len(lost) - limit} more)" if len(lost) > limit else ""
+    return (f" Since the pre-compaction snapshot {pre['sha'][:7]} these "
+            f"instruction lines are no longer in their files: {shown}{more}. "
+            f"Check they were meant to go (`sessionsteward why "
+            f"{pre['sha'][:7]}`).")
+
+
 def reminder(root: str) -> dict | None:
     """The text for SessionStart(compact): see the module docstring."""
     paths = core.watched_paths(root)
@@ -320,6 +389,7 @@ def reminder(root: str) -> dict | None:
         if snaps:
             text += (f" The latest snapshot is {snaps[0]['sha'][:7]} "
                      f"({snaps[0]['date'][:16]}).")
+        text += _lost_since_precompact(root)
         percent, _mode = settings()
         hits = shrunk_files(root, percent)[:3]
         if hits:

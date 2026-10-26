@@ -130,6 +130,7 @@ def prune(keep: int | None, days: float | None, apply: bool,
     result["bytes_before"] = _size()
     old_head = commits[-1]["sha"]
     parent = None
+    renamed: dict[str, str] = {}
     for c in commits:
         if c["sha"] in gone:
             continue
@@ -144,11 +145,13 @@ def prune(keep: int | None, days: float | None, apply: bool,
             raise core.GitError("git commit-tree failed: " + " ".join(
                 p.stderr.decode("utf-8", "replace").split())[:200])
         parent = p.stdout.decode().strip()
+        renamed[c["sha"]] = parent
     # Only now does the repository change; it is one ref move, checked
     # against the head we read, so a torn run leaves the old history.
     core._git(core.REPO_DIR, "update-ref", "-m", "sessionsteward prune",
               "HEAD", parent, old_head)
     result["applied"] = True
+    core.ledger_remap(renamed)      # the manifests' checksums follow the ids
     try:
         core._git(core.REPO_DIR, "reflog", "expire", "--expire=now", "--all")
         core._git(core.REPO_DIR, "gc", "--prune=now", "--quiet")

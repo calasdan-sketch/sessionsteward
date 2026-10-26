@@ -9,8 +9,9 @@ is) and the command says so.
 
 This is a pattern check, not a guarantee: it knows the shapes of the common
 tokens and password-like assignments. It misses a secret in a shape it does
-not know, and it can flag a harmless sample key. It reads at most the first
-2 MB of a file. `SESSIONSTEWARD_SECRET_SCAN=0`, or `"secret_scan": false` in
+not know, and it can flag a harmless sample key. It reads the whole file, in
+pieces, up to SCAN_LIMIT bytes (the largest a snapshot could hold; past that
+the rest is not read). `SESSIONSTEWARD_SECRET_SCAN=0`, or `"secret_scan": false` in
 ~/.sessionsteward/config.json, turns it off.
 
 Nothing here ever returns, logs or prints the text that matched: only the
@@ -22,8 +23,12 @@ from __future__ import annotations
 import os
 import re
 
-#: Most bytes of one file that are read.
-SCAN_BYTES = 2 * 1024 * 1024
+#: Bytes read per piece, and how many bytes of the previous piece are kept in
+#: front of the next so a secret cut by the boundary is still seen.
+CHUNK = 4 * 1024 * 1024
+OVERLAP = 4096
+#: Most bytes of one file that are read (the default per-snapshot limit).
+SCAN_LIMIT = 500 * 1024 * 1024
 #: Files remembered by (path, size, mtime) so a polling daemon does not read
 #: every file again every few seconds.
 _CACHE_MAX = 4096
@@ -63,6 +68,9 @@ _ASSIGNMENT = re.compile(
     rb"(?i)(?<![A-Za-z0-9])(?:password|passwd|secret|api[_-]?key|"
     rb"access[_-]?token|auth[_-]?token|client[_-]?secret)[\"']?\s*[:=]\s*"
     rb"[\"']?([A-Za-z0-9+/_=.\-]{16,})")
+#: A value that is nothing but letters is a passphrase when it is this long
+#: (correcthorsebatterystaple): no digit, so the rule above misses it.
+_PASSPHRASE_MIN = 20
 _KIND_ASSIGNMENT = "a password or key assignment"
 
 _cache: dict = {}
@@ -81,37 +89,73 @@ def enabled() -> bool:
         return True
 
 
-def scan(data: bytes) -> list[str]:
-    """The kinds of secret `data` looks like it holds (each once, in a fixed
-    order); [] for none."""
-    data = data[:SCAN_BYTES]
+def _kinds(data: bytes) -> list[str]:
     kinds = [name for name, pattern in PATTERNS if pattern.search(data)]
     for m in _ASSIGNMENT.finditer(data):
-        value = m.group(1)
-        if (any(c.isdigit() for c in value.decode("ascii", "replace"))
-                and any(c.isalpha() for c in value.decode("ascii", "replace"))
-                and not value.startswith((b"http", b"/", b"./", b"$", b"{"))):
+        value = m.group(1).decode("ascii", "replace")     # decoded once
+        if value.startswith(("http", "/", "./", "$", "{")):
+            continue
+        has_digit = any(c.isdigit() for c in value)
+        has_alpha = any(c.isalpha() for c in value)
+        if (has_digit and has_alpha) or (
+                len(value) >= _PASSPHRASE_MIN and value.isalpha()
+                and value.isascii()):
             kinds.append(_KIND_ASSIGNMENT)
             break
     return kinds
 
 
+def _merge(into: list[str], more: list[str]) -> None:
+    for k in more:
+        if k not in into:
+            into.append(k)
+
+
+def scan(data: bytes) -> list[str]:
+    """The kinds of secret `data` looks like it holds (each once, in a fixed
+    order); [] for none. All of `data` is looked at."""
+    return _kinds(data)
+
+
+def scan_stream(f, limit: int = SCAN_LIMIT) -> list[str]:
+    """scan() of an open binary file, a piece at a time (with OVERLAP bytes
+    carried over), reading at most `limit` bytes."""
+    kinds: list[str] = []
+    carry = b""
+    read = 0
+    while read < limit:
+        piece = f.read(min(CHUNK, limit - read))
+        if not piece:
+            break
+        read += len(piece)
+        _merge(kinds, _kinds(carry + piece))
+        carry = piece[-OVERLAP:]
+    order = [name for name, _ in PATTERNS] + [_KIND_ASSIGNMENT]
+    return sorted(kinds, key=order.index)
+
+
 def file_kinds(path: str, size: int | None = None) -> list[str]:
-    """scan() of a file, cached by (path, size, modification time). A file
-    that cannot be read has no kinds (the snapshot reports it anyway)."""
+    """scan() of a file, cached by (path, size, modification time) taken from
+    the OPEN handle (fstat), so the file that is read is the file that was
+    measured. A file that cannot be read has no kinds (the snapshot reports
+    it anyway)."""
     try:
-        st = os.stat(path)
+        f = open(path, "rb")
     except OSError:
         return []
-    key = (path, st.st_size, st.st_mtime_ns)
-    hit = _cache.get(key)
-    if hit is not None:
-        return hit
-    try:
-        with open(path, "rb") as f:
-            kinds = scan(f.read(SCAN_BYTES))
-    except OSError:
-        return []
+    with f:
+        try:
+            st = os.fstat(f.fileno())
+        except OSError:
+            return []
+        key = (path, st.st_size, st.st_mtime_ns)
+        hit = _cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            kinds = scan_stream(f)
+        except OSError:
+            return []
     if len(_cache) >= _CACHE_MAX:
         _cache.clear()
     _cache[key] = kinds

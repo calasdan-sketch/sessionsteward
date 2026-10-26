@@ -42,6 +42,12 @@ class Cases(Base):
     def setUp(self):
         super().setUp()
         write(os.path.join(self.proj, "CLAUDE.md"), BIG)
+        # these tests are about the default "ask": pretend a person is there
+        # (a test machine often has no terminal)
+        patcher = mock.patch.object(guard_mod, "has_terminal",
+                                    return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def snap(self, message="s"):
         core_mod.init_repo()
@@ -448,7 +454,9 @@ class TestTheHookAsARealProcess(Cases):
         payload = {"hook_event_name": "PreToolUse", "tool_name": "Write",
                    "cwd": self.proj, "tool_input": {
                        "file_path": self.claude_md(), "content": "x\n"}}
-        p = self.run_child("guard", "hook", input=json.dumps(payload).encode())
+        with mock.patch.dict(os.environ, {"SESSIONSTEWARD_GUARD_MODE": "ask"}):
+            p = self.run_child("guard", "hook",
+                               input=json.dumps(payload).encode())
         self.assertEqual(p.returncode, 0, p.stderr)
         answer = json.loads(p.stdout)["hookSpecificOutput"]
         self.assertEqual(answer["permissionDecision"], "ask")

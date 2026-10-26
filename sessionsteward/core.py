@@ -178,6 +178,17 @@ def _ignored_name(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
 
+def _is_transcript(path: str) -> bool:
+    """A Claude Code session transcript: <...>/projects/<project>/<id>.jsonl.
+    These grow without limit and are never your instructions, so a watched
+    folder that happens to hold them (say `~/.claude/projects`) leaves them
+    out. Only this exact shape: a .jsonl anywhere else is yours."""
+    if not path.endswith(".jsonl"):
+        return False
+    grand = os.path.dirname(os.path.dirname(path))
+    return os.path.basename(grand) == "projects"
+
+
 def _ignored_dir(parent: str, name: str) -> bool:
     """Is the directory parent/name skipped when a watched directory is
     walked: an IGNORE_PATTERNS name, a virtual environment, or build output
@@ -272,13 +283,59 @@ def _private_dir(path: str) -> None:
         pass
 
 
+#: A hook is killed by Claude Code after HOOK_TIMEOUT_SECONDS; waiting for
+#: the lock that long would be killed mid-wait and say nothing. In a hook the
+#: wait is cut to this, and the skip is logged (see log_skip).
+HOOK_LOCK_WAIT = 10.0
+_hook = {"on": False}
+
+
+def hook_mode(on: bool = True) -> None:
+    """Called by the commands Claude Code runs as hooks: shorter lock wait,
+    and a lock that stays busy is written to hook.log."""
+    _hook["on"] = on
+
+
+def hook_log_path() -> str:
+    return os.path.join(os.path.dirname(REPO_DIR) or ".", "hook.log")
+
+
+def log_skip(reason: str) -> None:
+    """One line in ~/.sessionsteward/hook.log (kept under 64 KB) saying a
+    hook did nothing and why. Never raises."""
+    path = hook_log_path()
+    line = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) + " "
+            + " ".join(str(reason).split())[:300] + "\n").encode("utf-8")
+    try:
+        _private_dir(os.path.dirname(path))
+        try:
+            if os.path.getsize(path) > 64 * 1024:
+                with open(path, "rb") as f:
+                    f.seek(-32 * 1024, os.SEEK_END)
+                    tail = f.read()
+                tail = tail[tail.find(b"\n") + 1:]
+                with open(path, "wb") as f:
+                    f.write(tail)
+        except OSError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _lock_timeout() -> float:
     raw = os.environ.get("SESSIONSTEWARD_LOCK_TIMEOUT")
     try:
         value = float(raw) if raw else LOCK_TIMEOUT
     except ValueError:
-        return LOCK_TIMEOUT
-    return value if value == value and value >= 0 else LOCK_TIMEOUT
+        value = LOCK_TIMEOUT
+    if not (value == value and value >= 0):
+        value = LOCK_TIMEOUT
+    return min(value, HOOK_LOCK_WAIT) if _hook["on"] else value
 
 
 def _try_lock(fd: int) -> bool:
@@ -335,6 +392,9 @@ def locked(timeout: float | None = None):
         deadline = time.monotonic() + wait
         while not _try_lock(fd):
             if time.monotonic() >= deadline:
+                if _hook["on"]:
+                    log_skip(f"skipped: another sessionsteward held the lock "
+                             f"for {wait:g}s")
                 raise LockTimeoutError(
                     f"another sessionsteward is still working in {REPO_DIR} "
                     f"(waited {wait:g}s for {path}); try again in a moment")
@@ -1349,8 +1409,10 @@ def _snap(project_root: str, message: str, too_big: list | None = None,
     if withheld:
         document["withheld"] = sorted(set(withheld))
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
-              encoding="utf-8") as f:
+              encoding="utf-8", newline="\n") as f:
         json.dump(document, f, indent=2)
+    with open(os.path.join(REPO_DIR, "manifest.json"), "rb") as f:
+        manifest_digest = _manifest_digest(f.read())
     # The index is rebuilt from the mirror on every snapshot, never updated
     # in place. On a case-insensitive file system (Windows, macOS) git sees
     # a file or directory renamed by case alone (Notes.md -> notes.md) as
@@ -1381,7 +1443,60 @@ def _snap(project_root: str, message: str, too_big: list | None = None,
         if prev == tree:
             return newest[0]["sha"]
     _git(REPO_DIR, "commit", "-q", "-m", message)
-    return _git(REPO_DIR, "rev-parse", "HEAD").strip()
+    new_sha = _git(REPO_DIR, "rev-parse", "HEAD").strip()
+    _ledger_add(new_sha, manifest_digest)
+    _maintain()
+    return new_sha
+
+
+#: The snapshot history is trimmed (and git's garbage collector run) at most
+#: this often, when a snapshot is taken.
+MAINTENANCE_EVERY = 24 * 3600
+#: Without a saved policy (`prune --save`): keep this many snapshots of each
+#: project, and everything younger than this many days.
+AUTO_KEEP = 200
+AUTO_DAYS = 90
+
+
+def _auto_prune_on() -> bool:
+    env = os.environ.get("SESSIONSTEWARD_AUTO_PRUNE", "").strip().lower()
+    if env:
+        return env not in ("0", "off", "false", "no")
+    try:
+        return load_config().get("auto_prune", True) is not False
+    except StewardError:
+        return True
+
+
+def _maintain(now: float | None = None) -> None:
+    """Once a day, after a snapshot: drop snapshots beyond the policy and run
+    `git gc --auto`. Best effort - a failure here never fails the snapshot.
+    Turn it off with SESSIONSTEWARD_AUTO_PRUNE=0 or "auto_prune": false in
+    config.json."""
+    stamp = os.path.join(os.path.dirname(REPO_DIR) or ".", "maintenance.stamp")
+    now = time.time() if now is None else now
+    try:
+        if now - os.path.getmtime(stamp) < MAINTENANCE_EVERY:
+            return
+    except OSError:
+        pass
+    try:
+        with open(stamp, "w", encoding="ascii") as f:
+            f.write(str(int(now)))
+    except OSError:
+        return
+    if not _auto_prune_on():
+        return
+    try:
+        from . import retention     # (retention imports this module)
+        saved = load_config().get("retention")
+        keep, days = (retention.policy(None, None)
+                      if isinstance(saved, dict) and saved
+                      else (AUTO_KEEP, AUTO_DAYS))
+        retention.prune(keep, days, apply=True, now=now)
+        _run_git(REPO_DIR, ("-c", "gc.auto=6700", "gc", "--auto", "--quiet"))
+    except (StewardError, OSError, ValueError):
+        pass
 
 
 def _manifests_at(shas: list[str], strict: bool = False) -> dict[str, dict]:
@@ -1556,6 +1671,126 @@ def _has_live_content(ap: str) -> bool:
     return os.path.lexists(ap)
 
 
+def ledger_path() -> str:
+    return os.path.join(os.path.dirname(REPO_DIR) or ".", "manifests.sha256")
+
+
+def _manifest_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _ledger_add(sha: str, digest: str) -> None:
+    """Remember, outside the snapshots repository, the SHA-256 of the
+    manifest each snapshot was made with. Never raises: a ledger that cannot
+    be written only means that snapshot is checked by git alone."""
+    path = ledger_path()
+    try:
+        _private_dir(os.path.dirname(path))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"{sha} {digest}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def ledger() -> dict[str, str]:
+    """{snapshot id: manifest sha256} as recorded when the snapshots were
+    taken (the last entry for an id wins)."""
+    out: dict[str, str] = {}
+    try:
+        with open(ledger_path(), encoding="ascii", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if (len(parts) == 2 and len(parts[1]) == 64
+                        and re.fullmatch(r"[0-9a-f]{40,64}", parts[0])):
+                    out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def ledger_forget_except(keep: set[str]) -> None:
+    """Rewrite the ledger with only the ids in `keep` (after a prune)."""
+    kept = {k: v for k, v in ledger().items() if k in keep}
+    path = ledger_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.writelines(f"{k} {v}\n" for k, v in kept.items())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def ledger_remap(mapping: dict[str, str]) -> None:
+    """After a prune rebuilt the history: the same manifests under their new
+    ids."""
+    old = ledger()
+    new = {mapping[k]: v for k, v in old.items() if k in mapping}
+    path = ledger_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.writelines(f"{k} {v}\n" for k, v in new.items())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _manifest_checksum_problem(sha: str) -> str | None:
+    """Why the manifest of snapshot `sha` is not the one recorded when it was
+    taken, or None (it is, or nothing was recorded - older snapshots)."""
+    full = _git(REPO_DIR, "rev-parse", "--verify", "--quiet",
+                f"{sha}^{{commit}}").strip()
+    want = ledger().get(full)
+    if want is None:
+        return None
+    p = _run_git(REPO_DIR, ("show", f"{full}:manifest.json"))
+    got = _manifest_digest(p.stdout) if p.returncode == 0 else None
+    if got != want:
+        return ("its manifest does not match the SHA-256 recorded when the "
+                "snapshot was taken (the snapshots repository was changed "
+                "afterwards)")
+    return None
+
+
+def _destination_problems(manifest: dict, root: str | None) -> list[str]:
+    """Every destination the manifest says to write to must be one of the
+    paths on your CURRENT watch list (the watch list is the one place that
+    says where sessionsteward may write), spelled the way it spells them. A
+    manifest that names anything else - ~/.ssh/authorized_keys, say - is
+    refused before a live file is touched."""
+    files = manifest.get("files") or {}
+    if not files:
+        return []
+    allowed = []
+    for entry in watch_list():
+        p = _expand_watch_entry(entry, root or manifest.get("project_root") or "")
+        if p:
+            allowed.append(_fold(os.path.abspath(p)))
+    problems = []
+    for rel, ap in files.items():
+        if not isinstance(ap, str) or not os.path.isabs(ap):
+            problems.append(f"{display_rel(str(rel))} has no absolute "
+                            f"destination")
+            continue
+        here = _fold(os.path.abspath(ap))
+        if not any(here == a or _inside(here, a) for a in allowed):
+            problems.append(f"{ap} is not on your watch list")
+            continue
+        if root:
+            try:
+                back = _rel(os.path.abspath(ap), root)
+            except StewardError:
+                back = None
+            if back is None or back.casefold() != str(rel).casefold():
+                problems.append(f"{ap} does not belong to the name "
+                                f"{display_rel(str(rel))} in the manifest")
+    return problems
+
+
 def _snapshot_problems(sha: str, manifest: dict) -> list[str]:
     """Everything that stops snapshot sha from being restored faithfully:
     watched paths its manifest records that its tree cannot supply (or
@@ -1629,6 +1864,19 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
                 f"refusing cross-project restore: snapshot {sha[:7]} "
                 f"belongs to project {manifest.get('project_root')!r}, "
                 f"not the current project {want!r}")
+    why = _manifest_checksum_problem(sha)
+    if why:
+        raise SnapshotDamagedError(
+            f"refusing to restore snapshot {sha[:7]}: {why}. Nothing was "
+            f"changed")
+    bad = _destination_problems(manifest, project_root
+                                or manifest.get("project_root"))
+    if bad:
+        raise SnapshotDamagedError(
+            f"refusing to restore snapshot {sha[:7]}: it would write outside "
+            f"your watch list - " + "; ".join(bad[:5])
+            + ". Nothing was changed (`sessionsteward watch --add` a path "
+            "to allow it)")
     problems = _snapshot_problems(sha, manifest)
     if problems:
         raise SnapshotDamagedError(
@@ -1790,6 +2038,8 @@ def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
             if _ignored_name(fn):
                 continue
             full = os.path.join(root, fn)
+            if _is_transcript(full):
+                continue
             size = _regular_size(full)
             if size is None:
                 continue

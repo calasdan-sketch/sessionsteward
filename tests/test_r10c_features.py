@@ -294,6 +294,30 @@ class TestDoctorAndConfig(Base):
         self.assertIn("does not exist any more", text)
         self.assertTrue(any(lvl == doctor_mod.FAIL for lvl, _ in findings))
 
+    def test_doctor_reads_quoted_paths_with_spaces(self):
+        self.assertEqual(self.cli("init")[0], 0)
+        settings = os.path.join(self._tmp, "settings.json")
+        hooks = core_mod.merge_hooks({})
+        gone = os.path.join(self._tmp, "gone dir", "sessionsteward.exe")
+        hooks["hooks"]["PreCompact"][0]["hooks"][0]["command"] = (
+            f'"{gone}" precompact')
+        write(settings, json.dumps(hooks))
+        text = doctor_mod.render_doctor(doctor_mod.run_doctor(settings))
+        self.assertIn("does not exist any more", text)
+        self.assertNotIn("hook not installed: PreCompact", text)
+
+    def test_split_command_keeps_windows_backslashes(self):
+        with mock.patch.object(core_mod.os, "name", "nt"):
+            self.assertEqual(
+                core_mod.split_command(r'C:\Py Dir\ss.exe snap -m "a b"')[-3:],
+                ["snap", "-m", "a b"])
+            self.assertEqual(
+                core_mod.split_command(r'"C:\Py Dir\ss.exe" precompact'),
+                [r"C:\Py Dir\ss.exe", "precompact"])
+            self.assertEqual(
+                core_mod.split_command(r"C:\Users\me\ss.exe precompact"),
+                [r"C:\Users\me\ss.exe", "precompact"])
+
     def test_doctor_is_happy_with_the_hooks_it_wrote(self):
         self.assertEqual(self.cli("init")[0], 0)
         settings = os.path.join(self._tmp, "settings.json")

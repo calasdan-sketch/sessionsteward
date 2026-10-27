@@ -9,7 +9,6 @@ setting that matters with where its value comes from.
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 
 from . import core, guardhook
@@ -45,12 +44,12 @@ def _hook_findings(settings_path: str) -> list[tuple[str, str]]:
             out.append((WARN, f"hook not installed: {label}"))
             continue
         try:
-            words = shlex.split(mine[0])
+            words = core.split_command(mine[0])
         except ValueError:
             out.append((FAIL, f"hook {label}: the command cannot be read"))
             continue
         exe = words[0] if words else ""
-        want = shlex.split(cmd)[0]
+        want = core.split_command(cmd)[0]
         found = exe if os.path.isabs(exe) and os.path.exists(exe) else shutil.which(exe)
         if not found:
             out.append((FAIL, f"hook {label} runs {exe}, which does not exist "

@@ -2782,6 +2782,18 @@ for _event, _matcher, _args, _cmd in HOOK_SPECS:
     _HOOK_ARGS.setdefault(_event, _args)
 
 
+def split_command(cmd: str) -> list[str]:
+    """A hook command line as words. POSIX: shlex. Windows: only double
+    quotes group words and a backslash is an ordinary character, so an
+    unquoted C:\\Users\\me\\sessionsteward.exe keeps its path (shlex's
+    POSIX rules would eat the backslashes). Raises ValueError like shlex."""
+    if os.name != "nt":
+        return shlex.split(cmd)
+    words = shlex.split(cmd, posix=False)
+    return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] == '"' else w
+            for w in words]
+
+
 def _is_ours(event: str, cmd, args=None) -> bool:
     """Did sessionsteward write this hook command for this event? Exactly
     that, and nothing that merely mentions it: the bare `sessionsteward ...`
@@ -2795,7 +2807,7 @@ def _is_ours(event: str, cmd, args=None) -> bool:
     if not isinstance(cmd, str):
         return False
     try:
-        words = shlex.split(cmd)
+        words = split_command(cmd)
     except ValueError:
         return False
     args = _HOOK_ARGS[event] if args is None else args

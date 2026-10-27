@@ -547,8 +547,11 @@ class TestSteward(unittest.TestCase):
         self.assertEqual(merged["hooks"]["Stop"][0]["hooks"][0]["command"],
                          "echo stop")
         # our hooks added
+        # (whatever form the hook command has: the installed console script
+        # when there is one next to this Python, `python -I -m ...` if not)
         cmds = json.dumps(merged["hooks"])
-        self.assertIn("-m sessionsteward precompact", cmds)
+        self.assertIn(json.dumps(core_mod.HOOK_PRECOMPACT_CMD)[1:-1], cmds)
+        self.assertIn(json.dumps(core_mod.HOOK_SESSIONSTART_CMD)[1:-1], cmds)
         self.assertIn("session start", cmds)
         # idempotent: second run adds no duplicates
         before = json.dumps(merged["hooks"], sort_keys=True)
@@ -565,19 +568,30 @@ class TestSteward(unittest.TestCase):
         for cmd in (core_mod.HOOK_PRECOMPACT_CMD,
                     core_mod.HOOK_SESSIONSTART_CMD):
             self.assertFalse(cmd.startswith("sessionsteward"), cmd)
-            if os.name == "nt":
-                self.assertTrue(cmd.startswith(f'"{sys.executable}" '), cmd)
-            else:
-                self.assertEqual(shlex.split(cmd)[:3],
-                                 [sys.executable, "-m", "sessionsteward"])
+            first = shlex.split(cmd)[0]
+            self.assertTrue(os.path.isabs(first), cmd)
+            script = core_mod._console_script()
+            if script:   # installed: the console script, never `python -m`
+                self.assertEqual(first, script)
+                self.assertNotIn("-m sessionsteward", cmd)
+            else:        # run from a checkout: isolated mode, no cwd on path
+                self.assertEqual(shlex.split(cmd)[:4],
+                                 [sys.executable, "-I", "-m", "sessionsteward"])
 
     def test_hook_cmd_quotes_paths_with_spaces(self):
         from unittest import mock
         exe = r"C:\Program Files\Python 3\python.exe"
         with mock.patch.object(core_mod.sys, "executable", exe), \
-                mock.patch.object(core_mod.os, "name", "nt"):
+                mock.patch.object(core_mod.os, "name", "nt"), \
+                mock.patch.object(core_mod, "_console_script",
+                                  return_value=None):
             self.assertEqual(core_mod._self_cmd(),
-                             f'"{exe}" -m sessionsteward')
+                             f'"{exe}" -I -m sessionsteward')
+        script = r"C:\Program Files\Python 3\Scripts\sessionsteward.exe"
+        with mock.patch.object(core_mod.os, "name", "nt"), \
+                mock.patch.object(core_mod, "_console_script",
+                                  return_value=script):
+            self.assertEqual(core_mod._self_cmd(), f'"{script}"')
 
     def test_install_hooks_upgrades_legacy_bare_command(self):
         settings_path = os.path.join(self._tmp, "settings.json")
@@ -902,7 +916,7 @@ class TestSteward(unittest.TestCase):
                          ["echo other", core_mod.HOOK_PRECOMPACT_CMD])
         self.assertEqual(
             core_mod._hook_commands(settings["hooks"]["SessionStart"]),
-            [core_mod.HOOK_SESSIONSTART_CMD])
+            [core_mod.HOOK_SESSIONSTART_CMD, core_mod.HOOK_REMIND_CMD])
         before = json.dumps(settings, sort_keys=True)
         core_mod.merge_hooks(settings)
         self.assertEqual(json.dumps(settings, sort_keys=True), before)
@@ -981,11 +995,11 @@ class TestSteward(unittest.TestCase):
         names = core_mod._git(core_mod.REPO_DIR, "ls-tree", "-r",
                               "--name-only", "HEAD").splitlines()
         self.assertIn(f"files/{rel}", names)
-        files_dir = os.path.realpath(os.path.join(core_mod.REPO_DIR, "files"))
+        repo_real = os.path.realpath(core_mod.REPO_DIR)   # macOS /private/var, Windows long names
+        files_dir = os.path.join(repo_real, "files")
         for n in names:
             real = os.path.realpath(os.path.join(core_mod.REPO_DIR, n))
-            self.assertTrue(real.startswith(os.path.join(core_mod.REPO_DIR, "")),
-                            n)
+            self.assertTrue(real.startswith(os.path.join(repo_real, "")), n)
         self.assertFalse(os.path.exists(os.path.join(
             os.path.dirname(tmp), "outside2")))  # no stray mirror either
         # the file is actually protected: clobber -> undo brings it back
@@ -1643,6 +1657,12 @@ class TestSteward(unittest.TestCase):
         commands = os.path.join(self.proj, ".claude", "commands")
         os.symlink(os.path.join(shared, "cmds"), commands)
         settings = os.path.join(self.proj, ".claude", "settings.json")
+        # a link out of the watched folder is only followed on request
+        # (SESSIONSTEWARD_FOLLOW_LINKS, see TestRound9LinksAndHooks)
+        patcher = mock.patch.dict(os.environ,
+                                  {"SESSIONSTEWARD_FOLLOW_LINKS": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self._cli("init")
         a_sha = core_mod.log(1, project_root=self.proj)[0]["sha"]
         # what is behind the links is seen, so the live tree matches

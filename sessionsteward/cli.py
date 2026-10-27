@@ -19,6 +19,9 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
   sessionsteward undo                  # restore the previous snapshot
   sessionsteward restore <sha>         # restore a specific snapshot
   sessionsteward diet                  # what's eating the context window
+  sessionsteward why <sha1> [sha2]     # which instructions were lost between two snapshots
+  sessionsteward guard status|set      # the shrink guard (a hook); see README
+  sessionsteward prune [--yes]         # drop old snapshots by a keep-N / keep-D-days rule
   sessionsteward install-hooks [--write]  # Claude Code hooks JSON
   sessionsteward watch                 # daemon: auto-snapshot on change
 """
@@ -37,6 +40,11 @@ import time
 from . import __version__
 from . import core as core_mod
 from . import diet as diet_mod
+from . import doctor as doctor_mod
+from . import guardhook as guard_mod
+from . import retention as retention_mod
+from . import secretscan as secret_mod
+from . import why as why_mod
 
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
@@ -151,6 +159,18 @@ def _warn_too_big(too_big: list, root: str) -> None:
     if not too_big:
         return
     limit = core_mod.max_file_bytes()
+    # Two reasons share the list: a file over the per-file limit, and a file
+    # that fit the limit but was refused for the per-snapshot cap.
+    capped = [(p, n) for p, n in too_big if limit is None or n <= limit]
+    too_big = [(p, n) for p, n in too_big if (p, n) not in capped]
+    if capped:
+        cap = core_mod.max_snapshot_bytes()
+        _warn(f"{len(capped)} file(s) were not snapshotted: one snapshot "
+              f"holds at most {cap / 1048576:g} MB (first: "
+              f"{_short(capped[0][0], root)}); "
+              f"SESSIONSTEWARD_MAX_SNAPSHOT_MB changes the cap")
+    if not too_big:
+        return
     over = f"over the {limit / 1048576:g} MB limit" if limit else "too big"
     path, size = too_big[0]
     first = f"{_short(path, root)} ({size / 1048576:.1f} MB)"
@@ -160,6 +180,52 @@ def _warn_too_big(too_big: list, root: str) -> None:
         what = (f"{len(too_big)} files {over} were not snapshotted "
                 f"(first: {first})")
     _warn(f"{what}; SESSIONSTEWARD_MAX_FILE_MB changes the limit")
+
+
+def _warn_left_out(skipped: dict, root: str) -> None:
+    """Warn about what a snapshot's walk left behind without being asked to:
+    links that lead outside a watched folder and folders below the depth
+    limit. (A link to a folder already walked, an ignored name and a virtual
+    environment are left out on purpose and are not mentioned.) `undo` and
+    `restore` leave such items where they are, so nothing is lost - they are
+    simply not protected by the snapshot."""
+    outside = skipped.get("outside") or []
+    if outside:
+        first = _short(outside[0], root)
+        _warn(f"{len(outside)} link(s) leading outside the watched folders "
+              f"were not snapshotted (first: {first}); "
+              f"`sessionsteward watch --follow-links` includes them")
+    deep = skipped.get("deep") or []
+    if deep:
+        _warn(f"{len(deep)} folder(s) more than {core_mod.MAX_WALK_DEPTH} "
+              f"levels deep were not snapshotted (first: "
+              f"{_short(deep[0], root)})")
+
+
+def _warn_secrets(skipped: dict, root: str) -> None:
+    """Say which files were left out because they look like they hold a
+    secret. Names the file and the kind of secret, never the secret."""
+    found = skipped.get("secret") or []
+    if not found:
+        return
+    first = found[0]
+    kinds = secret_mod.file_kinds(first)
+    why = f" - it looks like {kinds[0]}" if kinds else ""
+    more = f" (and {len(found) - 1} more)" if len(found) > 1 else ""
+    _warn(f"not snapshotted: {_short(first, root)}{more}{why}. A snapshot "
+          f"is kept for good, so a file that holds a secret is left out and "
+          f"`undo` leaves it alone. Remove the secret from the file to have "
+          f"it snapshotted; SESSIONSTEWARD_SECRET_SCAN=0 turns this check off")
+
+
+def _snap_and_warn(root: str, message: str) -> str:
+    """snap_report() plus every warning about what it left out."""
+    skipped: dict = {}
+    sha, too_big = core_mod.snap_report(root, message, skipped)
+    _warn_too_big(too_big, root)
+    _warn_left_out(skipped, root)
+    _warn_secrets(skipped, root)
+    return sha
 
 
 def _warn_unwatchable(root: str) -> None:
@@ -186,9 +252,8 @@ def cmd_init(args) -> int:
     elif core_mod.watched_paths(args.root):
         # A first snapshot right away, so `undo` has somewhere to go the
         # moment the agent first clobbers a file.
-        sha, too_big = core_mod.snap_report(args.root, "initial snapshot")
+        sha = _snap_and_warn(args.root, "initial snapshot")
         print(f"snapshot {sha[:7]} (initial)")
-        _warn_too_big(too_big, args.root)
     else:
         print(f"nothing to snapshot yet: no watched file exists in "
               f"{os.path.abspath(args.root)}")
@@ -202,6 +267,8 @@ def cmd_watch_edit(args) -> int:
     core_mod.init_repo()
     cfg = core_mod.edit_watch_list(core_mod.load_config(),
                                    add=args.add or [], remove=args.remove or [])
+    if args.follow_links is not None:
+        cfg["follow_links"] = args.follow_links
     core_mod.save_config(cfg)
     print("watching: " + ", ".join(core_mod.watch_list(cfg)))
     return 0
@@ -215,19 +282,16 @@ def _guard(root: str, sha: str) -> None:
 
 
 def cmd_snap(args) -> int:
-    sha, too_big = core_mod.snap_report(args.root,
-                                        args.message or "manual snapshot")
+    sha = _snap_and_warn(args.root, args.message or "manual snapshot")
     print(f"snapshot {sha[:7]}")
-    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
 
 def cmd_precompact(args) -> int:
-    sha, too_big = core_mod.snap_report(args.root, "pre-compaction snapshot")
+    sha = _snap_and_warn(args.root, "pre-compaction snapshot")
     print(f"pre-compaction snapshot {sha[:7]} — "
           f"`sessionsteward diff {sha[:7]}` after, to see what was dropped")
-    _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
 
@@ -321,6 +385,8 @@ def _restore_errors(fn):
 
 
 def cmd_undo(args) -> int:
+    if args.steps < 1:
+        raise core_mod.StewardError("--steps must be 1 or more")
     if not core_mod.repo_ready():
         print("no snapshots yet")
         return 2
@@ -345,7 +411,7 @@ def cmd_undo(args) -> int:
         print(f"already at the oldest snapshot ({snaps[pos]['sha'][:7]}) — "
               f"nothing to undo to; `sessionsteward restore <sha>` goes forward")
         return 0
-    steps = max(1, args.steps)
+    steps = args.steps
     last = len(snaps) - 1
     target_i = min(pos + steps, last)
     target = snaps[target_i]
@@ -383,14 +449,131 @@ def cmd_restore(args) -> int:
     return 1 if core_mod.skipped(restored) else 0
 
 
+def cmd_why(args) -> int:
+    if not core_mod.repo_ready():
+        print("no snapshots yet - run `sessionsteward init` first",
+              file=sys.stderr)
+        return 2
+    sha2 = args.sha2
+    if sha2 is None:
+        snaps = core_mod.log(1, project_root=args.root)
+        if not snaps:
+            print(f"no snapshots yet for {os.path.abspath(args.root)}",
+                  file=sys.stderr)
+            return 2
+        sha2 = snaps[0]["sha"]
+    result = why_mod.compare(args.sha1, sha2, args.root)
+    sys.stdout.write(why_mod.render(result, args.lines))
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    findings = doctor_mod.run_doctor(CLAUDE_SETTINGS)
+    sys.stdout.write(doctor_mod.render_doctor(findings))
+    return 1 if any(lvl == doctor_mod.FAIL for lvl, _ in findings) else 0
+
+
+def cmd_config(args) -> int:
+    sys.stdout.write(doctor_mod.render_config(doctor_mod.config_show()))
+    return 0
+
+
+def cmd_remind(args) -> int:
+    return guard_mod.run_remind(args.root)
+
+
+def cmd_guard(args) -> int:
+    if args.guard_cmd == "hook":
+        return guard_mod.run_hook()
+    if args.guard_cmd == "set":
+        if args.percent is None and args.mode is None:
+            print("error: give --percent and/or --mode", file=sys.stderr)
+            return 2
+        guard_mod.set_settings(args.percent, args.mode)
+    percent, mode = guard_mod.settings()
+    wording = {"ask": "asks you first",
+               "warn": "lets the edit through and tells Claude",
+               "block": "refuses the edit"}[mode]
+    print(f"shrink guard: an edit that would make a watched file more than "
+          f"{percent}% smaller {wording} (mode: {mode})")
+    print("  before an edit (Claude's Write/Edit tools): acts, as above")
+    print("  after any change to CLAUDE.md / CLAUDE.local.md / AGENTS.md: "
+          "warns you only")
+    print("  files under 200 bytes are ignored")
+    print(f"  installed in {CLAUDE_SETTINGS}: "
+          f"{'yes' if _guard_installed() else 'no - run `sessionsteward install-hooks --write`'}")
+    return 0
+
+
+def _guard_installed() -> bool:
+    try:
+        with open(CLAUDE_SETTINGS, "rb") as f:
+            settings = core_mod._parse_settings(f.read(), CLAUDE_SETTINGS)
+    except (OSError, core_mod.SettingsError):
+        return False
+    entries = (settings.get("hooks") or {}).get("PreToolUse")
+    return isinstance(entries, list) and any(
+        core_mod._is_ours("PreToolUse", cmd, ["guard", "hook"])
+        for cmd in core_mod._hook_commands(entries))
+
+
+def cmd_prune(args) -> int:
+    keep, days = retention_mod.policy(args.keep, args.days)
+    if args.save:
+        retention_mod.save_policy(keep, days)
+    rule = " and ".join(part for part in (
+        f"the newest {keep} per project" if keep is not None else "",
+        f"everything from the last {days:g} days" if days is not None else ""
+    ) if part)
+    result = retention_mod.prune(keep, days, apply=args.yes)
+    print(f"keeping {rule} (the newest snapshot of each project always stays)")
+    if result["remove"] == 0:
+        print(f"nothing to remove: {result['total']} snapshot(s) in all")
+        return 0
+    if not result["applied"]:
+        print(f"would remove {result['remove']} of {result['total']} "
+              f"snapshot(s) and keep {result['kept']}. Nothing was changed; "
+              f"add --yes to do it. It cannot be undone, and the ids of "
+              f"the snapshots after the first one removed change.")
+        return 0
+    print(f"removed {result['remove']} of {result['total']} snapshot(s); "
+          f"{result['kept']} kept. Snapshot ids after the first one "
+          f"removed changed: see `sessionsteward log`.")
+    if result["bytes_before"] and result["bytes_after"] is not None:
+        print(f"the snapshots repo went from "
+              f"{result['bytes_before'] / 1048576:.1f} MB to "
+              f"{result['bytes_after'] / 1048576:.1f} MB")
+    for w in result["warnings"]:
+        _warn(w)
+    return 0
+
+
 def cmd_diet(args) -> int:
     print(diet_mod.render(diet_mod.analyze(args.root)))
     return 0
 
 
+def _warn_fallback_hooks() -> None:
+    """The hooks cannot name an installed command: say what that means."""
+    if core_mod._console_script() is not None:
+        return
+    _warn("the `sessionsteward` command was not found next to this Python "
+          "(you are running from a source checkout?), so the hooks run "
+          "`python -I -m sessionsteward`. The -I stops a cloned project "
+          "from running its own code at session start, but it also means "
+          "the hooks work only while sessionsteward is installed for that "
+          "Python (`pip install .` or `pip install -e .` in the checkout); "
+          "otherwise they fail silently at every session start")
+
+
 def cmd_install_hooks(args) -> int:
+    _warn_fallback_hooks()
     wiring = (f"Wiring: PreCompact -> `{core_mod.HOOK_PRECOMPACT_CMD}`, "
-              f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`.")
+              f"SessionStart -> `{core_mod.HOOK_SESSIONSTART_CMD}`, "
+              f"SessionStart (after a compaction) -> "
+              f"`{core_mod.HOOK_REMIND_CMD}`, "
+              f"PreToolUse (Write, Edit) and FileChanged (CLAUDE.md, "
+              f"CLAUDE.local.md, AGENTS.md) -> `{core_mod.HOOK_GUARD_CMD}`.")
     if args.write:
         try:
             path = core_mod.write_hooks_file(CLAUDE_SETTINGS)
@@ -428,10 +611,8 @@ def cmd_watch(args) -> int:
             try:
                 now = core_mod.file_mtimes(core_mod.watched_paths(args.root))
                 if now != mtimes:
-                    sha, too_big = core_mod.snap_report(
-                        args.root, "auto: files changed")
+                    sha = _snap_and_warn(args.root, "auto: files changed")
                     print(f"change detected -> snapshot {sha[:7]}")
-                    _warn_too_big(too_big, args.root)
                     _guard(args.root, sha)
                     mtimes = now
                 last_problem = None
@@ -489,6 +670,12 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--remove", nargs="+", default=None,
                     help="Drop paths from the watch list, defaults "
                          "included (then exit).")
+    wa.add_argument("--follow-links", dest="follow_links", default=None,
+                    action="store_true",
+                    help="Let snapshots follow links that lead outside a "
+                         "watched folder (off by default; then exit).")
+    wa.add_argument("--no-follow-links", dest="follow_links",
+                    action="store_false", help="Turn --follow-links off.")
     wa.add_argument("--interval", default="5", metavar="SECONDS",
                     help=f"Poll seconds for the daemon, from {MIN_INTERVAL:g} "
                          f"to {MAX_INTERVAL:g} (default 5).")
@@ -508,6 +695,44 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("restore", help="Restore a specific snapshot.")
     rs.add_argument("sha")
     sub.add_parser("diet", help="Context-diet report.")
+    wy = sub.add_parser("why", help="Which instruction lines went missing "
+                                    "between two snapshots.")
+    wy.add_argument("sha1", help="The older snapshot (see `log`).")
+    wy.add_argument("sha2", nargs="?", default=None,
+                    help="The newer one (default: this project's newest).")
+    wy.add_argument("--lines", type=int, default=why_mod.DEFAULT_LINES,
+                    help="Lines to show per file (default %(default)s).")
+    sub.add_parser("remind", help="(a hook) the note Claude gets after a "
+                                  "compaction.")
+    sub.add_parser("doctor", help="Check git, the hooks (do they point at "
+                                  "this install?) and the lock wait.")
+    cf = sub.add_parser("config", help="Show the settings in force and where "
+                                       "each comes from.")
+    csub = cf.add_subparsers(dest="config_cmd", required=True)
+    csub.add_parser("show", help="Print every setting and its source.")
+    gd = sub.add_parser("guard", help="The shrink guard: status, settings, "
+                                      "and the hook command.")
+    gsub = gd.add_subparsers(dest="guard_cmd", required=True)
+    gsub.add_parser("status", help="Show the settings.")
+    gs = gsub.add_parser("set", help="Change the settings.")
+    gs.add_argument("--percent", type=int, default=None,
+                    help="Act when an edit would make a file more than this "
+                         "percent smaller, 1-99 (default 50).")
+    gs.add_argument("--mode", choices=guard_mod.MODES, default=None,
+                    help="ask (default): you decide; warn: tell Claude and "
+                         "let it through; block: refuse the edit.")
+    gsub.add_parser("hook", help="(a hook) reads a Claude Code event on "
+                                 "stdin.")
+    pr = sub.add_parser("prune", help="Remove old snapshots (reports first; "
+                                      "--yes does it).")
+    pr.add_argument("--keep", type=int, default=None, metavar="N",
+                    help="Keep the newest N snapshots of each project.")
+    pr.add_argument("--days", type=float, default=None, metavar="D",
+                    help="Also keep every snapshot from the last D days.")
+    pr.add_argument("--save", action="store_true",
+                    help="Remember this rule as the default.")
+    pr.add_argument("--yes", action="store_true",
+                    help="Do it. Without this nothing is changed.")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")
     ih.add_argument("--write", action="store_true",
@@ -535,20 +760,30 @@ def main(argv=None) -> int:
         "init": cmd_init, "watch": cmd_watch, "snap": cmd_snap,
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
-        "install-hooks": cmd_install_hooks,
+        "install-hooks": cmd_install_hooks, "why": cmd_why,
+        "remind": cmd_remind, "guard": cmd_guard, "prune": cmd_prune,
+        "doctor": cmd_doctor, "config": cmd_config,
     }
-    if args.cmd == "watch" and (args.add or args.remove):
+    # The commands Claude Code runs as hooks wait less for the lock and log
+    # what they skipped (see core.hook_mode).
+    core_mod.hook_mode(
+        args.cmd in ("precompact", "remind")
+        or (args.cmd == "guard" and args.guard_cmd == "hook")
+        or (args.cmd == "snap" and args.message == "session start"))
+    editing = args.cmd == "watch" and bool(
+        args.add or args.remove or args.follow_links is not None)
+    if editing:
         cmds["watch"] = cmd_watch_edit
     # Commands that write take the lock for their whole run, so e.g. `undo`
     # cannot interleave with a hook's snap. `watch` (the daemon) locks only
     # around each snapshot it takes; read-only commands never wait.
-    writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
-        or (args.cmd == "watch" and (args.add or args.remove))
+    writes = args.cmd in ("init", "snap", "precompact", "undo", "restore",
+                          "prune") or editing
     try:
         if args.cmd == "watch":
             args.interval = _poll_interval(args.interval)
         if args.cmd in ("init", "snap", "precompact", "undo", "restore") \
-                or (args.cmd == "watch" and not (args.add or args.remove)):
+                or (args.cmd == "watch" and not editing):
             _warn_unwatchable(args.root)   # not for the edit that fixes it
         with core_mod.locked() if writes else contextlib.nullcontext():
             rc = cmds[args.cmd](args)

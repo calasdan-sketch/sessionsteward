@@ -448,7 +448,7 @@ class TestWhatTheMirrorTakes(Base):
             self.assertIn(f"files/.claude/skills/x/{name}", listed(), name)
         self.assert_matches_the_live_files()
 
-    def test_restore_leaves_a_virtual_environment_in_the_trash_copy(self):
+    def test_restore_leaves_a_virtual_environment_where_it_is(self):
         write(os.path.join(self.dot, ".venv", "keep.txt"), "mine\n")
         write(os.path.join(self.dot, "rules.md"), "v1\n")
         self.init()
@@ -458,13 +458,15 @@ class TestWhatTheMirrorTakes(Base):
         code, out, err = self.cli("undo")
         self.assertEqual(code, 0, out + err)
         self.assertEqual(slurp(os.path.join(self.dot, "rules.md")), b"v2\n")
-        # not part of a snapshot, so not carried over by the restore ...
-        self.assertFalse(os.path.exists(os.path.join(self.dot, ".venv")))
-        # ... but never lost: it is in the trash copy the restore names
+        # not part of a snapshot, so the restore does not take it away: it
+        # is put back into the restored folder (and says so)
+        self.assertEqual(slurp(os.path.join(self.dot, ".venv", "keep.txt")),
+                         b"mine\n")
+        self.assertIn("kept", out)
         trashed = [e for e in self.trash_entries() if e.startswith(".claude.")]
         self.assertEqual(len(trashed), 1, self.trash_entries())
-        self.assertTrue(os.path.isfile(os.path.join(
-            core_mod.TRASH_DIR, trashed[0], ".venv", "keep.txt")))
+        self.assertFalse(os.path.exists(os.path.join(
+            core_mod.TRASH_DIR, trashed[0], ".venv")))
 
     # -- the size limit ----------------------------------------------------
     def limit(self, megabytes):
@@ -611,6 +613,7 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
 
     PRE = core_mod.HOOK_PRECOMPACT_CMD
     START = core_mod.HOOK_SESSIONSTART_CMD
+    REMIND = core_mod.HOOK_REMIND_CMD     # added after START (0.2.0)
 
     def setUp(self):
         super().setUp()
@@ -640,7 +643,6 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
         "sessionsteward snap -m checkpoint",
         "sessionsteward log",
         "python -m sessionsteward diff",
-        "/usr/local/bin/sessionsteward precompact",
         'python -u -m sessionsteward snap -m "session start"',
         "echo sessionsteward precompact",
         "sessionsteward precompact --root /somewhere/else",
@@ -656,14 +658,15 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
         self.assertEqual(self.commands("PreCompact"),
                          [*self.THEIRS, self.PRE])
         self.assertEqual(self.commands("SessionStart"),
-                         [*self.THEIRS, self.START])
+                         [*self.THEIRS, self.START, self.REMIND])
         self.assertEqual(slurp(self.settings + ".bak"), original)
 
     def test_the_panels_hook_survives_and_a_second_write_changes_nothing(self):
         pull = "cd ~/code/sessionsteward && git pull"
         self.put({"SessionStart": [self.entry(pull)]})
         self.assertEqual(self.cli("install-hooks", "--write")[0], 0)
-        self.assertEqual(self.commands("SessionStart"), [pull, self.START])
+        self.assertEqual(self.commands("SessionStart"),
+                         [pull, self.START, self.REMIND])
         first = slurp(self.settings)
         self.assertEqual(self.cli("install-hooks", "--write")[0], 0)
         self.assertEqual(slurp(self.settings), first)
@@ -690,7 +693,7 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
             self.put({"SessionStart": [self.entry(stale, "echo after")]})
             self.assertEqual(self.cli("install-hooks", "--write")[0], 0)
             self.assertEqual(self.commands("SessionStart"),
-                             [self.START, "echo after"], stale)
+                             [self.START, "echo after", self.REMIND], stale)
 
     def test_duplicates_of_our_own_collapse_but_the_users_stay(self):
         self.put({"PreCompact": [
@@ -708,7 +711,8 @@ class TestInstallHooksOnlyRewritesItsOwn(Base):
                                             '"session start"')]})
         self.assertEqual(self.cli("install-hooks", "--write")[0], 0)
         self.assertEqual(self.commands("SessionStart"),
-                         ["sessionsteward precompact", self.START])
+                         ["sessionsteward precompact", self.START,
+                          self.REMIND])
         self.assertEqual(self.commands("PreCompact"),
                          ['sessionsteward snap -m "session start"', self.PRE])
 

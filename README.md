@@ -4,8 +4,12 @@
 files — `CLAUDE.md`, `.claude/`, `AGENTS.md`, `~/.claude/CLAUDE.md`, Claude
 Code's auto-memory directory — and `sessionsteward undo` brings them back.
 
+**Limits:** It snapshots the memory files you list and restores them; it does not stop an agent from writing a bad file, and it trusts the snapshot folder it makes (below).
+
+**Trust model.** `restore` and `undo` write only to paths on your *current* watch list: a snapshot whose manifest names anything else (say `~/.ssh/authorized_keys`) is refused before a file is touched, and a manifest whose SHA-256 differs from the one recorded outside the repository when the snapshot was taken is refused too. Someone who can already edit your files, `~/.sessionsteward` and the watch list can still forge a snapshot: this stops a tampered snapshot repository, not a hostile user. **Secret scan:** each file is read whole (in pieces, up to 500 MB) for the shapes of common keys and `password = ...` values; it is a pattern check, not a guarantee.
+
 ```bash
-pip install git+https://github.com/calasdan-sketch/sessionsteward
+pip install sessionsteward
 sessionsteward init                      # one-time: snapshots repo + first snapshot
 sessionsteward install-hooks --write     # snapshot on every Claude Code session start and before compaction
 sessionsteward undo                      # the agent clobbered CLAUDE.md? back it comes
@@ -33,13 +37,17 @@ undone 1 step(s) -> a3f9c21  before letting the agent edit memory
 ## Install
 
 Zero dependencies — Python 3.10+ stdlib only (uses your system's git; if
-git is missing every command says so in one line and exits 2).
+git is missing every command says so in one line and exits 2). Any git that
+can `init`, `add` and `commit` works; `diff` uses `--end-of-options`, which
+git added in 2.24 (2019), and with an older git it leaves that option out
+(snapshot ids are checked first, so nothing that looks like an option reaches
+git either way).
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/sessionsteward
+pip install sessionsteward
 ```
 
-Or from a clone (console script `sessionsteward`):
+Or from source (console script `sessionsteward`):
 
 ```bash
 git clone https://github.com/calasdan-sketch/sessionsteward && cd sessionsteward
@@ -47,8 +55,13 @@ pip install .
 ```
 
 pip installs the `sessionsteward` command on every OS. Install it before
-running `install-hooks`: the hooks call the installed package with the
-interpreter you ran it from.
+running `install-hooks`: the hooks call that command by its absolute path.
+
+**Upgrading from 0.1.3 or earlier: re-run `sessionsteward install-hooks
+--write` once.** Older versions wrote the hooks as `python -m
+sessionsteward ...`, which runs code from the project folder if a cloned
+repository carries its own `sessionsteward/` package (see
+[SECURITY.md](SECURITY.md)). Re-running rewrites them in place.
 
 ## Usage
 
@@ -66,6 +79,9 @@ sessionsteward diff                        # what changed (e.g. what compaction 
 sessionsteward undo                        # step back one snapshot (--steps N for more)
 sessionsteward restore <sha>               # restore a specific snapshot
 sessionsteward diet                        # what's eating the context window
+sessionsteward why <older> [newer]         # which instruction lines went missing between two snapshots
+sessionsteward guard status | set          # the shrink guard (see "Shrink guard in the session")
+sessionsteward prune [--keep N] [--days D] [--yes]  # drop old snapshots (reports first)
 sessionsteward install-hooks               # print Claude Code hooks JSON
 sessionsteward install-hooks --write       # merge it into ~/.claude/settings.json
 ```
@@ -159,11 +175,14 @@ it, and a restore keeps a link that is in place but never recreates one that
 is gone); not special files (a named pipe, socket or device is skipped,
 never read - reading a pipe would block for ever - and a restore never
 writes onto one: `skipped ... is not a regular file`); not the ignored names
-or oversized files listed below (so a skill you cloned into `.claude/skills/`
-loses its `.git` when `.claude` is restored). A restore
-replaces a watched directory as a whole, so whatever a snapshot cannot hold
-is *not* carried over - it stays in the trash copy the restore names
-(`moved .claude -> ~/.sessionsteward/trash/...`). A change that only toggles
+or oversized files listed below. A restore replaces a watched directory as
+a whole (the old one goes to the trash), but what a snapshot never holds is
+**put back where it was**: ignored names (a skill's own `.git`, `node_modules`,
+a virtual environment, logs), links that lead outside the folder, folders
+deeper than 64 levels, files over the size limit or the snapshot cap, and
+anything that is not a regular file. Each is reported as `kept …: not part of
+any snapshot (left in place)`. Only files a snapshot could have held, and
+that were not in it, go to the trash. A change that only toggles
 a file's executable bit or narrows its permissions is recorded by `snap`, but
 `undo` does not revert it.
 `log`/`diff`/`undo`/`restore` are scoped to the current project (`--root`,
@@ -303,9 +322,9 @@ changes the limit (`0` lifts it, and so does a number too big to count, such
 as `1e305`). A file you name yourself with `watch --add` is never left out
 for its size, even where it lies inside a watched folder, and is never
 reported as left out; naming the folder does not name the files in it. None
-of the things left out comes back with a restore of the directory they sit
-in: when a restore replaces that directory, the old one - with them in it -
-goes to the trash (`moved .claude -> ...`).
+of the things left out is in a snapshot, so `undo` cannot bring one back if
+you delete it yourself; a restore does not take them away (it leaves them in
+place, see above).
 
 **Who can read the store.** `~/.sessionsteward` (the snapshots repo, the
 trash, the config and the lock) is created readable by you alone (mode 0700),
@@ -334,6 +353,140 @@ PowerShell 5's `>` writes, gets a hint to save it as UTF-8; a UTF-8
 byte-order mark is fine); or a `watch` or `unwatch` that is not a list of
 paths (`"watch": "NOTES.md"` is refused, not read letter by letter).
 
+## Links
+
+Symlinks inside a watched folder are followed (the snapshot holds the content
+behind them) with these limits: a link to the watched folder itself, to one
+of its parents, or to a folder already walked is skipped (no loops); walks go
+at most 64 folders deep; one snapshot holds at most 500 MB of walked files
+(`SESSIONSTEWARD_MAX_SNAPSHOT_MB`, 0 = no cap); and **a link that leads
+outside the watched folder is skipped**, so
+`.claude/out -> ~/.ssh` cannot copy your keys into the snapshot store. Windows
+junctions count as links (also on a Python that cannot tell them from folders:
+anything that resolves outside the watched folder is treated alike). Loops and
+repeats are skipped quietly; the other three - a file or folder over the
+limits, a link leading outside, a folder deeper than 64 levels - are named in
+one `warning:` line each on stderr, with a count and the first one, every time
+a snapshot leaves something out. A restore leaves those items where they are.
+If you
+keep real content behind such links (a dotfiles repo), opt in with
+`sessionsteward watch --follow-links` (or `SESSIONSTEWARD_FOLLOW_LINKS=1`);
+`--no-follow-links` turns it off. A watched entry that is itself a link is
+always followed.
+
+## Shrink guard in the session (hooks)
+
+The guard above compares one snapshot with the next. Since 0.2.0 there is
+also a guard that looks at the live file while you work. `install-hooks
+--write` adds it; what each Claude Code event can and cannot do is below
+(checked against https://code.claude.com/docs/en/hooks in October 2026;
+none of it has been run by a real Claude Code, only with the documented
+input shapes):
+
+| Event | When | What it does | What it cannot do |
+| --- | --- | --- | --- |
+| `PreToolUse` on `Write`, `Edit`, `MultiEdit` | before Claude's edit | works out the file's size afterwards; if a watched file would get more than N% smaller (default 50) it first takes a snapshot, then **asks you** (default), **tells Claude and lets it through** (`warn`) or **refuses** (`block`) | does not see `sed -i`, `> file`, an editor or any other program; in a non-interactive `claude -p` run nobody can answer "ask", and Claude Code then refuses the edit |
+| `FileChanged` on `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` | after any change to those files in the project folder, whoever made it | compares the file with the biggest it was in your last 5 snapshots and shows **you** a warning with the snapshot to restore | cannot block or undo; the text is for you, not sent to Claude; does not watch `.claude/`, other watched paths or files outside the project folder |
+| `SessionStart` on `compact` | when a session continues after a compaction | adds a short note to Claude's context (see below) | cannot change what the compaction kept |
+
+```bash
+sessionsteward guard status                     # what is set, and whether the hook is installed
+sessionsteward guard set --percent 30           # act at a 30% cut instead of 50%
+sessionsteward guard set --mode block           # ask (default) | warn | block
+```
+
+`SESSIONSTEWARD_SHRINK_PERCENT` and `SESSIONSTEWARD_GUARD_MODE` override the
+saved settings. A file under 200 bytes is never reported. If a cut is
+approved, the snapshot taken just before it is what `sessionsteward restore
+<id>` brings back (in `block` mode nothing changes, so no snapshot is taken).
+The guard cannot stop a run of small cuts that each stay under the limit.
+If sessionsteward itself fails inside the hook, the hook answers nothing and
+the edit goes ahead: a broken guard must not break your session.
+
+**The reminder after a compaction.** `SessionStart` with the matcher
+`compact` runs `sessionsteward remind`, whose output is added to Claude's
+context (the docs say so for SessionStart; for `PostCompact` they say its
+output is discarded, which is why that event is not used). The note says the
+conversation was just compacted, that the instruction files are read from
+disk rather than from the summary, names the latest snapshot, and lists any
+file that is much smaller than in your recent snapshots. Whether Claude acts
+on it is up to Claude, and that it arrives has not been confirmed on a real
+run.
+
+## Secrets are left out of snapshots
+
+A snapshot lives in a git history for as long as you keep it, so a key pasted
+into a notes file would stay there after you delete it from the file. Since
+0.2.0 a file that looks like it holds a secret (an AWS key id, a private key,
+a GitHub, Slack, Stripe, Google or `sk-` API key, a JSON web token, a
+password in a web address, `password = <long mixed value>`) is **skipped**:
+not copied, named in a `warning:` with the kind of secret (never the secret),
+and left alone by `undo` and `restore`. Remove the secret from the file and
+the next snapshot includes it. This is a pattern check: it does not know
+every token format, it can flag a harmless sample key, and it reads the
+whole file (up to 500 MB). A `password = ...` value of 20 or more letters
+with no digit (a passphrase) is flagged too. `SESSIONSTEWARD_SECRET_SCAN=0` (or `"secret_scan":
+false` in `~/.sessionsteward/config.json`) turns it off. Snapshots made by
+older versions may already contain a secret; `why` hides such lines, and the
+snapshot itself is still in the history until `prune` removes it.
+
+## What did I lose? (`why`)
+
+```
+$ sessionsteward why a3f9c21 b81d0e4
+Between a3f9c21 and b81d0e4: 1 file(s) differ, 24 line(s) are no longer anywhere in their file.
+
+CLAUDE.md  changed  (2,412 -> 18 bytes)
+  24 line(s) lost, 1 added
+  - - Always run the tests before committing.
+  ...
+  + - Remember to be careful.
+```
+
+`diff` shows git's view of every changed line. `why` answers the question
+after a bad compaction: which lines are **no longer anywhere in their file**
+(a paragraph that was only moved is not a loss), which are new, per file.
+Lines are compared by text, ignoring leading and trailing spaces and blank
+lines; a line that looks like it holds a secret is shown as a placeholder.
+The second snapshot defaults to this project's newest; `--lines N` limits how
+many lines are listed per file (30 by default).
+
+## Keeping the history small (`prune`)
+
+Snapshots are never removed on their own. `prune` removes old ones:
+
+```bash
+sessionsteward prune --keep 20 --days 14   # report what it would remove
+sessionsteward prune --keep 20 --days 14 --yes
+sessionsteward prune --keep 20 --save      # remember the rule as the default
+```
+
+A snapshot stays if it is among the newest N of its project **or** younger
+than D days; the newest snapshot of every project always stays. Without
+flags the saved rule is used, and without a saved rule 50 snapshots and 30
+days. Without `--yes` nothing is changed. It **cannot be undone**, and the
+ids of the snapshots after the first one removed change (it rebuilds the
+history from the kept snapshots, same files, messages and dates), so look at
+`sessionsteward log` again afterwards. `prune` itself never runs by itself, but once a day, after a
+snapshot, an automatic prune keeps the newest 200 snapshots of each project
+and everything from the last 90 days (or your saved rule) and runs `git gc
+--auto`. `SESSIONSTEWARD_AUTO_PRUNE=0` or `"auto_prune": false` in config.json
+turns it off.
+
+## doctor, config show and the hooks
+
+`sessionsteward doctor` checks git, whether each installed hook points at this
+install (and still exists), the lock wait against the hook timeout, and
+`~/.sessionsteward/hook.log`. `sessionsteward config show` prints each setting
+and where it comes from. A hook waits at most 10 s for the lock (Claude Code
+stops a hook after 30 s) and writes a line to hook.log when it gives up. With
+no terminal to ask on (CI, cron, a container) the shrink guard's *default*
+`ask` runs as `warn`; a mode you set yourself is used as set (a `claude -p`
+started from a terminal still has one, and is not detected). After a
+compaction the reminder also lists the instruction lines gone since the
+pre-compaction snapshot. Session transcripts
+(`projects/*/*.jsonl`) are never snapshotted.
+
 ## Claude Code hooks
 
 ```bash
@@ -343,21 +496,34 @@ sessionsteward install-hooks --write   # merge into ~/.claude/settings.json
 
 This wires **PreCompact** → `sessionsteward precompact` (snapshot before
 compaction — run `sessionsteward diff` afterwards to see exactly what the
-compaction dropped) and **SessionStart** → `sessionsteward snap -m "session
-start"`. Point the steward at the same files your agent's memory hook
+compaction dropped), **SessionStart** → `sessionsteward snap -m "session
+start"`, **SessionStart (after a compaction)** → `sessionsteward remind`,
+and the shrink guard: **PreToolUse** (`Write|Edit|MultiEdit`) and
+**FileChanged** (`CLAUDE.md|CLAUDE.local.md|AGENTS.md`) →
+`sessionsteward guard hook`. Run `install-hooks --write` again after
+upgrading to 0.2.0 to add the new ones (the old two are rewritten in place). Point the steward at the same files your agent's memory hook
 writes (`watch --add`) and those get the same protection.
 
-The hooks call the Python that ran `install-hooks` by absolute path
-(`"/path/to/python" -m sessionsteward ...`), because hook shells don't load
-your aliases or activate your venv — re-run `install-hooks --write` if you
-move or recreate that environment: the hooks sessionsteward wrote itself
-(`sessionsteward precompact` and `sessionsteward snap -m "session start"` as
-the first version wrote them, or the same commands run as
-`<python> -m sessionsteward ...` by any interpreter) are rewritten in place,
-never duplicated. Every other hook is yours and is left alone, even one that
+The hooks call the installed `sessionsteward` command by absolute path
+(for example `/path/to/venv/bin/sessionsteward snap ...`), because hook
+shells don't load your aliases or activate your venv. They deliberately do
+not use `python -m sessionsteward`: Claude Code runs hooks with the project
+as the working directory, and `python -m` would then import a
+`sessionsteward/` package from the project, so a repository you just cloned
+could run code at session start. (Only when the command cannot be found - a run from a source checkout -
+does `install-hooks` fall back to `python -I -m sessionsteward`, where `-I`
+keeps the project folder off the import path. It says so in a `warning:`
+line, because that form works only while sessionsteward is installed for that
+Python, so run `pip install .` in the checkout first; otherwise the hooks
+fail silently.) Each hook has a 30 second timeout.
+Re-run `install-hooks --write` if you move or recreate that environment, and
+once after upgrading from 0.1.3 or earlier: the hooks sessionsteward wrote
+itself (`sessionsteward precompact` and `sessionsteward snap -m "session
+start"` as the first version wrote them, the same commands run as
+`<python> -m sessionsteward ...`, or run by the console script's path) are
+rewritten in place, never duplicated. Every other hook is yours and is left alone, even one that
 mentions sessionsteward (`cd ~/code/sessionsteward && git pull`,
-`sessionsteward snap -m checkpoint`); `--write` adds the two hooks beside
-it. It merges into the existing settings file without clobbering your other
+`sessionsteward snap -m checkpoint`); `--write` adds ours beside it. It merges into the existing settings file without clobbering your other
 hooks, and re-running is a no-op (nothing is written when the hooks are
 already there).
 
@@ -404,10 +570,21 @@ Counted: what Claude Code loads at session start — `CLAUDE.md`,
 and the auto-memory index `MEMORY.md`. Settings, commands/skills, hooks,
 transcripts and logs are watched for undo but never counted.
 
+## Limits (v0.2.0)
+
+- Linux only so far for what was run: Python 3.10, 3.13 and 3.14 and the
+  unpacked source archive. Not run on Windows or macOS, and not with a real
+  Claude Code: the hook input and output shapes come from the documentation.
+- The shrink guard sees edits made with Claude's file tools before they
+  happen and any change to three file names afterwards; it does not see
+  changes made by other programs to other files until the next snapshot.
+- Secrets: a pattern check, not a guarantee (see above).
+- `prune` is permanent and renumbers snapshots.
+
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # temp dirs only; never touches ~/.sessionsteward
+python -m unittest discover -s tests   # temp dirs only; never touches ~/.sessionsteward
 ```
 
 Every test runs against a temporary HOME; the newer ones also give git a

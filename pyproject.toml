@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sessionsteward"
-version = "0.1.3"
+version = "0.2.0"
 description = "Undo for CLAUDE.md: git-snapshots your agent memory files and brings them back."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "Calas Automations Inc." }]
 keywords = ["claude-code", "agents", "CLAUDE.md", "snapshots", "undo", "compaction"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -21,12 +22,19 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
     "Topic :: Software Development :: Version Control :: Git",
     "Topic :: Utilities",
 ]
 
 [project.urls]
 Homepage = "https://github.com/calasdan-sketch/sessionsteward"
+Issues = "https://github.com/calasdan-sketch/sessionsteward/issues"
+Changelog = "https://github.com/calasdan-sketch/sessionsteward/blob/main/CHANGELOG.md"
 
 [project.scripts]
 sessionsteward = "sessionsteward.cli:main"
+
+[tool.setuptools.package-data]
+sessionsteward = ["py.typed"]

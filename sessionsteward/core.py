@@ -34,11 +34,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 import threading
 import time
 import unicodedata
+
+from . import secretscan
 
 try:  # POSIX: advisory whole-file locks
     import fcntl
@@ -175,6 +178,17 @@ def _ignored_name(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
 
+def _is_transcript(path: str) -> bool:
+    """A Claude Code session transcript: <...>/projects/<project>/<id>.jsonl.
+    These grow without limit and are never your instructions, so a watched
+    folder that happens to hold them (say `~/.claude/projects`) leaves them
+    out. Only this exact shape: a .jsonl anywhere else is yours."""
+    if not path.endswith(".jsonl"):
+        return False
+    grand = os.path.dirname(os.path.dirname(path))
+    return os.path.basename(grand) == "projects"
+
+
 def _ignored_dir(parent: str, name: str) -> bool:
     """Is the directory parent/name skipped when a watched directory is
     walked: an IGNORE_PATTERNS name, a virtual environment, or build output
@@ -269,13 +283,59 @@ def _private_dir(path: str) -> None:
         pass
 
 
+#: A hook is killed by Claude Code after HOOK_TIMEOUT_SECONDS; waiting for
+#: the lock that long would be killed mid-wait and say nothing. In a hook the
+#: wait is cut to this, and the skip is logged (see log_skip).
+HOOK_LOCK_WAIT = 10.0
+_hook = {"on": False}
+
+
+def hook_mode(on: bool = True) -> None:
+    """Called by the commands Claude Code runs as hooks: shorter lock wait,
+    and a lock that stays busy is written to hook.log."""
+    _hook["on"] = on
+
+
+def hook_log_path() -> str:
+    return os.path.join(os.path.dirname(REPO_DIR) or ".", "hook.log")
+
+
+def log_skip(reason: str) -> None:
+    """One line in ~/.sessionsteward/hook.log (kept under 64 KB) saying a
+    hook did nothing and why. Never raises."""
+    path = hook_log_path()
+    line = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) + " "
+            + " ".join(str(reason).split())[:300] + "\n").encode("utf-8")
+    try:
+        _private_dir(os.path.dirname(path))
+        try:
+            if os.path.getsize(path) > 64 * 1024:
+                with open(path, "rb") as f:
+                    f.seek(-32 * 1024, os.SEEK_END)
+                    tail = f.read()
+                tail = tail[tail.find(b"\n") + 1:]
+                with open(path, "wb") as f:
+                    f.write(tail)
+        except OSError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _lock_timeout() -> float:
     raw = os.environ.get("SESSIONSTEWARD_LOCK_TIMEOUT")
     try:
         value = float(raw) if raw else LOCK_TIMEOUT
     except ValueError:
-        return LOCK_TIMEOUT
-    return value if value == value and value >= 0 else LOCK_TIMEOUT
+        value = LOCK_TIMEOUT
+    if not (value == value and value >= 0):
+        value = LOCK_TIMEOUT
+    return min(value, HOOK_LOCK_WAIT) if _hook["on"] else value
 
 
 def _try_lock(fd: int) -> bool:
@@ -332,6 +392,9 @@ def locked(timeout: float | None = None):
         deadline = time.monotonic() + wait
         while not _try_lock(fd):
             if time.monotonic() >= deadline:
+                if _hook["on"]:
+                    log_skip(f"skipped: another sessionsteward held the lock "
+                             f"for {wait:g}s")
                 raise LockTimeoutError(
                     f"another sessionsteward is still working in {REPO_DIR} "
                     f"(waited {wait:g}s for {path}); try again in a moment")
@@ -358,7 +421,8 @@ def _is_snapshots_repo(repo: str) -> bool:
     return os.path.abspath(repo) == os.path.abspath(REPO_DIR)
 
 
-def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProcess:
+def _run_git(repo: str, args: tuple[str, ...], env_extra: dict | None = None,
+             **kw) -> subprocess.CompletedProcess:
     """subprocess.run of a git command with the failure modes that are not
     git's own exit code turned into GitError: no git on PATH, a hang.
 
@@ -371,8 +435,10 @@ def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProc
     if _is_snapshots_repo(repo):
         where += ["--git-dir", os.path.join(repo, ".git"), "--work-tree", repo]
     try:
+        env = _git_env()
+        env.update(env_extra or {})
         return subprocess.run([*GIT, *where, *args], capture_output=True,
-                              timeout=60, env=_git_env(), **kw)
+                              timeout=60, env=env, **kw)
     except FileNotFoundError:
         raise GitError("git not found — sessionsteward needs git on PATH "
                        "(https://git-scm.com/downloads)") from None
@@ -553,6 +619,41 @@ def _project_slug(path: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
+def _spellings(candidates: list[str], root: str) -> list[str]:
+    """Every way the same folders may be written. git reports a real path
+    (macOS /private/var/..., Windows long names) while Claude Code named the
+    project folder after the path it was started in (/var/..., 8.3 short
+    names). For each candidate: its real path, and the parent of `root` (as
+    given) that is the same folder."""
+    out: list[str] = []
+
+    def add(p):
+        if p and p not in out:
+            out.append(p)
+    parents = []
+    cur = root
+    while True:
+        parents.append(cur)
+        up = os.path.dirname(cur)
+        if up == cur:
+            break
+        cur = up
+    for cand in candidates:
+        add(cand)
+        try:
+            real = os.path.realpath(cand)
+        except (OSError, ValueError):
+            continue
+        add(real)
+        for anc in parents:
+            try:
+                if os.path.realpath(anc) == real:
+                    add(anc)
+            except (OSError, ValueError):
+                pass
+    return out
+
+
 def auto_memory_dir(project_root: str) -> str | None:
     """Claude Code's auto-memory directory for project_root
     (~/.claude/projects/<project>/memory), or None when none exists.
@@ -581,6 +682,7 @@ def auto_memory_dir(project_root: str) -> str | None:
     except GitError:
         pass
     candidates.append(root)
+    candidates = _spellings(candidates, root)
     projects = os.path.join(_claude_config_dir(), "projects")
     for cand in candidates:
         d = os.path.join(projects, _project_slug(cand), "memory")
@@ -1193,16 +1295,21 @@ def snap(project_root: str, message: str) -> str:
         return _snap(project_root, message)
 
 
-def snap_report(project_root: str, message: str) -> tuple[str, list]:
+def snap_report(project_root: str, message: str,
+                skipped: dict | None = None) -> tuple[str, list]:
     """snap(), plus the files it left out for being over max_file_bytes():
-    (sha, [(path, size), ...]) in path order."""
+    (sha, [(path, size), ...]) in path order. ``skipped``, when given, is
+    filled with the other things a snapshot silently leaves behind:
+    skipped["outside"] = links that lead outside a watched folder,
+    skipped["deep"] = folders below MAX_WALK_DEPTH levels (sorted paths)."""
     too_big: list = []
     with locked():
-        sha = _snap(project_root, message, too_big)
+        sha = _snap(project_root, message, too_big, skipped)
     return sha, sorted(set(too_big))
 
 
-def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
+def _snap(project_root: str, message: str, too_big: list | None = None,
+          skipped: dict | None = None) -> str:
     if not repo_ready():
         init_repo()
     _ensure_attributes()
@@ -1215,6 +1322,20 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
         rel = _rel(ap, project_root)
         plan.append((rel, ap, _mirror_path(files_dir, rel)))
         entry_of.setdefault(rel, entry)
+    # A watched FILE that looks like it holds a secret is not copied (a
+    # file inside a watched folder is left out by the walk below). It is
+    # also not in the manifest, so a restore never touches it.
+    if skipped is None:
+        skipped = {}
+    withheld: list[str] = []
+    if secretscan.enabled():
+        for item in list(plan):
+            rel, ap, _dest = item
+            if os.path.isfile(ap) and secretscan.file_kinds(ap):
+                plan.remove(item)
+                entry_of.pop(rel, None)
+                skipped.setdefault("secret", []).append(ap)
+                withheld.append(rel)
     manifest = {rel: ap for rel, ap, _ in plan}
     # What each watched path IS: a path with a manifest entry but nothing in
     # the tree is an empty directory only if it was one. (A file that git
@@ -1228,6 +1349,7 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     if os.path.lexists(files_dir):
         _remove_mirror(files_dir)
     os.makedirs(files_dir)
+    budget = _Budget()
     for rel, ap, dest in plan:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         # _copy_content, not copy2/copytree's default: the mirror must never
@@ -1235,14 +1357,34 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
         # (dirs_exist_ok / the lexists check: a watched file inside a
         # watched dir, e.g. ~/.claude/CLAUDE.md with ~ as the project.)
         if os.path.isdir(ap):
-            # Symlinks are followed: the mirror holds the content behind
-            # them (restore() never writes it back through the link).
-            shutil.copytree(ap, dest, copy_function=_copy_content,
-                            ignore=functools.partial(_not_copied,
-                                                     too_big=too_big),
-                            dirs_exist_ok=True)
+            # Symlinks are followed within the limits of _walk_files: the
+            # mirror holds the content behind them (restore() never writes
+            # it back through the link), but never loops, never leaves the
+            # watched folder unless asked, and stops at the snapshot cap.
+            def mirror_dir(d, ap=ap, dest=dest):
+                t = os.path.join(dest, os.path.relpath(d, ap))
+                os.makedirs(t, exist_ok=True)
+                if os.name != "nt":   # keep the folder's mode (owner can write)
+                    try:
+                        os.chmod(t, (os.stat(d).st_mode & 0o777) | 0o700)
+                    except OSError:
+                        pass
+            for full, _size in _walk_files(ap, budget, too_big, mirror_dir,
+                                           skipped):
+                _copy_content(full, os.path.join(dest, os.path.relpath(full, ap)))
         elif not os.path.lexists(dest):
             _copy_content(ap, dest)
+    for key in list(skipped):
+        skipped[key] = sorted(set(skipped[key]))
+    for rel, ap, _dest in plan:
+        if kinds[rel] == "dir":
+            prefix = ap.rstrip(os.sep) + os.sep
+            withheld.extend(
+                rel + "/" + path[len(prefix):].replace(os.sep, "/")
+                for path in skipped.get("secret", [])
+                if path.startswith(prefix))
+    if too_big is not None:
+        too_big.extend(budget.skipped)   # refused for the snapshot cap
     if too_big:
         # The limit is for what a walk of a watched folder finds. A file the
         # watch list names itself was copied above whatever its size - it is
@@ -1264,9 +1406,13 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     if modes:
         document["modes"] = modes
     document["watch"] = watch_list()
+    if withheld:
+        document["withheld"] = sorted(set(withheld))
     with open(os.path.join(REPO_DIR, "manifest.json"), "w",
-              encoding="utf-8") as f:
+              encoding="utf-8", newline="\n") as f:
         json.dump(document, f, indent=2)
+    with open(os.path.join(REPO_DIR, "manifest.json"), "rb") as f:
+        manifest_digest = _manifest_digest(f.read())
     # The index is rebuilt from the mirror on every snapshot, never updated
     # in place. On a case-insensitive file system (Windows, macOS) git sees
     # a file or directory renamed by case alone (Notes.md -> notes.md) as
@@ -1297,7 +1443,60 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
         if prev == tree:
             return newest[0]["sha"]
     _git(REPO_DIR, "commit", "-q", "-m", message)
-    return _git(REPO_DIR, "rev-parse", "HEAD").strip()
+    new_sha = _git(REPO_DIR, "rev-parse", "HEAD").strip()
+    _ledger_add(new_sha, manifest_digest)
+    _maintain()
+    return new_sha
+
+
+#: The snapshot history is trimmed (and git's garbage collector run) at most
+#: this often, when a snapshot is taken.
+MAINTENANCE_EVERY = 24 * 3600
+#: Without a saved policy (`prune --save`): keep this many snapshots of each
+#: project, and everything younger than this many days.
+AUTO_KEEP = 200
+AUTO_DAYS = 90
+
+
+def _auto_prune_on() -> bool:
+    env = os.environ.get("SESSIONSTEWARD_AUTO_PRUNE", "").strip().lower()
+    if env:
+        return env not in ("0", "off", "false", "no")
+    try:
+        return load_config().get("auto_prune", True) is not False
+    except StewardError:
+        return True
+
+
+def _maintain(now: float | None = None) -> None:
+    """Once a day, after a snapshot: drop snapshots beyond the policy and run
+    `git gc --auto`. Best effort - a failure here never fails the snapshot.
+    Turn it off with SESSIONSTEWARD_AUTO_PRUNE=0 or "auto_prune": false in
+    config.json."""
+    stamp = os.path.join(os.path.dirname(REPO_DIR) or ".", "maintenance.stamp")
+    now = time.time() if now is None else now
+    try:
+        if now - os.path.getmtime(stamp) < MAINTENANCE_EVERY:
+            return
+    except OSError:
+        pass
+    try:
+        with open(stamp, "w", encoding="ascii") as f:
+            f.write(str(int(now)))
+    except OSError:
+        return
+    if not _auto_prune_on():
+        return
+    try:
+        from . import retention     # (retention imports this module)
+        saved = load_config().get("retention")
+        keep, days = (retention.policy(None, None)
+                      if isinstance(saved, dict) and saved
+                      else (AUTO_KEEP, AUTO_DAYS))
+        retention.prune(keep, days, apply=True, now=now)
+        _run_git(REPO_DIR, ("-c", "gc.auto=6700", "gc", "--auto", "--quiet"))
+    except (StewardError, OSError, ValueError):
+        pass
 
 
 def _manifests_at(shas: list[str], strict: bool = False) -> dict[str, dict]:
@@ -1472,6 +1671,126 @@ def _has_live_content(ap: str) -> bool:
     return os.path.lexists(ap)
 
 
+def ledger_path() -> str:
+    return os.path.join(os.path.dirname(REPO_DIR) or ".", "manifests.sha256")
+
+
+def _manifest_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _ledger_add(sha: str, digest: str) -> None:
+    """Remember, outside the snapshots repository, the SHA-256 of the
+    manifest each snapshot was made with. Never raises: a ledger that cannot
+    be written only means that snapshot is checked by git alone."""
+    path = ledger_path()
+    try:
+        _private_dir(os.path.dirname(path))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"{sha} {digest}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def ledger() -> dict[str, str]:
+    """{snapshot id: manifest sha256} as recorded when the snapshots were
+    taken (the last entry for an id wins)."""
+    out: dict[str, str] = {}
+    try:
+        with open(ledger_path(), encoding="ascii", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if (len(parts) == 2 and len(parts[1]) == 64
+                        and re.fullmatch(r"[0-9a-f]{40,64}", parts[0])):
+                    out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def ledger_forget_except(keep: set[str]) -> None:
+    """Rewrite the ledger with only the ids in `keep` (after a prune)."""
+    kept = {k: v for k, v in ledger().items() if k in keep}
+    path = ledger_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.writelines(f"{k} {v}\n" for k, v in kept.items())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def ledger_remap(mapping: dict[str, str]) -> None:
+    """After a prune rebuilt the history: the same manifests under their new
+    ids."""
+    old = ledger()
+    new = {mapping[k]: v for k, v in old.items() if k in mapping}
+    path = ledger_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.writelines(f"{k} {v}\n" for k, v in new.items())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _manifest_checksum_problem(sha: str) -> str | None:
+    """Why the manifest of snapshot `sha` is not the one recorded when it was
+    taken, or None (it is, or nothing was recorded - older snapshots)."""
+    full = _git(REPO_DIR, "rev-parse", "--verify", "--quiet",
+                f"{sha}^{{commit}}").strip()
+    want = ledger().get(full)
+    if want is None:
+        return None
+    p = _run_git(REPO_DIR, ("show", f"{full}:manifest.json"))
+    got = _manifest_digest(p.stdout) if p.returncode == 0 else None
+    if got != want:
+        return ("its manifest does not match the SHA-256 recorded when the "
+                "snapshot was taken (the snapshots repository was changed "
+                "afterwards)")
+    return None
+
+
+def _destination_problems(manifest: dict, root: str | None) -> list[str]:
+    """Every destination the manifest says to write to must be one of the
+    paths on your CURRENT watch list (the watch list is the one place that
+    says where sessionsteward may write), spelled the way it spells them. A
+    manifest that names anything else - ~/.ssh/authorized_keys, say - is
+    refused before a live file is touched."""
+    files = manifest.get("files") or {}
+    if not files:
+        return []
+    allowed = []
+    for entry in watch_list():
+        p = _expand_watch_entry(entry, root or manifest.get("project_root") or "")
+        if p:
+            allowed.append(_fold(os.path.abspath(p)))
+    problems = []
+    for rel, ap in files.items():
+        if not isinstance(ap, str) or not os.path.isabs(ap):
+            problems.append(f"{display_rel(str(rel))} has no absolute "
+                            f"destination")
+            continue
+        here = _fold(os.path.abspath(ap))
+        if not any(here == a or _inside(here, a) for a in allowed):
+            problems.append(f"{ap} is not on your watch list")
+            continue
+        if root:
+            try:
+                back = _rel(os.path.abspath(ap), root)
+            except StewardError:
+                back = None
+            if back is None or back.casefold() != str(rel).casefold():
+                problems.append(f"{ap} does not belong to the name "
+                                f"{display_rel(str(rel))} in the manifest")
+    return problems
+
+
 def _snapshot_problems(sha: str, manifest: dict) -> list[str]:
     """Everything that stops snapshot sha from being restored faithfully:
     watched paths its manifest records that its tree cannot supply (or
@@ -1527,6 +1846,7 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
     cannot supply everything its manifest records (checked BEFORE any live
     file is touched).
     """
+    _require_snapshot_id(sha)
     manifest = _manifest_at(sha, strict=True)
     if not manifest:
         p = _run_git(REPO_DIR, ("rev-parse", "--verify", "--quiet",
@@ -1544,6 +1864,19 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
                 f"refusing cross-project restore: snapshot {sha[:7]} "
                 f"belongs to project {manifest.get('project_root')!r}, "
                 f"not the current project {want!r}")
+    why = _manifest_checksum_problem(sha)
+    if why:
+        raise SnapshotDamagedError(
+            f"refusing to restore snapshot {sha[:7]}: {why}. Nothing was "
+            f"changed")
+    bad = _destination_problems(manifest, project_root
+                                or manifest.get("project_root"))
+    if bad:
+        raise SnapshotDamagedError(
+            f"refusing to restore snapshot {sha[:7]}: it would write outside "
+            f"your watch list - " + "; ".join(bad[:5])
+            + ". Nothing was changed (`sessionsteward watch --add` a path "
+            "to allow it)")
     problems = _snapshot_problems(sha, manifest)
     if problems:
         raise SnapshotDamagedError(
@@ -1551,6 +1884,182 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
             + "; ".join(problems) + ". Nothing was changed; "
             "`sessionsteward log` lists the other snapshots")
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Walking a watched directory (the one walk behind both snapshots and the
+# live-tree comparison)
+# ---------------------------------------------------------------------------
+
+MAX_SNAPSHOT_MB = 500.0   # total bytes one snapshot may walk (see _Budget)
+MAX_WALK_DEPTH = 64       # directory levels below a watched directory
+
+
+def max_snapshot_bytes() -> int | None:
+    """The most one snapshot copies from watched directories, or None for no
+    cap. SESSIONSTEWARD_MAX_SNAPSHOT_MB overrides MAX_SNAPSHOT_MB; 0 = no cap;
+    anything that is not a finite number >= 0 is ignored."""
+    raw = os.environ.get("SESSIONSTEWARD_MAX_SNAPSHOT_MB")
+    try:
+        megabytes = float(raw) if raw and raw.strip() else MAX_SNAPSHOT_MB
+    except ValueError:
+        megabytes = MAX_SNAPSHOT_MB
+    if not 0 <= megabytes < float("inf"):
+        megabytes = MAX_SNAPSHOT_MB
+    try:
+        return int(megabytes * 1024 * 1024) or None
+    except OverflowError:
+        return None
+
+
+def follow_external_links() -> bool:
+    """May a walk of a watched directory follow a link that leads OUTSIDE it
+    (`.claude/out -> ~/.ssh`)? No, unless you opted in: the target's files
+    would be copied into the snapshot store. SESSIONSTEWARD_FOLLOW_LINKS=1 or
+    `sessionsteward watch --follow-links` (config key follow_links) opts in.
+    A watched entry that is itself a link is always followed."""
+    env = os.environ.get("SESSIONSTEWARD_FOLLOW_LINKS", "").strip().lower()
+    if env:
+        return env in ("1", "true", "yes", "on")
+    try:
+        return load_config().get("follow_links") is True
+    except StewardError:
+        return False
+
+
+class _Budget:
+    """Total bytes one snapshot (or one comparison) may walk. Shared by every
+    watched directory, so a tree that is huge only through links cannot fill
+    the disk; files refused for it are listed in `skipped`."""
+
+    def __init__(self):
+        self.cap = max_snapshot_bytes()
+        self.used = 0
+        self.skipped: list = []
+
+    def take(self, path: str, size: int) -> bool:
+        if self.cap is not None and self.used + size > self.cap:
+            self.skipped.append((path, size))
+            return False
+        self.used += size
+        return True
+
+
+def _inside(real: str, root_real: str) -> bool:
+    a, b = os.path.normcase(real), os.path.normcase(root_real)
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
+
+
+_REPARSE_MOUNT_POINT = 0xA0000003   # IO_REPARSE_TAG_MOUNT_POINT: a junction
+
+
+def _is_link(path: str) -> bool:
+    """A symlink, or - on Windows - an NTFS junction. os.path.islink() is
+    False for a junction (Python before 3.12 cannot see one, and 3.12+ has
+    os.path.isjunction for it), but os.walk follows it like a link, so a
+    junction pointing at a parent loops and one pointing at ~/.ssh copies
+    your keys: both must be treated exactly like symlinks."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        try:
+            if isjunction(path):
+                return True
+        except (OSError, ValueError):
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+        except (OSError, ValueError):
+            return False
+        return getattr(st, "st_reparse_tag", 0) == _REPARSE_MOUNT_POINT
+    return False
+
+
+def _walk_files(ap: str, budget: "_Budget", too_big: list | None = None,
+                on_dir=None, skips: dict | None = None):
+    """Yield (path, size) for every regular file under the watched directory
+    ap, in a stable order: IGNORE_PATTERNS, virtual environments and build
+    output left out; pipes, sockets, devices and dangling links skipped;
+    files over max_file_bytes() left out (appended to too_big when given).
+
+    Links to directories are walked (the mirror holds the content behind
+    them) unless they would loop or repeat: a link to the watched
+    directory, one of its ancestors or a directory already visited is never
+    followed, depth is capped, and so is the total (budget). A link
+    (file or directory) that leads outside ap is skipped unless
+    follow_external_links(). on_dir(path), when given, is called for ap and
+    each directory walked, before its files. skips, when given, collects
+    what the walk left out that the user did not ask to have left out:
+    skips["outside"] (links leading outside ap), skips["deep"]
+    (directories below MAX_WALK_DEPTH levels) and skips["secret"] (files
+    that look like they hold a secret: see secretscan), as lists of paths."""
+    limit = max_file_bytes()
+    root_real = os.path.realpath(ap)
+    outside_ok = follow_external_links()
+    seen = {os.path.normcase(root_real)}
+    scan_secrets = secretscan.enabled()
+    base_depth = ap.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(ap, followlinks=True):
+        if on_dir is not None:
+            on_dir(root)
+        keep = []
+        too_deep = root.rstrip(os.sep).count(os.sep) - base_depth >= MAX_WALK_DEPTH
+        for d in sorted(dirs):
+            if _ignored_dir(root, d):
+                continue
+            full = os.path.join(root, d)
+            if too_deep:
+                if skips is not None:
+                    skips.setdefault("deep", []).append(full)
+                continue
+            if _is_link(full):
+                real = os.path.realpath(full)
+                nreal = os.path.normcase(real)
+                if nreal in seen or _inside(root_real, real):
+                    continue   # a loop, or somewhere already walked
+                if not outside_ok and not _inside(real, root_real):
+                    if skips is not None:
+                        skips.setdefault("outside", []).append(full)
+                    continue
+                seen.add(nreal)
+            elif not outside_ok and not _inside(os.path.realpath(full),
+                                                root_real):
+                # Not a link as far as this Python can tell, yet it resolves
+                # to somewhere else (a junction an old Python cannot see, or
+                # a path with a link above it): the same rule applies.
+                if skips is not None:
+                    skips.setdefault("outside", []).append(full)
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for fn in sorted(files):
+            if _ignored_name(fn):
+                continue
+            full = os.path.join(root, fn)
+            if _is_transcript(full):
+                continue
+            size = _regular_size(full)
+            if size is None:
+                continue
+            if (not outside_ok and _is_link(full)
+                    and not _inside(os.path.realpath(full), root_real)):
+                if skips is not None:
+                    skips.setdefault("outside", []).append(full)
+                continue
+            if limit is not None and size > limit:
+                if too_big is not None:
+                    too_big.append((full, size))
+                continue
+            if scan_secrets and secretscan.file_kinds(full, size):
+                # Left out like an ignored file (and listed, so the command
+                # can say so): the text that matched is never kept.
+                if skips is not None:
+                    skips.setdefault("secret", []).append(full)
+                continue
+            if budget.take(full, size):
+                yield full, size
 
 
 # ---------------------------------------------------------------------------
@@ -1566,31 +2075,17 @@ def iter_files(paths: list[str]):
     went into it.
 
     Symlinked directories are walked (snap() mirrors what is behind
-    them, so the live tree must see the same files), with a guard so a
-    link back into the tree cannot loop forever."""
-    limit = max_file_bytes()
+    them, so the live tree must see the same files) under the rules of
+    _walk_files: no loops or repeats, bounded depth and total size, and no
+    links that lead outside the watched directory unless you opted in."""
+    budget = _Budget()
     for ap in paths:
         if os.path.isdir(ap):
-            seen: set[str] = set()
-            for root, dirs, files in os.walk(ap, followlinks=True):
-                seen.add(os.path.realpath(root))
-                keep = []
-                for d in sorted(dirs):
-                    if _ignored_dir(root, d):
-                        continue
-                    full = os.path.join(root, d)
-                    if os.path.islink(full) and os.path.realpath(full) in seen:
-                        continue
-                    keep.append(d)
-                dirs[:] = keep
-                for fn in sorted(files):
-                    full = os.path.join(root, fn)
-                    # regular files only (links followed): the callers
-                    # open() what they get, and a named pipe never returns
-                    size = None if _ignored_name(fn) else _regular_size(full)
-                    if size is not None and (limit is None or size <= limit):
-                        yield full
+            for full, _size in _walk_files(ap, budget):
+                yield full
         elif os.path.isfile(ap):
+            if secretscan.enabled() and secretscan.file_kinds(ap):
+                continue   # not in the snapshot, so not in the comparison
             yield ap
 
 
@@ -1744,7 +2239,7 @@ def _links_under(top: str) -> list[str]:
         dirs[:] = [d for d in dirs if not _ignored_dir(root, d)]
         for name in dirs + files:
             full = os.path.join(root, name)
-            if os.path.islink(full):
+            if _is_link(full):
                 links.append(full)
     return links
 
@@ -1780,6 +2275,63 @@ def _keep_links(live_dir: str, staged: str, snap_tree: dict[str, str],
             lines.append(f"skipped {link}: is a symlink (left untouched, "
                          f"never written through)")
     return lines
+
+
+def unsnapshotted_items(top: str) -> list[str]:
+    """The top-most paths under the watched folder ``top`` that a snapshot
+    walk leaves out: ignored names (logs, caches, a virtual environment, a
+    skill's own .git), links leading outside, folders below the depth limit,
+    files over the size limit or the snapshot cap, and anything that is not a
+    regular file. A snapshot cannot hold them, so a restore must not take
+    them away. Links that ARE walked are not listed (_keep_links looks after
+    those)."""
+    walked: set[str] = set()
+    yielded: set[str] = set()
+    for full, _size in _walk_files(top, _Budget(), None,
+                                   lambda d: walked.add(os.path.normcase(d))):
+        yielded.add(os.path.normcase(full))
+    out: list[str] = []
+
+    def visit(directory: str) -> None:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            return
+        for name in names:
+            full = os.path.join(directory, name)
+            key = os.path.normcase(full)
+            if os.path.isdir(full):
+                if key in walked:
+                    if not os.path.islink(full):
+                        visit(full)
+                else:
+                    out.append(full)
+            elif key not in yielded:
+                out.append(full)
+    visit(top)
+    return out
+
+
+def _carry_unsnapshotted(live: str, trashed: str, items: list[str],
+                         report: list[str]) -> None:
+    """Put the items (listed under the live folder ``live``, whose old copy
+    is now ``trashed``) back where they were, unless the restored folder
+    already has something by that name. Reports each one."""
+    for item in items:
+        sub = os.path.relpath(item, live)
+        src = os.path.join(trashed, sub)
+        dst = os.path.join(live, sub)
+        if not os.path.lexists(src) or os.path.lexists(dst):
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+        except OSError as e:
+            report.append(f"skipped {dst}: could not put it back from the "
+                          f"trash ({e.strerror or e}); it is in {src}")
+            continue
+        report.append(f"kept {dst}: not part of any snapshot (left in "
+                      f"place)")
 
 
 def _unpack_folder(archive: bytes, prefix: str, dest: str) -> None:
@@ -1957,8 +2509,10 @@ def _restore(sha: str, trash_dir: str | None,
                     restored.append(f"skipped {ap}: could not extract "
                                     f"snapshot {sha[:7]}{why} (left untouched)")
                     continue
-                if os.path.isdir(ap):
+                leftovers = []
+                if os.path.isdir(ap) and not os.path.islink(ap):
                     restored.extend(_keep_links(ap, src, snap_tree, algo))
+                    leftovers = unsnapshotted_items(ap)
                 _apply_modes(src, ap, rel, bits)
                 # Never delete: the existing path (dir, file or link) goes
                 # to trash before the snapshot copy takes its place - and
@@ -1966,6 +2520,8 @@ def _restore(sha: str, trash_dir: str | None,
                 if _swap_via_trash(ap, lambda: os.rename(src, ap), trash_dir,
                                    restored, trashed):
                     restored.append(ap)
+                    if leftovers and trashed:
+                        _carry_unsnapshotted(ap, trashed[-1], leftovers, restored)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         elif data is not None:
@@ -2047,9 +2603,13 @@ def shrunk(sha: str, prev_sha: str, ratio: float = 0.5) -> list[tuple]:
     that disappeared altogether (new_size None).
     Returns [(rel, old_size, new_size)]."""
     old, new = _sizes(prev_sha), _sizes(sha)
+    # A file left out of the newer snapshot on purpose (it looked like it
+    # held a secret) is not a deleted file.
+    withheld = set(_manifest_at(sha).get("withheld") or [])
     hits = [(rel, old[rel], new[rel]) for rel in sorted(new)
             if rel in old and new[rel] < old[rel] * (1 - ratio)]
-    hits += [(rel, old[rel], None) for rel in sorted(old) if rel not in new]
+    hits += [(rel, old[rel], None) for rel in sorted(old)
+             if rel not in new and rel not in withheld]
     return hits
 
 
@@ -2077,14 +2637,64 @@ def guard_lines(sha: str, prev_sha: str, hint: str | None = "undo") -> list[str]
     return lines
 
 
+_SHA_RE = re.compile(r"(?:[0-9a-fA-F]{4,64}|HEAD)\Z")
+
+
+def is_snapshot_id(sha) -> bool:
+    """A snapshot is named by a hex id (4-64 digits) or HEAD, nothing else:
+    an argument that starts with `-` must never reach git as an option."""
+    return isinstance(sha, str) and bool(_SHA_RE.match(sha))
+
+
+def _require_snapshot_id(sha) -> str:
+    if not is_snapshot_id(sha):
+        shown = " ".join(str(sha).split())[:40]
+        raise NothingToRestoreError(
+            f"no such snapshot: {shown!r} (a snapshot is named by its hex "
+            f"id as `sessionsteward log` prints it, or HEAD)")
+    return sha
+
+
 def diff(sha1: str, sha2: str) -> str:
+    _require_snapshot_id(sha1)
+    _require_snapshot_id(sha2)
     # Plain unified diff whatever your git config says: no colour (escape
     # codes hid every line from the +/- filter), no external diff tool or
     # textconv filter (their output is not a diff), and no rename detection
     # (a renamed file would show as "similarity index 100%" and no lines).
+    option_end = ("--end-of-options",) if _git_has_end_of_options() else ()
     return _git(REPO_DIR, "diff", "--no-color", "--no-ext-diff",
-                "--no-textconv", "--no-renames", f"{sha1}..{sha2}", "--",
-                "files/")
+                "--no-textconv", "--no-renames", *option_end,
+                f"{sha1}..{sha2}", "--", "files/")
+
+
+#: git added --end-of-options in 2.24 (November 2019).
+_GIT_END_OF_OPTIONS = (2, 24)
+
+
+@functools.lru_cache(maxsize=1)
+def _git_version() -> tuple[int, ...] | None:
+    """The installed git's version as numbers, e.g. (2, 43, 0), or None when
+    it cannot be read."""
+    try:
+        p = _run_git(REPO_DIR if os.path.isdir(REPO_DIR) else os.getcwd(),
+                     ("--version",))
+    except StewardError:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?",
+                  p.stdout.decode("utf-8", "replace"))
+    if p.returncode != 0 or not m:
+        return None
+    return tuple(int(g) for g in m.groups() if g is not None)
+
+
+def _git_has_end_of_options() -> bool:
+    """Does this git know --end-of-options (2.24+)? An older git gets the
+    command without it: the ids are checked by _require_snapshot_id first, so
+    nothing that looks like an option can reach it either way. A git whose
+    version cannot be read is assumed to be recent."""
+    version = _git_version()
+    return version is None or version >= _GIT_END_OF_OPTIONS
 
 
 def file_mtimes(paths: list[str]) -> dict[str, float]:
@@ -2101,62 +2711,127 @@ def file_mtimes(paths: list[str]) -> dict[str, float]:
 # Claude Code hook wiring (`install-hooks`)
 # ---------------------------------------------------------------------------
 
+HOOK_TIMEOUT_SECONDS = 30
+
+
+def _console_script() -> str | None:
+    """Absolute path of the installed `sessionsteward` console script, or
+    None when it is not there (a run from a source checkout)."""
+    name = "sessionsteward.exe" if os.name == "nt" else "sessionsteward"
+    dirs = []
+    try:
+        dirs.append(sysconfig.get_path("scripts"))
+        dirs.append(sysconfig.get_path(
+            "scripts", sysconfig.get_preferred_scheme("user")))
+    except (KeyError, ValueError, AttributeError):
+        pass
+    for d in dirs:
+        if not d:
+            continue
+        path = os.path.join(d, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return os.path.abspath(path)
+    return None
+
+
 def _self_cmd() -> str:
-    """Absolute, quoted `python -m sessionsteward` for hook shells.
+    """The command a Claude Code hook runs, quoted for hook shells.
 
     Hook shells don't load your aliases or activate your venv, so a bare
-    `sessionsteward` fails silently there. Windows paths with spaces need
-    double quotes (cmd and Git Bash both accept them); POSIX gets shlex.
+    `sessionsteward` fails silently there: the absolute path of the console
+    script is written. NOT `python -m sessionsteward`: Claude Code runs hooks
+    with the PROJECT as the working directory, and `python -m` puts that
+    directory first on sys.path, so a cloned repository holding its own
+    sessionsteward/__main__.py would run its code at every session start.
+    Only when the script cannot be found does this fall back to
+    `python -I -m sessionsteward` (-I: no working directory on sys.path).
+    Windows paths with spaces need double quotes (cmd and Git Bash both
+    accept them); POSIX gets shlex.
     """
-    exe = sys.executable
-    exe = f'"{exe}"' if os.name == "nt" else shlex.quote(exe)
-    return f"{exe} -m sessionsteward"
+    def quote(word: str) -> str:
+        return f'"{word}"' if os.name == "nt" else shlex.quote(word)
+    script = _console_script()
+    if script:
+        return quote(script)
+    return f"{quote(sys.executable)} -I -m sessionsteward"
 
 
 HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact"
 HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap -m "session start"'
-# The arguments each event's hook has when sessionsteward wrote it.
-_HOOK_ARGS = {"PreCompact": ["precompact"],
-              "SessionStart": ["snap", "-m", "session start"]}
+HOOK_REMIND_CMD = f"{_self_cmd()} remind"
+HOOK_GUARD_CMD = f"{_self_cmd()} guard hook"
+
+#: Every hook sessionsteward installs: (event, matcher, arguments after the
+#: command, the full command). The matchers are Claude Code's: SessionStart
+#: "compact" is the session that continues after a compaction; the guard's
+#: PreToolUse matcher names the file-editing tools; FileChanged takes the
+#: literal file names to watch (see guardhook.py for what each can do).
+HOOK_SPECS = (
+    ("PreCompact", "", ["precompact"], HOOK_PRECOMPACT_CMD),
+    ("SessionStart", "", ["snap", "-m", "session start"],
+     HOOK_SESSIONSTART_CMD),
+    ("SessionStart", "compact", ["remind"], HOOK_REMIND_CMD),
+    ("PreToolUse", "Write|Edit|MultiEdit", ["guard", "hook"],
+     HOOK_GUARD_CMD),
+    ("FileChanged", "CLAUDE.md|CLAUDE.local.md|AGENTS.md", ["guard", "hook"],
+     HOOK_GUARD_CMD),
+)
+# The arguments each event's first hook has when sessionsteward wrote it.
+_HOOK_ARGS = {}
+for _event, _matcher, _args, _cmd in HOOK_SPECS:
+    _HOOK_ARGS.setdefault(_event, _args)
 
 
-def _is_ours(event: str, cmd) -> bool:
+def split_command(cmd: str) -> list[str]:
+    """A hook command line as words. POSIX: shlex. Windows: only double
+    quotes group words and a backslash is an ordinary character, so an
+    unquoted C:\\Users\\me\\sessionsteward.exe keeps its path (shlex's
+    POSIX rules would eat the backslashes). Raises ValueError like shlex."""
+    if os.name != "nt":
+        return shlex.split(cmd)
+    words = shlex.split(cmd, posix=False)
+    return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] == '"' else w
+            for w in words]
+
+
+def _is_ours(event: str, cmd, args=None) -> bool:
     """Did sessionsteward write this hook command for this event? Exactly
     that, and nothing that merely mentions it: the bare `sessionsteward ...`
-    the first version wrote, or `<any python> -m sessionsteward ...` (ours
-    from another, moved or recreated, environment). merge_hooks rewrites
-    these in place rather than appending a second, stale-plus-fresh pair;
-    every other hook is the user's - `cd ~/code/sessionsteward && git pull`,
+    the first version wrote, `<any python> [-I] -m sessionsteward ...` (the
+    0.1.0-0.1.3 form, unsafe - see _self_cmd - and rewritten by
+    `install-hooks --write`), or `<path>/sessionsteward[.exe] ...` (ours from
+    another, moved or recreated, environment). merge_hooks rewrites these in
+    place rather than appending a second, stale-plus-fresh pair; every other
+    hook is the user's - `cd ~/code/sessionsteward && git pull`,
     `sessionsteward snap -m checkpoint` - and is never touched."""
     if not isinstance(cmd, str):
         return False
     try:
-        words = shlex.split(cmd)
+        words = split_command(cmd)
     except ValueError:
         return False
-    args = _HOOK_ARGS[event]
-    return (words == ["sessionsteward", *args]
-            or (len(words) == len(args) + 3
-                and words[1:3] == ["-m", "sessionsteward"]
-                and words[3:] == args))
+    args = _HOOK_ARGS[event] if args is None else args
+    if words[-len(args):] != args:
+        return False
+    head = words[:-len(args)]
+    if head == ["sessionsteward"]:
+        return True
+    if len(head) == 1:
+        return re.split(r"[\\/]", head[0])[-1].lower() in (
+            "sessionsteward", "sessionsteward.exe")
+    return (len(head) in (3, 4) and head[-2:] == ["-m", "sessionsteward"]
+            and (len(head) == 3 or head[1] == "-I"))
 
 
 def build_hooks_json() -> dict:
     """The hooks payload for Claude Code's settings.json `hooks` section."""
-    return {
-        "hooks": {
-            "PreCompact": [
-                {"matcher": "",
-                 "hooks": [{"type": "command",
-                            "command": HOOK_PRECOMPACT_CMD}]}
-            ],
-            "SessionStart": [
-                {"matcher": "",
-                 "hooks": [{"type": "command",
-                            "command": HOOK_SESSIONSTART_CMD}]}
-            ],
-        }
-    }
+    hooks: dict = {}
+    for event, matcher, _args, cmd in HOOK_SPECS:
+        hooks.setdefault(event, []).append(
+            {"matcher": matcher,
+             "hooks": [{"type": "command", "command": cmd,
+                        "timeout": HOOK_TIMEOUT_SECONDS}]})
+    return {"hooks": hooks}
 
 
 def _hook_commands(entries: list) -> list[str]:
@@ -2183,30 +2858,30 @@ def merge_hooks(settings: dict) -> dict:
     SettingsError for a `hooks` value of an unexpected shape (it cannot be
     merged into without replacing something the user wrote).
     """
-    ours = build_hooks_json()["hooks"]
     hooks = settings.get("hooks")
     if hooks is None:
         hooks = settings["hooks"] = {}
     elif not isinstance(hooks, dict):
         raise SettingsError('"hooks" in the settings file is not an object')
-    for event, entries in ours.items():
+    for event, matcher, args, cmd in HOOK_SPECS:
         existing = hooks.get(event)
         if existing is None:
             existing = hooks[event] = []
         elif not isinstance(existing, list):
             raise SettingsError(f'"hooks.{event}" in the settings file is '
                                 f'not a list')
-        cmd = entries[0]["hooks"][0]["command"]
         found = False
         for e in list(existing):
             if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
                 continue
             kept = []
             for h in e["hooks"]:
-                if isinstance(h, dict) and _is_ours(event, h.get("command")):
+                if isinstance(h, dict) and _is_ours(event, h.get("command"),
+                                                    args):
                     if found:
                         continue  # stale duplicate
                     h["command"] = cmd
+                    h.setdefault("timeout", HOOK_TIMEOUT_SECONDS)
                     found = True
                 kept.append(h)
             if kept:
@@ -2214,7 +2889,9 @@ def merge_hooks(settings: dict) -> dict:
             elif e["hooks"]:
                 existing.remove(e)  # we emptied it
         if not found:
-            existing.append(entries[0])
+            existing.append({"matcher": matcher,
+                             "hooks": [{"type": "command", "command": cmd,
+                                        "timeout": HOOK_TIMEOUT_SECONDS}]})
     return settings
 
 

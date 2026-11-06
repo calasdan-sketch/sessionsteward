@@ -99,7 +99,7 @@ sessionsteward restore <sha>               # restore a specific snapshot
 sessionsteward show <sha>                  # list the files a snapshot holds
 sessionsteward show <sha> CLAUDE.md > old.md  # get one file back, touch nothing else
 sessionsteward diet                        # what's eating the context window
-sessionsteward diet --check [--budget N]   # exit 1 on warnings / over N tokens (CI, pre-commit)
+sessionsteward diet --check [--budget N]   # exit 3 on warnings / over N tokens (CI, pre-commit)
 sessionsteward diet --json                 # the same report, machine-readable
 sessionsteward install-hooks               # print Claude Code hooks JSON
 sessionsteward install-hooks --write       # merge it into ~/.claude/settings.json
@@ -273,7 +273,7 @@ otherwise look changed for ever, and `undo` would take an extra `pre-undo`
 snapshot every time - seen with hand-made names, not on a Mac); two files
 that differ only that way are still two, never taken for one. One
 limit remains: a project is identified by its path as it is spelled, so the
-same folder reached as `C:\Users\Dan\Proj` and as `c:\users\dan\proj` is two
+same folder reached as `C:\Users\me\Proj` and as `c:\users\me\proj` is two
 projects with two histories (`undo` from the second says `nothing to
 restore`); start sessionsteward from the same spelling every time, or pass
 `--root`. The tests reproduce the rename on any OS by telling git to ignore
@@ -421,7 +421,7 @@ sessionsteward, input nobody foresaw - is also one line, `error: unexpected
 
 ```
 $ sessionsteward status
-project: /home/dan/proj
+project: /home/me/proj
 watching: 3 existing path(s) - CLAUDE.md, .claude, ~/.claude/CLAUDE.md
 hooks: installed (SessionStart + PreCompact)
 snapshots: 14, newest b81d0e4 2026-11-06 09:12 (5 min ago)  session start
@@ -465,7 +465,7 @@ Files loaded into context: 4, total ~12,400 chars (~3,100 tokens)
 
 ## Warnings
 - `CLAUDE.md`: 231 lines - Claude Code recommends under 200 per file (longer files cost context and reduce adherence)
-- `~/.claude/projects/-home-dan-proj/memory/MEMORY.md`: only the first 200 of 246 lines load at session start (limit: 200 lines or 25 KB) - Claude does not see the other 46 unless it opens the file
+- `~/.claude/projects/-home-me-proj/memory/MEMORY.md`: only the first 200 of 246 lines load at session start (limit: 200 lines or 25 KB) - Claude does not see the other 46 unless it opens the file
 
 ## Imported but not protected by undo
 - `docs/arch.md` — `sessionsteward watch --add docs/arch.md`
@@ -475,29 +475,64 @@ Counted, following Claude Code's [memory docs](https://code.claude.com/docs/en/m
 
 - `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/rules/**/*.md`,
   `~/.claude/CLAUDE.md` and the auto-memory index `MEMORY.md` - the watched
-  ones (a file you do not watch is not looked at, unless imported);
+  ones (a file you do not watch is not looked at, unless imported). A rules
+  file is one under a `.claude/rules/` folder (or `~/.claude/rules/`), judged
+  from the `.claude` folder down;
 - every file they pull in with `@path` imports, up to four hops deep:
   relative to the importing file, `~/...` or absolute, `\ ` for a space,
-  never inside a code span or fenced code block, and not when quoted. An
-  import that is both a watched file and imported is counted once. A
-  project file's import of something outside the project is counted but its
-  lines are never quoted in the duplicate report;
+  and not when quoted. Imports are never taken from a code span or a code
+  block: fenced (also behind a list marker or `>`, and indented), or
+  indented four spaces after a blank line outside a list. An import that is
+  both a watched file and imported is counted once;
+- block-level HTML comments (`<!-- ... -->` starting a line, outside code)
+  are left out, as Claude Code strips them, and are not searched for imports;
 - of `MEMORY.md`, only the first 200 lines or 25 KB, whichever comes first
   (its topic files load on demand and are not counted);
 - a rules file with `paths:` front matter is listed apart as on demand;
-  front matter is not counted, since Claude Code strips it.
+  front matter is not counted, since Claude Code strips it. Front matter
+  that does not parse makes Claude Code ignore `paths`, so such a rule is
+  counted as always loaded, with a warning. sessionsteward has no YAML
+  parser: it catches what YAML always rejects (a tab used to indent, a line
+  that is not `key: value` or a list item, an unclosed `[`, `{` or quote),
+  not every error.
 
-Warnings: a file over 200 lines (MEMORY.md excepted - it gets the cut-off
-warning instead), a file over 4 MiB (Claude Code skips it; at most that much
-is read), an `@...md` import whose file does not exist (other `@words` - a
-name, `@types/node` - are prose, not imports), and an import more than four
-hops deep. `diet --check` exits 1 when there is any warning and `--budget
-TOKENS` when more than that many (estimated) tokens load at session start;
-the reasons go to stderr as `check: ...` lines. `--json` prints the report
-(paths absolute) for scripts. Settings, commands/skills, hooks, transcripts
-and logs are watched for undo but never counted. Not modelled: `CLAUDE.md`
-files in parent or sub-directories, `claudeMdExcludes`, and whether you have
-approved external imports.
+**Outside the project.** A file of the project whose real location is
+outside it - a rule that is a symlink out of the project, or an import of
+`~/...` or `/...` from a project file - is what Claude Code calls an
+external import: it loads only after you approve external imports for the
+project. `diet` lists such files apart, does not count them, does not follow
+their imports, and never quotes their lines (a cloned repo's
+`.claude/rules/x.md -> ~/.aws/...` must not print a key). It does not know
+whether you have approved them. Your own user-level files
+(`~/.claude/CLAUDE.md` and what it imports) are trusted, as Claude Code
+trusts them.
+
+Warnings: a top-level `CLAUDE.md`, `CLAUDE.local.md` or `AGENTS.md` over 200
+lines (the docs' "under 200 lines per CLAUDE.md file"; imports and rules are
+not warned about), MEMORY.md past its cut-off, a file over 4 MiB (Claude Code
+skips it; at most that much is read), a file that cannot be read, rules front
+matter that does not parse, an `@...md` import whose file does not exist
+(each one once per file, at most 20 per file, then a count; other `@words` -
+a name, `@types/node` - are prose, not imports), and an import more than four
+hops deep. A suggested `watch --add` is only ever for an imported file inside
+the project or `~/.claude`; one elsewhere is only counted (it may hold a
+secret that a snapshot would copy).
+
+`diet --check` exits **3** when there is any warning, and `--budget TOKENS`
+when more than that many (estimated) tokens load at session start; the
+reasons go to stderr as `check: ...` lines. 0 is a pass, 2 a usage, git or
+config error, 1 a refused read or write or an unexpected error - so CI can
+tell a failed check from a broken run. `--json` prints the report (paths
+absolute, non-ASCII escaped) for scripts. Every path and line the report
+prints has its control characters (bar tab) replaced by `?`, so nothing in a
+memory file can send escape sequences to your terminal or CI log. Settings,
+commands/skills, hooks, transcripts and logs are watched for undo but never
+counted. Not modelled: `CLAUDE.md` files in parent or sub-directories,
+`claudeMdExcludes`, whether you have approved external imports, every
+corner of CommonMark (HTML blocks other than comments, lazy continuation
+lines, nested-list indentation rules), whether an `@` inside an HTML comment
+or after `(` is an import, and whether "25KB" means 25,000 or 25,600 bytes
+(25,600 is used).
 
 ## Tests
 

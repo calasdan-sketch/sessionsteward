@@ -21,7 +21,7 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
   sessionsteward status                # newest snapshot, unsaved changes, hooks
   sessionsteward show <sha> CLAUDE.md  # print one file from a snapshot
   sessionsteward diet                  # what's eating the context window
-  sessionsteward diet --check          # exit 1 on warnings (CI / pre-commit)
+  sessionsteward diet --check          # exit 3 on warnings (CI / pre-commit)
   sessionsteward install-hooks [--write]  # Claude Code hooks JSON
   sessionsteward watch                 # daemon: auto-snapshot on change
 """
@@ -393,7 +393,9 @@ def cmd_diet(args) -> int:
                                     "0 or more")
     report = diet_mod.analyze(args.root)
     if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        # ensure_ascii: a C1 control character in a path or line comes out
+        # as \u0085, never raw
+        print(json.dumps(report, indent=2, ensure_ascii=True))
     else:
         print(diet_mod.render(report, args.root))
     if args.check or args.budget is not None:
@@ -401,10 +403,16 @@ def cmd_diet(args) -> int:
         for line in found:
             print(f"check: {line}", file=sys.stderr)
         if found:
-            return 1
+            return CHECK_FAILED
         if not args.json:
             print("check: ok")
     return 0
+
+
+# `diet --check` / `--budget` found something: not 1 (the system refused a
+# read or write, or an unexpected error) or 2 (git, config, usage), so CI can
+# tell a failed check from a broken run.
+CHECK_FAILED = 3
 
 
 def _ago(date: str) -> str:
@@ -466,7 +474,7 @@ def cmd_status(args) -> int:
             print(f"state: {len(changes)} unsaved change(s) since "
                   f"{top['sha'][:7]}:")
             for tag, path in changes[:STATUS_LIMIT]:
-                print(f"  {tag} {_short(path, root)}")
+                print(f"  {tag} {diet_mod.safe(_short(path, root))}")
             if len(changes) > STATUS_LIMIT:
                 print(f"  ... {len(changes) - STATUS_LIMIT} more")
             print("  `sessionsteward snap` saves them, `sessionsteward diff` "
@@ -503,7 +511,7 @@ def cmd_show(args) -> int:
     if args.path is None:
         for ap in sorted(files):
             size = files[ap][1]
-            print(f"{size:>10,}  {_short(ap, args.root)}")
+            print(f"{size:>10,}  {diet_mod.safe(_short(ap, args.root))}")
         print(f"{len(files)} file(s) in snapshot {sha[:7]} - "
               f"`sessionsteward show {sha[:7]} <file>` prints one")
         return 0
@@ -520,7 +528,8 @@ def cmd_show(args) -> int:
         under = sorted(ap for k, ap in norm.items() if k.startswith(prefix))
         if under:
             for ap in under:
-                print(f"{files[ap][1]:>10,}  {_short(ap, args.root)}")
+                print(f"{files[ap][1]:>10,}  "
+                      f"{diet_mod.safe(_short(ap, args.root))}")
             print(f"{len(under)} file(s) under {args.path} in snapshot "
                   f"{sha[:7]}")
             return 0
@@ -661,9 +670,9 @@ def build_parser() -> argparse.ArgumentParser:
     dt.add_argument("--json", action="store_true",
                     help="Print the report as JSON.")
     dt.add_argument("--check", action="store_true",
-                    help="Exit 1 when there are warnings (CI, pre-commit).")
+                    help="Exit 3 when there are warnings (CI, pre-commit).")
     dt.add_argument("--budget", type=int, default=None, metavar="TOKENS",
-                    help="With or without --check: exit 1 when more than "
+                    help="With or without --check: exit 3 when more than "
                          "TOKENS (estimated) load at session start.")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")

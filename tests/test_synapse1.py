@@ -163,8 +163,8 @@ class TestDietLoadingRules(Base):
         write(os.path.join(self.proj, "CLAUDE.md"),
               f"@{outside}\n{secret}\n")
         r = self.report()
-        ext = [f for f in r["files"] if f["path"] == outside][0]
-        self.assertTrue(ext["external"])
+        self.assertNotIn(outside, [f["path"] for f in r["files"]])
+        self.assertEqual([f["path"] for f in r["external"]], [outside])
         self.assertEqual(r["duplicates"], [])
         self.assertNotIn(secret, json.dumps(r["duplicates"]))
 
@@ -182,7 +182,7 @@ class TestDietCli(Base):
         self.assertIn("check: ok", out)
         write(os.path.join(self.proj, "CLAUDE.md"), "@docs/gone.md\n")
         code, out, err = self.cli("diet", "--check")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, cli_mod.CHECK_FAILED)
         self.assertIn("check: CLAUDE.md: imports @docs/gone.md", err)
         code, out, _ = self.cli("diet", "--json")
         self.assertEqual(code, 0)
@@ -194,7 +194,7 @@ class TestDietCli(Base):
         write(os.path.join(self.proj, "CLAUDE.md"), "x" * 4000 + "\n")
         self.assertEqual(self.cli("diet", "--budget", "2000")[0], 0)
         code, _, err = self.cli("diet", "--budget", "500")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, cli_mod.CHECK_FAILED)
         self.assertIn("over the budget of 500", err)
         code, _, err = self.cli("diet", "--budget", "-1")
         self.assertEqual(code, 2)
@@ -306,6 +306,244 @@ class TestShow(Base):
         sha = self.log()[0]["sha"]
         code, out, _ = self.cli("show", sha, "~/.claude/CLAUDE.md")
         self.assertEqual((code, out), (0, "user mem\n"))
+
+
+
+@unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+class TestPanelSymlinkedRules(Base):
+    """Panel #1: a rule that is a symlink out of the project leaked its lines
+    into the duplicate report and was counted as loaded."""
+
+    def test_symlinked_rule_out_of_the_project_is_external(self):
+        secret = "AWS_SECRET_ACCESS_KEY=" + "q" * 40
+        outside = os.path.join(self._tmp, "secret")
+        write(os.path.join(outside, "creds.md"), secret + "\n")
+        write(os.path.join(outside, "creds2.md"), secret + "\n")
+        rules = os.path.join(self.proj, ".claude", "rules")
+        os.makedirs(rules)
+        os.symlink(os.path.join(outside, "creds.md"),
+                   os.path.join(rules, "a.md"))
+        os.symlink(os.path.join(outside, "creds2.md"),
+                   os.path.join(rules, "b.md"))
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual(r["duplicates"], [])
+        self.assertEqual(len(r["external"]), 2)
+        names = [f["path"] for f in r["files"]]
+        self.assertFalse(any(n.endswith(("a.md", "b.md")) for n in names))
+        code, out, err = self.cli("diet", "--check")
+        self.assertNotIn(secret, out + err)
+        self.assertIn("approve external imports", out)
+
+    def test_symlink_inside_the_project_still_counts(self):
+        write(os.path.join(self.proj, "docs", "real.md"), "real rule\n")
+        rules = os.path.join(self.proj, ".claude", "rules")
+        os.makedirs(rules)
+        os.symlink(os.path.join(self.proj, "docs", "real.md"),
+                   os.path.join(rules, "r.md"))
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual(r["external"], [])
+        self.assertEqual(len(r["files"]), 2)
+
+
+class TestPanelControlCharacters(Base):
+    """Panel #2: escape sequences from a memory file reached the terminal."""
+
+    def test_duplicates_warnings_and_check_lines_are_neutralised(self):
+        evil = "\x1b]52;c;ZXZpbA==\x07\x1b[2J long duplicated line " + "x" * 30
+        write(os.path.join(self.proj, "CLAUDE.md"),
+              evil + "\n@x\x1b[31mred.md\n\x9b31m\n")
+        write(os.path.join(self.proj, "AGENTS.md"), evil + "\n")
+        code, out, err = self.cli("diet", "--check")
+        self.assertEqual(code, cli_mod.CHECK_FAILED)
+        for text in (out, err):
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("\x07", text)
+            self.assertNotIn("\x9b", text)
+        self.assertIn("?]52;c;", out)
+        self.assertIn("@x?[31mred.md", err)
+        _, out, _ = self.cli("diet", "--json")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x9b", out)
+        self.assertEqual(json.loads(out)["n_duplicates"], 1)
+
+    def test_safe_keeps_tabs_and_text(self):
+        self.assertEqual(diet_mod.safe("a\tb Καλάς\x00\x85\r\n"),
+                         "a\tb Καλάς????")
+
+
+class TestPanelNoSecretSuggestions(Base):
+    """Panel #3: `watch --add` was suggested for any imported file."""
+
+    def test_user_level_import_outside_claude_dir_is_not_suggested(self):
+        creds = os.path.join(self._home, ".aws", "credentials.md")
+        write(creds, "key\n")
+        mine = os.path.join(self._home, ".claude", "mine.md")
+        write(mine, "mine\n")
+        write(os.path.join(self._home, ".claude", "CLAUDE.md"),
+              "@~/.aws/credentials.md\n@~/.claude/mine.md\n")
+        write(os.path.join(self.proj, "CLAUDE.md"), "@docs/a.md\n")
+        write(os.path.join(self.proj, "docs", "a.md"), "a\n")
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual(sorted(r["unprotected"]),
+                         sorted([mine, os.path.join(self.proj, "docs", "a.md")]))
+        self.assertEqual(r["n_unprotected_elsewhere"], 1)
+        out = diet_mod.render(r, self.proj)
+        self.assertNotIn("credentials", out.split("Imported but not")[1]
+                         .split("##")[0].replace("1 imported file(s)", ""))
+        self.assertIn("may hold secrets", out)
+
+
+class TestPanelRulesFolder(Base):
+    """Panel #4: any folder called `rules` above the project made its
+    commands count as context."""
+
+    def test_project_under_a_rules_folder(self):
+        proj = os.path.join(self._tmp, "rules", "p")
+        write(os.path.join(proj, "CLAUDE.md"), "hi\n")
+        write(os.path.join(proj, ".claude", "commands", "deploy.md"), "d\n")
+        write(os.path.join(proj, ".claude", "rules", "x.md"), "x\n")
+        r = diet_mod.analyze(proj)
+        names = rel([f["path"] for f in r["files"]], proj)
+        self.assertEqual(names, {"CLAUDE.md", ".claude/rules/x.md"})
+
+    def test_rules_detection(self):
+        j = os.path.join
+        self.assertTrue(diet_mod._is_rules_file(j("/a", ".claude", "rules",
+                                                  "sub", "x.md")))
+        self.assertFalse(diet_mod._is_rules_file(j("/rules", "p", ".claude",
+                                                   "commands", "x.md")))
+        self.assertFalse(diet_mod._is_rules_file(j("/a", "rules", "x.md")))
+        self.assertTrue(diet_mod._is_rules_file(
+            j(core_mod._claude_config_dir(), "rules", "x.md")))
+
+
+class TestPanelMissingImportFlood(Base):
+    """Panel #5: one warning per repeated missing import (400,000 lines)."""
+
+    def test_deduplicated_and_capped(self):
+        many = "".join(f"@gone{i}.md\n" for i in range(100))
+        write(os.path.join(self.proj, "CLAUDE.md"), "@nope.md " * 5000 + "\n"
+              + many)
+        r = diet_mod.analyze(self.proj)
+        msgs = [w["message"] for w in r["warnings"]
+                if w["code"] == "missing-import"]
+        self.assertEqual(len(msgs), diet_mod.MAX_MISSING_PER_FILE + 1)
+        self.assertEqual(sum("@nope.md," in m for m in msgs), 1)
+        self.assertIn("... and 81 more missing imports", msgs[-1])
+
+
+class TestPanelParser(unittest.TestCase):
+    """Panel #6: list-item and indented fences, indented code blocks, bad
+    front matter, block HTML comments."""
+
+    def test_fences_behind_list_markers_and_quotes(self):
+        text = ("- ```\n  @a.md\n  ```\n"
+                "1. ~~~\n@b.md\n~~~\n"
+                "> ```\n> @c.md\n> ```\n"
+                "      ```\n@d.md\n```\n"
+                "@ok.md\n")
+        self.assertEqual(diet_mod.find_imports(text), ["ok.md"])
+
+    def test_indented_code_block(self):
+        text = "para\n\n    @code.md\n\tcode @tab.md\n\n@ok.md\n"
+        self.assertEqual(diet_mod.find_imports(text), ["ok.md"])
+
+    def test_indented_list_continuation_is_not_code(self):
+        text = "- item\n\n    @nested.md\n- other\n    - @deep.md\n"
+        self.assertEqual(diet_mod.find_imports(text),
+                         ["nested.md", "deep.md"])
+
+    def test_indent_inside_paragraph_is_not_code(self):
+        self.assertEqual(diet_mod.find_imports("text\n    @lazy.md\n"),
+                         ["lazy.md"])
+
+    def test_html_comments(self):
+        text = ("<!-- maintainer note @hidden.md -->\n"
+                "<!--\nmulti line\n@also-hidden.md\n-->\n"
+                "kept @ok.md\n"
+                "```\n<!-- kept in code -->\n```\n"
+                "inline <!-- not block --> @inline.md\n")
+        body, imports = diet_mod._scan(text)
+        self.assertEqual(imports, ["ok.md", "inline.md"])
+        self.assertNotIn("maintainer", body)
+        self.assertNotIn("multi line", body)
+        self.assertIn("<!-- kept in code -->", body)
+        self.assertIn("<!-- not block -->", body)
+
+    def test_unclosed_comment_drops_the_rest(self):
+        body, imports = diet_mod._scan("a\n<!-- open\n@x.md\n")
+        self.assertEqual((body, imports), ("a", []))
+
+    def test_front_matter_that_does_not_parse_is_not_scoped(self):
+        for fm in ("paths: [unclosed", "paths:\n\t- src/**",
+                   "paths: \"open", "not yaml at all {", "paths: {a: [}"):
+            self.assertFalse(diet_mod.is_path_scoped(f"---\n{fm}\n---\nb\n"),
+                             fm)
+        for fm in ("paths: [\"src/**\", 'lib/**']", "paths:\n  - src/**",
+                   "paths: src/**  # comment", "paths: [don't]",
+                   "description: it's fine\npaths:\n  - \"a\"",
+                   "paths:\n  - [a, b]"):
+            self.assertTrue(diet_mod.is_path_scoped(f"---\n{fm}\n---\nb\n"),
+                            fm)
+
+
+class TestPanelExitCodesAndWarnings(Base):
+    """Panel #7: a failed check shared exit 1 with unexpected errors,
+    unreadable files passed the check, imports got the 200-line warning."""
+
+    def test_check_failure_code_is_distinct(self):
+        self.assertNotIn(cli_mod.CHECK_FAILED, (0, 1, 2))
+        write(os.path.join(self.proj, "CLAUDE.md"), "@gone.md\n")
+        self.assertEqual(self.cli("diet", "--check")[0], cli_mod.CHECK_FAILED)
+        with mock.patch.object(diet_mod, "analyze",
+                               side_effect=KeyError("boom")):
+            code, _, err = self.cli("diet", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected", err)
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid")
+                     and os.geteuid() == 0), "permission bits do not bind")
+    def test_unreadable_file_fails_the_check(self):
+        rule = os.path.join(self.proj, ".claude", "rules", "locked.md")
+        write(rule, "secret rule\n")
+        os.chmod(rule, 0)
+        self.addCleanup(os.chmod, rule, 0o600)
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual([w["code"] for w in r["warnings"]], ["unreadable"])
+
+    def test_unreadable_file_reported_when_open_fails(self):
+        real = diet_mod._read_text
+
+        def fake(path):
+            if path.endswith("CLAUDE.md"):
+                return "Permission denied"
+            return real(path)
+        with mock.patch.object(diet_mod, "_read_text", fake):
+            r = diet_mod.analyze(self.proj)
+        self.assertEqual([w["code"] for w in r["warnings"]], ["unreadable"])
+        self.assertIn("Permission denied", r["warnings"][0]["message"])
+
+    def test_long_file_warning_only_for_claude_md_files(self):
+        long = "".join(f"line {i}\n" for i in range(300))
+        write(os.path.join(self.proj, "CLAUDE.md"), "@README.md\n")
+        write(os.path.join(self.proj, "README.md"), long)
+        write(os.path.join(self.proj, ".claude", "rules", "big.md"), long)
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual(r["warnings"], [])
+        write(os.path.join(self.proj, "CLAUDE.md"), long)
+        r = diet_mod.analyze(self.proj)
+        self.assertEqual([w["code"] for w in r["warnings"]], ["long-file"])
+
+
+class TestPanelReadmeNames(unittest.TestCase):
+    """Panel #8: the README examples carried the owner's name."""
+
+    def test_no_personal_names_in_examples(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
+            text = f.read()
+        for name in ("/home/dan", "Users\\Dan", "-home-dan-", "Users\\dan"):
+            self.assertNotIn(name, text)
 
 
 if __name__ == "__main__":

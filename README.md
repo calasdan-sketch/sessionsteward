@@ -9,6 +9,7 @@ pip install git+https://github.com/calasdan-sketch/sessionsteward
 sessionsteward init                      # one-time: snapshots repo + first snapshot
 sessionsteward install-hooks --write     # snapshot on every Claude Code session start and before compaction
 sessionsteward undo                      # the agent clobbered CLAUDE.md? back it comes
+sessionsteward status                    # where am I? unsaved changes, hooks, shrink guard
 ```
 
 Coding agents silently degrade: compaction drops constraints, and one
@@ -29,6 +30,35 @@ undone 1 step(s) -> a3f9c21  before letting the agent edit memory
 
 **Scope:** session *ops* (snapshots, undo, compaction guard) — not memory
 *storage*. That boundary stays clean.
+
+## How it compares
+
+Claude Code already has `/rewind`, and there are other undo tools. What each
+one says about itself (links are the sources; "not stated" means the source
+does not say):
+
+| | sessionsteward | Claude Code [`/rewind`](https://code.claude.com/docs/en/checkpointing) | [ccundo](https://github.com/gmh5225/ccundo) | [Claude Vigil](https://mcpmarket.com/server/claude-vigil) | [gitwatch](https://github.com/nevik/gitwatch) |
+|---|---|---|---|---|---|
+| Catches changes made by shell commands, by you, or by another session | yes (it snapshots the files, whoever changed them) | no: "A file that only Bash commands changed isn't tracked"; external changes "normally not captured" | no: bash commands "can't be undone automatically" | yes | yes |
+| How long history is kept | until you delete `~/.sessionsteward` | about 30 days by default (`cleanupPeriodDays`) | not stated | until garbage-collected | forever (it is a git repo) |
+| Scope | agent memory: `CLAUDE.md`, `.claude/`, `AGENTS.md`, `~/.claude/CLAUDE.md`, auto-memory | files Claude edited in the session | operations in Claude Code's session logs | the whole project | any folder already in a git repo |
+| Snapshot before compaction | yes (PreCompact hook) | not stated | not stated | as a manual step | not stated |
+| Warns when a memory file shrinks by half or vanishes | yes | not stated | not stated | not stated | not stated |
+| Needs | Python 3.10+ and git | built in | Node.js / npm | an MCP server | git + inotify-tools or fswatch |
+
+For the context report, [cclint](https://pkg.go.dev/github.com/pthm/cclint)
+and [claude-config-auditor](https://pypi.org/project/claude-config-auditor/)
+lint Claude Code configs and estimate token cost (the auditor has a CI
+`--fail-on` mode). `sessionsteward diet` is narrower: it counts what loads at
+session start by the rules in Claude Code's
+[memory docs](https://code.claude.com/docs/en/memory) (`@imports`,
+MEMORY.md's 200-line cut, `paths:` rules) and points out imported files that
+have no undo.
+
+**Honest limits.** sessionsteward is not a replacement for git in your
+project: it only versions the memory files it watches. It polls (`watch`) or
+runs from hooks; it is not a file-system event watcher. Token numbers are
+estimates (characters / 4), not a tokenizer's.
 
 ## Install
 
@@ -61,11 +91,16 @@ sessionsteward snap -m "before refactor"   # snapshot now
 sessionsteward precompact                  # snapshot before compaction
 sessionsteward watch [--interval SECONDS]  # daemon: auto-snapshot on change (polls every 5 s)
 
+sessionsteward status                      # newest snapshot, unsaved changes, hooks, guard
 sessionsteward log                         # list snapshots (this project only, local time)
 sessionsteward diff                        # what changed (e.g. what compaction dropped)
 sessionsteward undo                        # step back one snapshot (--steps N for more)
 sessionsteward restore <sha>               # restore a specific snapshot
+sessionsteward show <sha>                  # list the files a snapshot holds
+sessionsteward show <sha> CLAUDE.md > old.md  # get one file back, touch nothing else
 sessionsteward diet                        # what's eating the context window
+sessionsteward diet --check [--budget N]   # exit 3 on warnings / over N tokens (CI, pre-commit)
+sessionsteward diet --json                 # the same report, machine-readable
 sessionsteward install-hooks               # print Claude Code hooks JSON
 sessionsteward install-hooks --write       # merge it into ~/.claude/settings.json
 ```
@@ -238,7 +273,7 @@ otherwise look changed for ever, and `undo` would take an extra `pre-undo`
 snapshot every time - seen with hand-made names, not on a Mac); two files
 that differ only that way are still two, never taken for one. One
 limit remains: a project is identified by its path as it is spelled, so the
-same folder reached as `C:\Users\Dan\Proj` and as `c:\users\dan\proj` is two
+same folder reached as `C:\Users\me\Proj` and as `c:\users\me\proj` is two
 projects with two histories (`undo` from the second says `nothing to
 restore`); start sessionsteward from the same spelling every time, or pass
 `--root`. The tests reproduce the rename on any OS by telling git to ignore
@@ -382,27 +417,122 @@ where a directory belongs). Whatever else goes wrong - a bug in
 sessionsteward, input nobody foresaw - is also one line, `error: unexpected
 ...`, exit code 1, never a traceback.
 
+## Status and show
+
+```
+$ sessionsteward status
+project: /home/me/proj
+watching: 3 existing path(s) - CLAUDE.md, .claude, ~/.claude/CLAUDE.md
+hooks: installed (SessionStart + PreCompact)
+snapshots: 14, newest b81d0e4 2026-11-06 09:12 (5 min ago)  session start
+state: 2 unsaved change(s) since b81d0e4:
+  modified CLAUDE.md
+  added .claude/rules/new.md
+  `sessionsteward snap` saves them, `sessionsteward diff` shows snapshot changes, `sessionsteward undo` goes back
+```
+
+`status` only reads: it never takes a snapshot or the lock. When your files
+are an older snapshot (after `undo`) it says how many back; when they are
+the newest one it repeats that snapshot's shrink-guard lines.
+
+`show <sha>` lists the files a snapshot holds with their sizes; `show <sha>
+<file>` writes that one file's bytes to stdout, exactly as stored (CRLF
+stays CRLF, binary stays binary), so you can recover a single file - or
+compare it - without restoring anything. `<file>` is spelled as you know it
+(`CLAUDE.md`, `.claude/rules/x.md`, `~/.claude/CLAUDE.md`, absolute); a
+folder lists the files under it. `<sha>` must be a hex sha or prefix as
+`log` prints it (a revision expression such as `HEAD~1` is refused), and a
+snapshot of another project is refused, as with `restore`.
+
 ## Context diet
 
 ```
+$ sessionsteward diet
+
 # Context diet
 
-Files loaded into context: 3, total ~12,400 chars (~3,100 tokens)
+Files loaded into context: 4, total ~12,400 chars (~3,100 tokens)
 (2 other watched file(s) — settings, commands, hooks — are not loaded into context and are not counted)
 
 ## Biggest files
 | file | chars | lines |
+|---|---|---|
+| `CLAUDE.md` | 8,210 | 231 |
+| `docs/arch.md` (imported by `CLAUDE.md`) | 2,950 | 61 |
 ...
-## Duplicated content (4 lines in 2+ files)
-- _Be helpful and concise in all responses_ …
-  - `/proj/CLAUDE.md`
-  - `/proj/.claude/rules/style.md`
+## Loaded on demand (rules with `paths:`), not counted
+- `.claude/rules/frontend.md` — 1,840 chars
+
+## Warnings
+- `CLAUDE.md`: 231 lines - Claude Code recommends under 200 per file (longer files cost context and reduce adherence)
+- `~/.claude/projects/-home-me-proj/memory/MEMORY.md`: only the first 200 of 246 lines load at session start (limit: 200 lines or 25 KB) - Claude does not see the other 46 unless it opens the file
+
+## Imported but not protected by undo
+- `docs/arch.md` — `sessionsteward watch --add docs/arch.md`
 ```
 
-Counted: what Claude Code loads at session start — `CLAUDE.md`,
-`CLAUDE.local.md`, `AGENTS.md`, `.claude/rules/**/*.md`, `~/.claude/CLAUDE.md`
-and the auto-memory index `MEMORY.md`. Settings, commands/skills, hooks,
-transcripts and logs are watched for undo but never counted.
+Counted, following Claude Code's [memory docs](https://code.claude.com/docs/en/memory):
+
+- `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/rules/**/*.md`,
+  `~/.claude/CLAUDE.md` and the auto-memory index `MEMORY.md` - the watched
+  ones (a file you do not watch is not looked at, unless imported). A rules
+  file is one under a `.claude/rules/` folder (or `~/.claude/rules/`), judged
+  from the `.claude` folder down;
+- every file they pull in with `@path` imports, up to four hops deep:
+  relative to the importing file, `~/...` or absolute, `\ ` for a space,
+  and not when quoted. Imports are never taken from a code span or a code
+  block: fenced (also behind a list marker or `>`, and indented), or
+  indented four spaces after a blank line outside a list. An import that is
+  both a watched file and imported is counted once;
+- block-level HTML comments (`<!-- ... -->` starting a line, outside code)
+  are left out, as Claude Code strips them, and are not searched for imports;
+- of `MEMORY.md`, only the first 200 lines or 25 KB, whichever comes first
+  (its topic files load on demand and are not counted);
+- a rules file with `paths:` front matter is listed apart as on demand;
+  front matter is not counted, since Claude Code strips it. Front matter
+  that does not parse makes Claude Code ignore `paths`, so such a rule is
+  counted as always loaded, with a warning. sessionsteward has no YAML
+  parser: it catches what YAML always rejects (a tab used to indent, a line
+  that is not `key: value` or a list item, an unclosed `[`, `{` or quote),
+  not every error.
+
+**Outside the project.** A file of the project whose real location is
+outside it - a rule that is a symlink out of the project, or an import of
+`~/...` or `/...` from a project file - is what Claude Code calls an
+external import: it loads only after you approve external imports for the
+project. `diet` lists such files apart, does not count them, does not follow
+their imports, and never quotes their lines (a cloned repo's
+`.claude/rules/x.md -> ~/.aws/...` must not print a key). It does not know
+whether you have approved them. Your own user-level files
+(`~/.claude/CLAUDE.md` and what it imports) are trusted, as Claude Code
+trusts them.
+
+Warnings: a top-level `CLAUDE.md`, `CLAUDE.local.md` or `AGENTS.md` over 200
+lines (the docs' "under 200 lines per CLAUDE.md file"; imports and rules are
+not warned about), MEMORY.md past its cut-off, a file over 4 MiB (Claude Code
+skips it; at most that much is read), a file that cannot be read, rules front
+matter that does not parse, an `@...md` import whose file does not exist
+(each one once per file, at most 20 per file, then a count; other `@words` -
+a name, `@types/node` - are prose, not imports), and an import more than four
+hops deep. A suggested `watch --add` is only ever for an imported file inside
+the project or `~/.claude`; one elsewhere is only counted (it may hold a
+secret that a snapshot would copy).
+
+`diet --check` exits **3** when there is any warning, and `--budget TOKENS`
+when more than that many (estimated) tokens load at session start; the
+reasons go to stderr as `check: ...` lines. 0 is a pass, 2 a usage, git or
+config error, 1 a refused read or write or an unexpected error - so CI can
+tell a failed check from a broken run. `--json` prints the report (paths
+absolute, non-ASCII escaped) for scripts. Every path and line the report
+prints has its control characters (bar tab) replaced by `?`, so nothing in a
+memory file can send escape sequences to your terminal or CI log. Settings,
+commands/skills, hooks, transcripts and logs are watched for undo but never
+counted. Not modelled: `CLAUDE.md` files in parent or sub-directories,
+`claudeMdExcludes`, whether you have approved external imports, every
+corner of CommonMark (HTML blocks other than comments, lazy continuation
+lines, nested-list indentation rules), whether an `@` inside an HTML comment
+or after `(` is an import, and whether "25KB" means 25,000 or 25,600 bytes
+(25,600 is used).
 
 ## Tests
 

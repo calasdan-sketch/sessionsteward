@@ -18,7 +18,10 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
   sessionsteward diff [sha1] [sha2]    # what changed (e.g. what compaction dropped)
   sessionsteward undo                  # restore the previous snapshot
   sessionsteward restore <sha>         # restore a specific snapshot
+  sessionsteward status                # newest snapshot, unsaved changes, hooks
+  sessionsteward show <sha> CLAUDE.md  # print one file from a snapshot
   sessionsteward diet                  # what's eating the context window
+  sessionsteward diet --check          # exit 3 on warnings (CI / pre-commit)
   sessionsteward install-hooks [--write]  # Claude Code hooks JSON
   sessionsteward watch                 # daemon: auto-snapshot on change
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import errno
 import json
 import os
@@ -384,7 +388,156 @@ def cmd_restore(args) -> int:
 
 
 def cmd_diet(args) -> int:
-    print(diet_mod.render(diet_mod.analyze(args.root)))
+    if args.budget is not None and args.budget < 0:
+        raise core_mod.StewardError("--budget must be a number of tokens, "
+                                    "0 or more")
+    report = diet_mod.analyze(args.root)
+    if args.json:
+        # ensure_ascii: a C1 control character in a path or line comes out
+        # as \u0085, never raw
+        print(json.dumps(report, indent=2, ensure_ascii=True))
+    else:
+        print(diet_mod.render(report, args.root))
+    if args.check or args.budget is not None:
+        found = diet_mod.problems(report, args.budget, args.root)
+        for line in found:
+            print(f"check: {line}", file=sys.stderr)
+        if found:
+            return CHECK_FAILED
+        if not args.json:
+            print("check: ok")
+    return 0
+
+
+# `diet --check` / `--budget` found something: not 1 (the system refused a
+# read or write, or an unexpected error) or 2 (git, config, usage), so CI can
+# tell a failed check from a broken run.
+CHECK_FAILED = 3
+
+
+def _ago(date: str) -> str:
+    """`5 min ago` for a git iso-local date; '' when it cannot be read."""
+    try:
+        then = datetime.datetime.strptime(date[:25], "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return ""
+    secs = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    if secs < 0:
+        return "in the future"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "min")):
+        if secs >= size:
+            n = int(secs // size)
+            return f"{n} {unit}{'s' if n > 1 and unit != 'min' else ''} ago"
+    return "just now"
+
+
+def cmd_status(args) -> int:
+    root = args.root
+    print(f"project: {os.path.abspath(root)}")
+    watched = core_mod.watched_paths(root)
+    print(f"watching: {len(watched)} existing path(s) - "
+          + (", ".join(_short(p, root) for p in watched) or "none yet"))
+    hooks = core_mod.hooks_installed(CLAUDE_SETTINGS)
+    if hooks is None:
+        print(f"hooks: {CLAUDE_SETTINGS} cannot be read")
+    elif all(hooks.values()):
+        print("hooks: installed (SessionStart + PreCompact)")
+    else:
+        missing = " + ".join(e for e, ok in hooks.items() if not ok)
+        print(f"hooks: {missing} missing - `sessionsteward install-hooks "
+              f"--write` adds them")
+    if not core_mod.repo_ready():
+        print("snapshots: none - `sessionsteward init` starts")
+        return 0
+    snaps = core_mod.log(1_000_000, project_root=root)
+    if not snaps:
+        print("snapshots: none for this project - `sessionsteward snap` "
+              "takes one")
+        return 0
+    top = snaps[0]
+    ago = _ago(top["date"])
+    print(f"snapshots: {len(snaps)}, newest {top['sha'][:7]} "
+          f"{top['date'][:16]}{f' ({ago})' if ago else ''}  {top['message']}")
+    pos = core_mod.current_position(snaps[:50], root)
+    if pos == 0:
+        print(f"state: your files are snapshot {top['sha'][:7]} (nothing "
+              f"unsaved)")
+    elif pos is not None:
+        s = snaps[pos]
+        print(f"state: your files are snapshot {s['sha'][:7]} ({pos} "
+              f"back, after an undo or restore)  {s['message']}")
+    else:
+        changes = core_mod.changes_since(top["sha"], root)
+        if changes is None:
+            print("state: unsaved changes (a watched file cannot be read)")
+        else:
+            print(f"state: {len(changes)} unsaved change(s) since "
+                  f"{top['sha'][:7]}:")
+            for tag, path in changes[:STATUS_LIMIT]:
+                print(f"  {tag} {diet_mod.safe(_short(path, root))}")
+            if len(changes) > STATUS_LIMIT:
+                print(f"  ... {len(changes) - STATUS_LIMIT} more")
+            print("  `sessionsteward snap` saves them, `sessionsteward diff` "
+                  "shows snapshot changes, `sessionsteward undo` goes back")
+    if len(snaps) > 1 and pos == 0:
+        for line in core_mod.guard_lines(top["sha"], snaps[1]["sha"]):
+            print(line)
+    return 0
+
+
+STATUS_LIMIT = 50
+
+
+def _write_bytes(data: bytes) -> None:
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        sys.stdout.flush()
+        buf.write(data)
+        buf.flush()
+    else:   # a text-only stdout (captured in tests)
+        sys.stdout.write(data.decode("utf-8", "replace"))
+
+
+def cmd_show(args) -> int:
+    if not core_mod.repo_ready():
+        print("no snapshots yet", file=sys.stderr)
+        return 2
+    try:
+        sha, manifest = core_mod.resolve_snapshot(args.sha, args.root)
+    except (core_mod.NothingToRestoreError, core_mod.CrossProjectError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    files = core_mod.snapshot_files(sha, manifest)
+    if args.path is None:
+        for ap in sorted(files):
+            size = files[ap][1]
+            print(f"{size:>10,}  {diet_mod.safe(_short(ap, args.root))}")
+        print(f"{len(files)} file(s) in snapshot {sha[:7]} - "
+              f"`sessionsteward show {sha[:7]} <file>` prints one")
+        return 0
+    want = core_mod.lookup_path(args.path, args.root)
+    norm = {os.path.normcase(os.path.normpath(ap)): ap for ap in files}
+    hit = norm.get(os.path.normcase(want))
+    if hit is None:
+        # a unique case-insensitive match (Windows and macOS spellings)
+        folded = [ap for k, ap in norm.items()
+                  if k.casefold() == os.path.normcase(want).casefold()]
+        hit = folded[0] if len(folded) == 1 else None
+    if hit is None:
+        prefix = os.path.normcase(want).rstrip(os.sep) + os.sep
+        under = sorted(ap for k, ap in norm.items() if k.startswith(prefix))
+        if under:
+            for ap in under:
+                print(f"{files[ap][1]:>10,}  "
+                      f"{diet_mod.safe(_short(ap, args.root))}")
+            print(f"{len(under)} file(s) under {args.path} in snapshot "
+                  f"{sha[:7]}")
+            return 0
+        print(f"error: snapshot {sha[:7]} has no file {args.path} - "
+              f"`sessionsteward show {sha[:7]}` lists what it holds",
+              file=sys.stderr)
+        return 1
+    _write_bytes(core_mod.read_blob(files[hit][0]))
     return 0
 
 
@@ -507,7 +660,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "oldest; the report says when).")
     rs = sub.add_parser("restore", help="Restore a specific snapshot.")
     rs.add_argument("sha")
-    sub.add_parser("diet", help="Context-diet report.")
+    sub.add_parser("status", help="Where you are: newest snapshot, "
+                                  "unsaved changes, hooks.")
+    sh = sub.add_parser("show", help="Print one file from a snapshot (or "
+                                     "list the files it holds).")
+    sh.add_argument("sha")
+    sh.add_argument("path", nargs="?", default=None)
+    dt = sub.add_parser("diet", help="Context-diet report.")
+    dt.add_argument("--json", action="store_true",
+                    help="Print the report as JSON.")
+    dt.add_argument("--check", action="store_true",
+                    help="Exit 3 when there are warnings (CI, pre-commit).")
+    dt.add_argument("--budget", type=int, default=None, metavar="TOKENS",
+                    help="With or without --check: exit 3 when more than "
+                         "TOKENS (estimated) load at session start.")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")
     ih.add_argument("--write", action="store_true",
@@ -535,6 +701,7 @@ def main(argv=None) -> int:
         "init": cmd_init, "watch": cmd_watch, "snap": cmd_snap,
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
+        "status": cmd_status, "show": cmd_show,
         "install-hooks": cmd_install_hooks,
     }
     if args.cmd == "watch" and (args.add or args.remove):

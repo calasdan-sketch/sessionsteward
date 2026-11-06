@@ -2087,6 +2087,123 @@ def diff(sha1: str, sha2: str) -> str:
                 "files/")
 
 
+def changes_since(sha: str, project_root: str) -> list[tuple[str, str]] | None:
+    """What differs between the live watched files and snapshot sha, within
+    that snapshot's scope: [("modified" | "added" | "removed", abspath)],
+    sorted by path. [] when the files are the snapshot; None when a live file
+    cannot be read (nothing can be said)."""
+    manifest = _manifest_at(sha)
+    if not manifest:
+        return None
+    manifest = dict(manifest, files=_on_disk_files(
+        manifest, _norm_root(project_root)))
+    snap = snapshot_tree(sha, manifest)
+    live = live_tree(_scoped_paths(project_root, manifest), _blob_algo(snap))
+    if live is None:
+        return None
+    # compared as git records names (see _same_tree)
+    a = {_composed(p): (p, blob) for p, blob in live.items()}
+    b = {_composed(p): (p, blob) for p, blob in snap.items()}
+    if len(a) != len(live) or len(b) != len(snap):
+        a = {p: (p, blob) for p, blob in live.items()}
+        b = {p: (p, blob) for p, blob in snap.items()}
+    out = []
+    for k in sorted(set(a) | set(b)):
+        if k not in b:
+            out.append(("added", a[k][0]))
+        elif k not in a:
+            out.append(("removed", b[k][0]))
+        elif a[k][1] != b[k][1]:
+            out.append(("modified", a[k][0]))
+    return out
+
+
+_SHA_LIKE = re.compile(r"[0-9a-fA-F]{4,64}")
+
+
+def resolve_snapshot(sha: str, project_root: str | None = None) -> tuple[str, dict]:
+    """(full sha, manifest) of a snapshot given by a hex sha or prefix.
+    Raises NothingToRestoreError for anything that is not one (a revision
+    expression such as `HEAD~1` or `-x` is refused: it is not a snapshot id),
+    CrossProjectError when it belongs to another project than project_root."""
+    if not _SHA_LIKE.fullmatch(sha or ""):
+        raise NothingToRestoreError(f"no such snapshot: {sha!r} (give the "
+                                    f"sha `sessionsteward log` prints)")
+    p = _run_git(REPO_DIR, ("rev-parse", "--verify", "--quiet",
+                            f"{sha}^{{commit}}"))
+    full = p.stdout.decode("ascii", "replace").strip() if p.returncode == 0 else ""
+    manifest = _manifests_at([full], strict=True).get(full, {}) if full else {}
+    if not manifest:
+        raise NothingToRestoreError(f"no such snapshot: {sha[:12]}")
+    if project_root is not None:
+        want = _norm_root(project_root)
+        if _norm_root(manifest.get("project_root")) != want:
+            raise CrossProjectError(
+                f"snapshot {full[:7]} belongs to project "
+                f"{manifest.get('project_root')!r}, not {want!r}")
+    return full, manifest
+
+
+def snapshot_files(sha: str, manifest: dict) -> dict[str, tuple[str, int]]:
+    """{abspath: (blob id, size)} of every file snapshot sha holds."""
+    tree = snapshot_tree(sha, manifest)
+    if not tree:
+        return {}
+    sizes = {}
+    p = _run_git(REPO_DIR, ("cat-file", "--batch-check"),
+                 input="".join(f"{b}\n" for b in set(tree.values())).encode())
+    for line in p.stdout.decode("ascii", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2].isdigit():
+            sizes[parts[0]] = int(parts[2])
+    return {ap: (blob, sizes.get(blob, -1)) for ap, blob in tree.items()}
+
+
+def read_blob(blob: str) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", blob):
+        raise StewardError(f"not a blob id: {blob!r}")
+    p = _run_git(REPO_DIR, ("cat-file", "blob", blob))
+    if p.returncode != 0:
+        raise GitError(f"git cat-file failed for {blob[:7]}")
+    return p.stdout
+
+
+def lookup_path(text: str, project_root: str) -> str:
+    """A path as the user types it (`CLAUDE.md`, `.claude/rules/x.md`,
+    `~/.claude/CLAUDE.md`, absolute) as an absolute, normalised path."""
+    if text[:1] == "~" and (len(text) == 1 or text[1] in "/\\"):
+        p = os.path.expanduser("~" + text[1:].replace("\\", os.sep))
+    elif os.path.isabs(text):
+        p = text
+    else:
+        p = os.path.join(project_root, text)
+    return os.path.normpath(os.path.abspath(p))
+
+
+def hooks_installed(settings_path: str) -> dict[str, bool] | None:
+    """{event: whether sessionsteward's hook is in the settings file} for
+    PreCompact and SessionStart; None when the file cannot be read as
+    settings (missing counts as no hooks)."""
+    try:
+        with open(settings_path, "rb") as f:
+            raw = f.read(4 * 1024 * 1024)
+    except FileNotFoundError:
+        raw = None
+    except OSError:
+        return None
+    try:
+        settings = _parse_settings(raw, settings_path)
+    except SettingsError:
+        return None
+    hooks = settings.get("hooks")
+    out = {}
+    for event in _HOOK_ARGS:
+        entries = hooks.get(event) if isinstance(hooks, dict) else None
+        cmds = _hook_commands(entries) if isinstance(entries, list) else []
+        out[event] = any(_is_ours(event, c) for c in cmds)
+    return out
+
+
 def file_mtimes(paths: list[str]) -> dict[str, float]:
     mtimes = {}
     for fp in iter_files(paths):

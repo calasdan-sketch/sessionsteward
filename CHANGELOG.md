@@ -2,6 +2,30 @@
 
 ## 0.3.0 (unreleased)
 
+Round 4 (the first hour with the installed package)
+
+Fixed
+- `python -m build` failed: setuptools found `tests/`, `bench/` and the
+  package as three top-level packages and refused. `pyproject.toml` now
+  names the one package, so the wheel holds only `sessionsteward/` (and the
+  CI "package" job can pass). The sdist ships the tests and benchmark.
+- `undo --steps 0` and `--steps -3` quietly undid one step; `log --limit 0`
+  printed nothing. All three are now a plain error, exit 2.
+- `--root` pointing at a folder that does not exist was accepted and every
+  command then described an empty project; it is now an error, exit 2.
+- `diff <unknown sha>` printed git's own message; it now says "no such
+  snapshot" on stderr, exit 1.
+- The watch config was rewritten in place; it is now written beside and
+  swapped in, so a crash cannot leave half a file.
+
+Added
+- `log --json` and `status --json` (control characters are escaped).
+- Package metadata: author (Calas Automations Inc.), source, issues and
+  changelog links. A `MANIFEST.in`, a lint step (pyflakes rules) in CI.
+
+Behaviour change: `--steps 0`, a negative `--steps` or `--limit`, and a
+missing `--root` folder used to be accepted. Scripts relying on that break.
+
 Round 3 (hostile-input and fail-open fixes)
 
 Fixed

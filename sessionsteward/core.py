@@ -539,8 +539,17 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    # Write beside the file and swap it in, so a crash or a full disk
+    # mid-write cannot leave half a config (which every command then refuses).
+    tmp = f"{CONFIG_PATH}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def watch_list(cfg: dict | None = None) -> list[str]:

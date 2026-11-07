@@ -49,7 +49,6 @@ class TestOldPython(unittest.TestCase):
     def test_compiles_on_the_oldest_python_when_present(self):
         import shutil
         import subprocess
-        import sys
         exe = shutil.which("python3.10")
         if not exe:
             self.skipTest("python3.10 not installed")

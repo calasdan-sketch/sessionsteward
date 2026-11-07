@@ -178,6 +178,11 @@ git clone https://github.com/calasdan-sketch/sessionsteward && cd sessionsteward
 pip install .
 ```
 
+PyPI still holds the old 0.1.0, which lacks `status`, `lost`, `diet --lint`
+and everything after, so install from GitHub as above until 0.3.0 is
+released (checked 2026-11-07). Check what you got with
+`sessionsteward --version`.
+
 pip installs the `sessionsteward` command on every OS. Install it before
 running `install-hooks`: the hooks call the installed package with the
 interpreter you ran it from.
@@ -195,6 +200,7 @@ sessionsteward watch [--interval SECONDS]  # daemon: auto-snapshot on change (po
 
 sessionsteward status                      # newest snapshot, unsaved changes, hooks, guard
 sessionsteward log                         # list snapshots (this project only, local time)
+sessionsteward log --json                  # the same as JSON (also: status --json)
 sessionsteward diff                        # what changed (e.g. what compaction dropped)
 sessionsteward undo                        # step back one snapshot (--steps N for more)
 sessionsteward restore <sha>               # restore a specific snapshot

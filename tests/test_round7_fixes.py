@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unicodedata
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from unittest import mock
 
 try:   # pytest imports tests/ as a package, unittest discover as top-level
@@ -34,7 +34,7 @@ try:
     from .test_round5_fixes import Base, REPO_ROOT, plain_git, slurp, write
     from .test_round6_fixes import case_insensitive, listed
 except ImportError:
-    from test_round5_fixes import Base, REPO_ROOT, plain_git, slurp, write
+    from test_round5_fixes import Base, REPO_ROOT, slurp, write
     from test_round6_fixes import case_insensitive, listed
 
 

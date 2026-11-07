@@ -8,6 +8,7 @@ version = "0.3.0"
 description = "Undo for CLAUDE.md: git-snapshots your agent memory files and brings them back."
 readme = "README.md"
 requires-python = ">=3.10"
+authors = [{name = "Calas Automations Inc."}]
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["claude-code", "agents", "CLAUDE.md", "snapshots", "undo", "compaction"]
@@ -21,12 +22,19 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Version Control :: Git",
     "Topic :: Utilities",
 ]
 
 [project.urls]
 Homepage = "https://github.com/calasdan-sketch/sessionsteward"
+Source = "https://github.com/calasdan-sketch/sessionsteward"
+Issues = "https://github.com/calasdan-sketch/sessionsteward/issues"
+Changelog = "https://github.com/calasdan-sketch/sessionsteward/blob/main/CHANGELOG.md"
 
 [project.scripts]
 sessionsteward = "sessionsteward.cli:main"
+
+[tool.setuptools]
+packages = ["sessionsteward"]

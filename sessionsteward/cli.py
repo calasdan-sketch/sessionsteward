@@ -265,9 +265,21 @@ def cmd_precompact(args) -> int:
 
 def cmd_log(args) -> int:
     if not core_mod.repo_ready():
+        if args.json:
+            print("[]")
+            return 0
         print("no snapshots yet — run `sessionsteward init` first")
         return 0
     snaps = core_mod.log(args.limit + 1, project_root=args.root)
+    if args.json:
+        rows = []
+        for i, s in enumerate(snaps[:args.limit]):
+            guard = (core_mod.guard_lines(s["sha"], snaps[i + 1]["sha"])
+                     if i + 1 < len(snaps) else [])
+            rows.append({"sha": s["sha"], "date": s["date"],
+                         "message": s["message"], "guard": guard})
+        print(json.dumps(rows, indent=2, ensure_ascii=True))
+        return 0
     if not snaps:
         print(f"no snapshots yet for {os.path.abspath(args.root)} — "
               f"`sessionsteward snap` takes one")
@@ -325,6 +337,12 @@ def cmd_diff(args) -> int:
     if not sha1:
         print("only one snapshot — nothing to diff")
         return 0
+    try:
+        sha1 = core_mod.resolve_snapshot(sha1)[0]
+        sha2 = core_mod.resolve_snapshot(sha2)[0]
+    except core_mod.NothingToRestoreError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     out = core_mod.diff(sha1, sha2)
     kept = _changed_lines(out)
     if not kept:
@@ -503,8 +521,40 @@ def _ago(date: str) -> str:
     return "just now"
 
 
+def _status_json(root: str) -> dict:
+    """The facts `status` prints, as data (for scripts and CI)."""
+    hooks = core_mod.hooks_installed(CLAUDE_SETTINGS)
+    data = {"project": os.path.abspath(root),
+            "watching": core_mod.watched_paths(root),
+            "hooks": hooks, "snapshots": 0, "newest": None,
+            "state": "no-snapshots", "unsaved": []}
+    if not core_mod.repo_ready():
+        return data
+    snaps = core_mod.log(1_000_000, project_root=root)
+    if not snaps:
+        return data
+    data["snapshots"] = len(snaps)
+    data["newest"] = {"sha": snaps[0]["sha"], "date": snaps[0]["date"],
+                      "message": snaps[0]["message"]}
+    pos = core_mod.current_position(snaps[:50], root)
+    if pos is not None:
+        data["state"] = "saved" if pos == 0 else "behind-newest"
+        data["steps_back"] = pos
+        return data
+    changes = core_mod.changes_since(snaps[0]["sha"], root)
+    if changes is None:
+        data["state"] = "unreadable"
+    else:
+        data["state"] = "unsaved"
+        data["unsaved"] = [{"change": k, "path": p} for k, p in changes]
+    return data
+
+
 def cmd_status(args) -> int:
     root = args.root
+    if args.json:
+        print(json.dumps(_status_json(root), indent=2, ensure_ascii=True))
+        return 0
     print(f"project: {os.path.abspath(root)}")
     watched = core_mod.watched_paths(root)
     print(f"watching: {len(watched)} existing path(s) - "
@@ -706,6 +756,28 @@ def _poll_interval(text) -> float:
     return value
 
 
+def _positive_int(text: str) -> int:
+    """argparse type: a whole number of 1 or more (0 and negatives used to
+    be silently turned into 1, so `undo --steps 0` still undid a step)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a whole number") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+def _existing_dir(text: str) -> str:
+    """argparse type for --root: a typo used to be accepted and every
+    command then reported an empty project."""
+    if not os.path.isdir(text):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a folder that exists")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     # RawDescription: the docstring is a paragraph plus a list of examples,
     # one per line - the default formatter folds it into a single block.
@@ -714,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {__version__}")
-    p.add_argument("--root", default=os.getcwd(),
+    p.add_argument("--root", type=_existing_dir, default=os.getcwd(),
                    help="Project root for relative watch paths.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -734,7 +806,9 @@ def build_parser() -> argparse.ArgumentParser:
     sn.add_argument("-m", "--message", default=None)
     sub.add_parser("precompact", help="Snapshot before compaction.")
     lg = sub.add_parser("log", help="List snapshots.")
-    lg.add_argument("--limit", type=int, default=20)
+    lg.add_argument("--limit", type=_positive_int, default=20)
+    lg.add_argument("--json", action="store_true",
+                    help="machine-readable list (sha, date, message, guard)")
     df = sub.add_parser("diff", help="Diff two snapshots (default: the "
                                      "previous one against the newest).")
     df.add_argument("sha1", nargs="?")
@@ -742,15 +816,17 @@ def build_parser() -> argparse.ArgumentParser:
     un = sub.add_parser("undo", help="Restore the previous snapshot.")
     un.add_argument("--dry-run", action="store_true",
                     help="say what would change; touch nothing")
-    un.add_argument("--steps", type=int, default=1,
+    un.add_argument("--steps", type=_positive_int, default=1,
                     help="How many snapshots to step back (clamped to the "
                          "oldest; the report says when).")
     rs = sub.add_parser("restore", help="Restore a specific snapshot.")
     rs.add_argument("sha")
     rs.add_argument("--dry-run", action="store_true",
                     help="say what would change; touch nothing")
-    sub.add_parser("status", help="Where you are: newest snapshot, "
-                                  "unsaved changes, hooks.")
+    st = sub.add_parser("status", help="Where you are: newest snapshot, "
+                                       "unsaved changes, hooks.")
+    st.add_argument("--json", action="store_true",
+                    help="machine-readable (project, hooks, newest, state)")
     sh = sub.add_parser("show", help="Print one file from a snapshot (or "
                                      "list the files it holds).")
     sh.add_argument("sha")

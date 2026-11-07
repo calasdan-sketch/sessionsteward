@@ -486,7 +486,7 @@ def load_config() -> dict:
     if not isinstance(cfg, dict):
         raise StewardError(f"watch config {CONFIG_PATH} must be a JSON "
                            f"object (it was left as is)")
-    for key in ("watch", "unwatch"):
+    for key in ("watch", "unwatch", "pins"):
         value = cfg.get(key)
         if value is None:
             cfg.pop(key, None)   # null is the same as not set
@@ -494,8 +494,9 @@ def load_config() -> dict:
                   and all(isinstance(item, str) for item in value)):
             raise StewardError(
                 f'watch config {CONFIG_PATH}: "{key}" must be a list of '
-                f'paths such as ["NOTES.md"]; fix it or delete it (it was '
-                f'left as is)')
+                f'{"lines of text" if key == "pins" else "paths"} such as '
+                f'{"[\"never force-push\"]" if key == "pins" else "[\"NOTES.md\"]"}'
+                f'; fix it or delete it (it was left as is)')
     return cfg
 
 

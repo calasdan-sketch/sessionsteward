@@ -10,6 +10,8 @@ sessionsteward init                      # one-time: snapshots repo + first snap
 sessionsteward install-hooks --write     # snapshot on every Claude Code session start and before compaction
 sessionsteward undo                      # the agent clobbered CLAUDE.md? back it comes
 sessionsteward status                    # where am I? unsaved changes, hooks, shrink guard
+sessionsteward lost                      # what did compaction really drop? (not "what moved")
+sessionsteward diet --lint               # repeated, contradicting and dead lines, with their token cost
 ```
 
 Coding agents silently degrade: compaction drops constraints, and one
@@ -46,6 +48,15 @@ does not say):
 | Warns when a memory file shrinks by half or vanishes | yes | not stated | not stated | not stated | not stated |
 | Needs | Python 3.10+ and git | built in | Node.js / npm | an MCP server | git + inotify-tools or fswatch |
 
+Memory stores such as [claude-mem](https://www.npmjs.com/package/claude-mem)
+("persistent memory for AI coding agents", per its npm page),
+[mem0](https://pypi.org/project/mem0ai/) ("long-term memory for AI Agents")
+and [basic-memory](https://pypi.org/project/basic-memory/) ("local-first
+knowledge management") keep and retrieve what an agent learned; they are not
+undo for the instruction files you wrote, and they add context rather than
+count it (descriptions read from the package registries on 2026-11-07; not
+installed or run here).
+
 For the context report, [cclint](https://pkg.go.dev/github.com/pthm/cclint)
 and [claude-config-auditor](https://pypi.org/project/claude-config-auditor/)
 lint Claude Code configs and estimate token cost (the auditor has a CI
@@ -55,10 +66,75 @@ session start by the rules in Claude Code's
 MEMORY.md's 200-line cut, `paths:` rules) and points out imported files that
 have no undo.
 
+### What 0.3.0 adds, and the numbers
+
+`diff` shows every changed line, so a compaction that re-orders and rewords
+looks like a wall of changes. `lost` compares *instructions* and shows only
+what is gone (illustrative output):
+
+```
+$ sessionsteward lost
+lost: snapshot 3f2a9c1 -> b81d0e4
+2 dropped (~31 tokens), 1 reworded, 1 reversed, 4 moved to another file, 38 kept, 0 new
+
+DROPPED (in the older version, nowhere in the newer):
+  - CLAUDE.md:14  - Never run migrations against the production database
+REVERSED (the rule now says the opposite):
+  - CLAUDE.md:22  - Always use the staging database for experiments
+    -> - Never use the staging database for experiments
+```
+
+| new | what it does |
+|---|---|
+| `lost [sha1 [sha2]] [--live] [--check]` | dropped / reworded / reversed / moved instructions between two snapshots, or a snapshot and your files now; `--check` exits 3 for CI and hooks |
+| `pin "rule"` / `pin --check` | name rules you cannot afford to lose; `snap`, `precompact` and `status` say when a pinned line is gone |
+| `diet --lint` | lines repeated in a file, lines that say the same thing in other words (templated lines grouped), do-vs-do-not on one topic, `` `paths` `` that do not exist, each with the tokens it costs |
+| `diet --fix [--write]` | removes repeated lines and extra blank lines; previews by default, `--write` snapshots first so `undo` reverts it; CRLF and file modes kept; never touches a link, an unwatched file or a file that changed meanwhile |
+| `diet --history [N]` | session-start tokens at each of the last N snapshots, with the jump marked: *when* did CLAUDE.md grow |
+| `scan` and a `snap` warning | secret-shaped values (provider key prefixes, private-key headers, `password = <random>`) in watched files or a snapshot; only the first four characters are ever printed |
+| `show <sha> <file> --redact` | print a snapshot file with secrets replaced |
+
+Lines that `lost`, `diet --lint` and `pin` quote from a memory file go
+through the secret redactor, and the text output also through the
+control-character filter; `--json` is ASCII-escaped.
+
+**Benchmark** (`python bench/run.py`, offline, no model, no network, 20
+seeded synthetic corpora; token counts are characters / 4; the numbers
+describe this corpus, not your files):
+
+| | result |
+|---|---|
+| same line twice in a file | recall 100%, precision 100% |
+| near-duplicate (filler word, case, plural) | recall 99%, precision 98% |
+| partial synonym swap | recall 48% (word overlap only: a full rewrite is not found) |
+| do vs. do-not on one topic | recall 100%, precision 88% |
+| path that does not exist | recall 100%, precision 100% (0 false alarms on existing paths) |
+| secret-shaped value | recall 100%, precision 100% (0 false alarms on hashes, uuids, prose) |
+| `diet --fix` | 6.1% fewer session-start tokens (70,356 -> 66,046), 0 distinct instructions lost; `--lint` sees 12.5% in reach by hand |
+| `lost` after a simulated compaction (drop 10%, reword 10%, move 5%, shuffle) | 320 true losses: recall 98%, precision 100%; you read 638 lines where a line diff shows 2,863 removed lines; 99% of rewordings paired, 100% of moves recognised |
+| speed, 3,433 lines in 12 files | `diet --lint` 0.9 s, `lost` 0.05 s, `scan` 0.06 s |
+
+On the first corpus of that benchmark (12 repeated lines, 12 near-duplicates,
+8 contradictions, 8 dead paths, 7 secrets) claude-config-auditor 0.1.0, run
+in its default offline mode, reported "No issues found"; it is a budget and
+structure linter, so that is not a defect in it, only a difference in what
+it looks for. On a separate 41-file synthetic project its tiktoken count was
+49,308 tokens against `diet`'s 49,837 (characters / 4) - one data point, not
+a general claim about the estimate.
+
 **Honest limits.** sessionsteward is not a replacement for git in your
 project: it only versions the memory files it watches. It polls (`watch`) or
 runs from hooks; it is not a file-system event watcher. Token numbers are
-estimates (characters / 4), not a tokenizer's.
+estimates (characters / 4), not a tokenizer's. `lost`, `--lint` and `scan`
+compare words and shapes, not meaning: a rule rewritten in different words is
+reported as dropped (and the new wording as new), a contradiction that does
+not flip "do" to "do not" ("prefer tabs" against "prefer spaces") is not
+found, and a secret in a shape the scanner does not know is not found. They
+point at lines for you to read; none of them is a verdict. Nothing here
+measures whether an agent follows a shorter file better - the benchmark counts
+tokens and lines only, and makes no claim about model behaviour. A secret that
+was ever snapshotted stays in the snapshots repo's history after you delete
+the line; `scan` warns, it cannot rewrite history.
 
 ## Install
 
@@ -98,6 +174,13 @@ sessionsteward undo                        # step back one snapshot (--steps N f
 sessionsteward restore <sha>               # restore a specific snapshot
 sessionsteward show <sha>                  # list the files a snapshot holds
 sessionsteward show <sha> CLAUDE.md > old.md  # get one file back, touch nothing else
+sessionsteward lost [--live] [--check]     # what really disappeared: dropped / reworded / reversed / moved
+sessionsteward pin "Never force-push"      # watch a rule; --check, --remove
+sessionsteward scan [--sha SHA]            # secret-shaped values in watched files or a snapshot
+sessionsteward diet --lint                 # repeated, near-identical, contradicting, dead lines
+sessionsteward diet --fix [--write]        # preview / apply removing repeats (snapshot first)
+sessionsteward diet --history [N]          # session-start tokens over the last N snapshots
+sessionsteward show <sha> CLAUDE.md --redact  # a snapshot file without its secrets
 sessionsteward diet                        # what's eating the context window
 sessionsteward diet --check [--budget N]   # exit 3 on warnings / over N tokens (CI, pre-commit)
 sessionsteward diet --json                 # the same report, machine-readable

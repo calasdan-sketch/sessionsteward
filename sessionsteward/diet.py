@@ -39,6 +39,7 @@ import os
 import re
 
 from . import core as core_mod
+from . import secrets as secrets_mod
 
 MIN_LINE_LEN = 40  # ignore short lines when hunting duplicates
 
@@ -474,7 +475,7 @@ def analyze(project_root: str, top_dupes: int = 10) -> dict:
                  f"... and {len(names) - MAX_MISSING_PER_FILE} more missing "
                  f"imports")
 
-    dupes = [{"line": ln[:100], "files": sorted(owners), "count": len(owners)}
+    dupes = [{"line": secrets_mod.redact_line(ln[:100]), "files": sorted(owners), "count": len(owners)}
              for ln, owners in line_owners.items() if len(owners) > 1]
     dupes.sort(key=lambda d: (-d["count"], -len(d["line"])))
     per_file.sort(key=lambda f: -f["chars"])

@@ -20,7 +20,11 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
   sessionsteward restore <sha>         # restore a specific snapshot
   sessionsteward status                # newest snapshot, unsaved changes, hooks
   sessionsteward show <sha> CLAUDE.md  # print one file from a snapshot
+  sessionsteward lost [--live]         # what compaction really dropped (not what moved)
+  sessionsteward pin "rule"            # watch a rule you cannot lose
+  sessionsteward scan                  # secret-shaped values in watched files
   sessionsteward diet                  # what's eating the context window
+  sessionsteward diet --lint / --fix / --history
   sessionsteward diet --check          # exit 3 on warnings (CI / pre-commit)
   sessionsteward install-hooks [--write]  # Claude Code hooks JSON
   sessionsteward watch                 # daemon: auto-snapshot on change
@@ -41,6 +45,7 @@ import time
 from . import __version__
 from . import core as core_mod
 from . import diet as diet_mod
+from . import extras as extras_mod
 
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
@@ -216,6 +221,9 @@ def _guard(root: str, sha: str) -> None:
     if len(snaps) == 2 and snaps[0]["sha"] == sha:
         for line in core_mod.guard_lines(sha, snaps[1]["sha"]):
             print(line)
+    for line in extras_mod.pin_lines(root):
+        print(line)
+    extras_mod.snap_secret_warning(root)
 
 
 def cmd_snap(args) -> int:
@@ -391,15 +399,29 @@ def cmd_diet(args) -> int:
     if args.budget is not None and args.budget < 0:
         raise core_mod.StewardError("--budget must be a number of tokens, "
                                     "0 or more")
+    if args.history is not None:
+        return extras_mod.cmd_history(args)
     report = diet_mod.analyze(args.root)
+    if args.fix:
+        return extras_mod.cmd_fix(args, report)
+    if args.lint:
+        report["lint"] = extras_mod.lint_section(report, args.root)
     if args.json:
         # ensure_ascii: a C1 control character in a path or line comes out
         # as \u0085, never raw
         print(json.dumps(report, indent=2, ensure_ascii=True))
     else:
         print(diet_mod.render(report, args.root))
+        if args.lint:
+            print(extras_mod.dietlint.render(
+                report["lint"], lambda p: _short(p, args.root),
+                extras_mod.redact))
     if args.check or args.budget is not None:
         found = diet_mod.problems(report, args.budget, args.root)
+        if args.lint:
+            found += [diet_mod.safe(extras_mod.redact(x)) for x in
+                      extras_mod.dietlint.problems(
+                          report["lint"], lambda p: _short(p, args.root))]
         for line in found:
             print(f"check: {line}", file=sys.stderr)
         if found:
@@ -482,6 +504,14 @@ def cmd_status(args) -> int:
     if len(snaps) > 1 and pos == 0:
         for line in core_mod.guard_lines(top["sha"], snaps[1]["sha"]):
             print(line)
+    pins = core_mod.load_config().get("pins") or []
+    if pins:
+        gone = extras_mod.pin_lines(root)
+        print(f"pins: {len(pins)} pinned line(s), "
+              f"{len(gone)} missing" if gone else
+              f"pins: {len(pins)} pinned line(s), all present")
+        for line in gone:
+            print(line)
     return 0
 
 
@@ -537,7 +567,12 @@ def cmd_show(args) -> int:
               f"`sessionsteward show {sha[:7]}` lists what it holds",
               file=sys.stderr)
         return 1
-    _write_bytes(core_mod.read_blob(files[hit][0]))
+    data = core_mod.read_blob(files[hit][0])
+    if getattr(args, "redact", False):
+        text, _ = extras_mod.secrets_mod.redact_text(
+            data.decode("utf-8", "replace"))
+        data = text.encode("utf-8")
+    _write_bytes(data)
     return 0
 
 
@@ -666,6 +701,9 @@ def build_parser() -> argparse.ArgumentParser:
                                      "list the files it holds).")
     sh.add_argument("sha")
     sh.add_argument("path", nargs="?", default=None)
+    sh.add_argument("--redact", action="store_true",
+                    help="Print the file with secret-looking values "
+                         "replaced by [REDACTED:kind].")
     dt = sub.add_parser("diet", help="Context-diet report.")
     dt.add_argument("--json", action="store_true",
                     help="Print the report as JSON.")
@@ -674,6 +712,46 @@ def build_parser() -> argparse.ArgumentParser:
     dt.add_argument("--budget", type=int, default=None, metavar="TOKENS",
                     help="With or without --check: exit 3 when more than "
                          "TOKENS (estimated) load at session start.")
+    dt.add_argument("--lint", action="store_true",
+                    help="Also find repeated, near-identical, contradicting "
+                         "and dead (missing path) lines, with the tokens "
+                         "they cost. With --check they fail the check.")
+    dt.add_argument("--fix", action="store_true",
+                    help="Preview removing lines repeated inside a file and "
+                         "extra blank lines (changes nothing).")
+    dt.add_argument("--write", action="store_true",
+                    help="With --fix: do it (a snapshot is taken first, so "
+                         "undo reverts it).")
+    dt.add_argument("--history", nargs="?", type=int, const=10, default=None,
+                    metavar="N", help="Session-start token cost of the last "
+                                      "N snapshots (default 10), to see when "
+                                      "it grew.")
+    lo = sub.add_parser("lost", help="What did compaction (or an agent) "
+                                     "drop? Compares instructions, not "
+                                     "lines: reordering is not a loss.")
+    lo.add_argument("sha1", nargs="?", help="older snapshot (default: the "
+                                            "one before the newest)")
+    lo.add_argument("sha2", nargs="?", default=None,
+                    help="newer snapshot (default: the newest)")
+    lo.add_argument("--live", action="store_true",
+                    help="Compare a snapshot (default: the newest) with "
+                         "your files as they are now.")
+    lo.add_argument("--json", action="store_true")
+    lo.add_argument("--check", action="store_true",
+                    help="Exit 3 when something was dropped.")
+    sc = sub.add_parser("scan", help="Look for secrets in the watched "
+                                     "files (or in a snapshot).")
+    sc.add_argument("--sha", default=None, help="scan this snapshot instead")
+    sc.add_argument("--json", action="store_true")
+    pn = sub.add_parser("pin", help="Keep a watch on a rule you cannot "
+                                    "afford to lose.")
+    pn.add_argument("text", nargs="?", default=None,
+                    help="the rule, as it appears in your memory files")
+    pn.add_argument("--remove", action="store_true",
+                    help="Unpin TEXT.")
+    pn.add_argument("--check", action="store_true",
+                    help="Exit 3 when a pinned line is no longer in any "
+                         "watched file.")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")
     ih.add_argument("--write", action="store_true",
@@ -702,6 +780,8 @@ def main(argv=None) -> int:
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
         "status": cmd_status, "show": cmd_show,
+        "lost": extras_mod.cmd_lost, "scan": extras_mod.cmd_scan,
+        "pin": extras_mod.cmd_pin,
         "install-hooks": cmd_install_hooks,
     }
     if args.cmd == "watch" and (args.add or args.remove):
@@ -710,7 +790,9 @@ def main(argv=None) -> int:
     # cannot interleave with a hook's snap. `watch` (the daemon) locks only
     # around each snapshot it takes; read-only commands never wait.
     writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
-        or (args.cmd == "watch" and (args.add or args.remove))
+        or (args.cmd == "watch" and (args.add or args.remove)) \
+        or (args.cmd == "pin" and args.text) \
+        or (args.cmd == "diet" and args.fix and args.write)
     try:
         if args.cmd == "watch":
             args.interval = _poll_interval(args.interval)

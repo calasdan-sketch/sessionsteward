@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+Added
+- `sessionsteward lost [sha1 [sha2]] [--live] [--json] [--check]`: what
+  compaction or an agent edit really dropped. Compares instructions, not
+  lines (list markers, case, emphasis ignored): kept, moved to another file,
+  reworded (paired with the new wording), reversed (a "do" that became a "do
+  not"), dropped (with the tokens it cost).
+- `sessionsteward pin "<rule>"`, `pin --check`, `pin --remove`: `snap`,
+  `precompact` and `status` report a pinned line that no watched file holds.
+- `diet --lint`: lines repeated inside a file, near-duplicate lines (grouped),
+  do-versus-do-not on one topic, and backticked paths that do not exist, each
+  with its token cost; with `--check` they fail the check.
+- `diet --fix` (preview) and `diet --fix --write`: remove repeated lines and
+  extra blank lines. Takes a snapshot first and another after, keeps CRLF and
+  file modes, writes through a temporary file, skips links, unwatched files
+  and files that changed since they were read.
+- `diet --history [N]`: session-start token cost at each snapshot, jumps marked.
+- `sessionsteward scan [--sha SHA]` and a one-line `snap`/`precompact`
+  warning when a watched file holds a secret-shaped value (provider key
+  prefixes, private-key headers, `password = <random value>`); previews are
+  four characters. `show <sha> <file> --redact`.
+- `bench/`: an offline, seeded benchmark (`python bench/run.py [--check]`);
+  `tests/test_expert2.py` runs it with floors on each headline number.
+
+Changed
+- `diet` no longer prints a secret-shaped value in the duplicate list.
+- config.json may hold `"pins"` (a list of lines); a bad value is a one-line
+  error like the other keys.
+
+Not changed: every existing command, exit code and output line.
+
 ## 0.2.0 (unreleased)
 
 Added

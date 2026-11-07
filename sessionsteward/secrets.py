@@ -35,17 +35,25 @@ _PATTERNS = [
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("private-key", re.compile(
         r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}")),
+    ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{34,}\b")),
+    ("sendgrid-key", re.compile(r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}")),
+    ("google-oauth-token", re.compile(r"\bya29\.[A-Za-z0-9_\-]{20,}")),
     ("jwt", re.compile(
         r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
     ("url-credentials", re.compile(
         r"\b[a-z][a-z0-9+.\-]{1,15}://[^\s:/@]{1,64}:[^\s:/@]{3,}@[^\s/]+")),
 ]
-# NAME = value, where NAME says it is a secret and value looks random.
+# NAME = value, where NAME says it is a secret and value looks random. The
+# keyword is found first and the text around it is bounded: a pattern that
+# began with an open-ended `[\w.\-]*` took quadratic time on one long line
+# of `a.a.a.a.` (47 s for 20,000 characters).
 _ASSIGN = re.compile(
     r"""(?ix)
-    \b[\w.\-]*(?:api[_\-]?key|secret|token|passwd|password|credential)[\w.\-]*
-    \s*[:=]\s*
-    ["']?([A-Za-z0-9_\-+/=.!@#$%^&*]{12,})["']?""")
+    (?:api[_\-]?key|secret|token|passwd|password|credential)[\w.\-]{0,40}
+    \s{0,8}[:=]\s{0,8}
+    ["']?([A-Za-z0-9_\-+/=.!@\#$%^&*]{12,4000})["']?""")
 
 # Values that are placeholders, not secrets.
 _PLACEHOLDER = re.compile(
@@ -81,8 +89,28 @@ def _random_looking(value: str) -> bool:
     return classes >= 2 and _entropy(value) >= 3.2
 
 
+CHUNK = 4000        # a line is scanned in pieces this long ...
+OVERLAP = 300       # ... that share this much, so no token is cut in two
+
+
 def scan_line(line: str) -> list[tuple[str, int, int]]:
-    """(kind, start, end) of every secret-looking span in one line."""
+    """(kind, start, end) of every secret-looking span in one line. A very
+    long line (a minified JSON file) is scanned in overlapping pieces: the
+    whole line is covered, in time linear in its length."""
+    if len(line) <= CHUNK + OVERLAP:
+        return _scan_piece(line)
+    spans: list[tuple[str, int, int]] = []
+    seen = set()
+    for off in range(0, len(line), CHUNK):
+        for kind, a, b in _scan_piece(line[off:off + CHUNK + OVERLAP]):
+            sp = (kind, a + off, b + off)
+            if sp[1:] not in seen:
+                seen.add(sp[1:])
+                spans.append(sp)
+    return _drop_nested(spans)
+
+
+def _scan_piece(line: str) -> list[tuple[str, int, int]]:
     spans: list[tuple[str, int, int]] = []
     for kind, pat in _PATTERNS:
         for m in pat.finditer(line):
@@ -90,6 +118,10 @@ def scan_line(line: str) -> list[tuple[str, int, int]]:
     for m in _ASSIGN.finditer(line):
         if _random_looking(m.group(1)):
             spans.append(("secret-assignment", m.start(1), m.end(1)))
+    return _drop_nested(spans)
+
+
+def _drop_nested(spans):
     # drop spans inside another (a key seen by two patterns is one finding)
     spans.sort(key=lambda s: (s[1], -(s[2] - s[1])))
     out: list[tuple[str, int, int]] = []
@@ -103,8 +135,6 @@ def scan_line(line: str) -> list[tuple[str, int, int]]:
 def scan_text(text: str) -> list[Finding]:
     found = []
     for no, line in enumerate(text.split("\n"), 1):
-        if len(line) > 20000:
-            line = line[:20000]
         for kind, a, b in scan_line(line):
             found.append(Finding(kind, no, a, b, line[a:a + 4] + "..."))
     return found
@@ -115,7 +145,7 @@ def redact_text(text: str) -> tuple[str, int]:
     n = 0
     out = []
     for line in text.split("\n"):
-        spans = scan_line(line[:20000]) if line else []
+        spans = scan_line(line) if line else []
         if spans:
             for kind, a, b in reversed(spans):
                 line = line[:a] + f"[REDACTED:{kind}]" + line[b:]

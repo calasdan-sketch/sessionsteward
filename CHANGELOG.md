@@ -2,6 +2,43 @@
 
 ## 0.3.0 (unreleased)
 
+Round 3 (hostile-input and fail-open fixes)
+
+Fixed
+- Python 3.10 and 3.11 could not import the package: an f-string in
+  `core.py` held a backslash in its braces (a SyntaxError before 3.12).
+  A test now checks every source file for it.
+- The secret scanner took quadratic time on one long line: 20,000
+  characters of `a.a.a.` cost 47 s, and it ran on every `snap`, so a cloned
+  repo's CLAUDE.md could stall every SessionStart hook for minutes. The
+  assignment pattern is linear now and long lines are scanned in overlapping
+  pieces.
+- A secret more than 20,000 characters into a line was neither found by
+  `scan` nor removed by `show --redact` (the rest of the line was printed
+  unredacted).
+- `lost`, `scan` (and `snap`'s warning) skipped files over 1 MiB, UTF-16
+  files and binary files without saying so, then reported "nothing lost" or
+  "no secrets". They now list what they did not compare, UTF-16 with a BOM
+  is read, the size limit is 4 MiB (what Claude Code loads), and
+  `lost --check` exits 3 while a file is unreadable. JSON keeps its shape
+  (`lost --json` gains `not_compared`).
+- A link inside `.claude/` to a huge folder was copied on every snapshot
+  (3 GB, two-minute timeout). A snapshot now refuses past 20,000 files or
+  256 MB (env vars lift or change it); reading commands are unaffected.
+- A snapshot message or file name with an escape sequence or a bidirectional
+  control reached the terminal raw through `log`, `status`, `undo` and the
+  guard lines; `safe()` now also covers bidi controls.
+- `diet --lint` silently analysed only the first 20,000 lines; it says so now.
+
+Added
+- `undo --dry-run`, `restore <sha> --dry-run`: list what would be rewritten,
+  recreated or moved to the trash; takes no snapshot, changes nothing.
+- `prune [--keep N] [--write]`: forget old snapshots and delete their
+  objects (see README, "Forgetting history").
+- Secret shapes: npm, GitLab, Hugging Face, SendGrid and Google OAuth tokens
+  (shape only; lengths are the common ones, not a spec check).
+- `bench/`: worst-case scan line and a far-token recall check.
+
 Added
 - `sessionsteward lost [sha1 [sha2]] [--live] [--json] [--check]`: what
   compaction or an agent edit really dropped. Compares instructions, not
@@ -30,7 +67,7 @@ Changed
 - config.json may hold `"pins"` (a list of lines); a bad value is a one-line
   error like the other keys.
 
-Not changed: every existing command, exit code and output line.
+Not changed: every existing command and exit code, except `lost --check` (3 when a file could not be compared) and a refused oversized snapshot (2).
 
 ## 0.2.0 (unreleased)
 

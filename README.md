@@ -112,7 +112,8 @@ describe this corpus, not your files):
 | secret-shaped value | recall 100%, precision 100% (0 false alarms on hashes, uuids, prose) |
 | `diet --fix` | 6.1% fewer session-start tokens (70,356 -> 66,046), 0 distinct instructions lost; `--lint` sees 12.5% in reach by hand |
 | `lost` after a simulated compaction (drop 10%, reword 10%, move 5%, shuffle) | 320 true losses: recall 98%, precision 100%; you read 638 lines where a line diff shows 2,863 removed lines; 99% of rewordings paired, 100% of moves recognised |
-| speed, 3,433 lines in 12 files | `diet --lint` 0.9 s, `lost` 0.05 s, `scan` 0.06 s |
+| speed, 3,433 lines in 12 files | `diet --lint` 1-5 s (it varies with machine load), `lost` about 0.2 s, `scan` about 0.2 s |
+| hostile input: one 200,000-character line of `a.a.a.`; a token 200,000 characters into one line | `scan` 0.1 s; the token is found (before 0.3.0's last fix the scanner took 47 s for a tenth of that line) |
 
 On the first corpus of that benchmark (12 repeated lines, 12 near-duplicates,
 8 contradictions, 8 dead paths, 7 secrets) claude-config-auditor 0.1.0, run
@@ -121,6 +122,31 @@ structure linter, so that is not a defect in it, only a difference in what
 it looks for. On a separate 41-file synthetic project its tiktoken count was
 49,308 tokens against `diet`'s 49,837 (characters / 4) - one data point, not
 a general claim about the estimate.
+
+**What a report did not look at.** `lost`, `scan` and `diet --lint` used to
+say "nothing lost" / "no secrets" for a memory file they had silently skipped
+(over 4 MiB, or not text). They now list such files under `NOT COMPARED` /
+`NOT SCANNED`, and `lost --check` fails (exit 3) while one exists, because it
+cannot vouch for it. A UTF-16 file with a byte-order mark (what PowerShell 5's
+`>` writes) is read, not skipped. `diet --lint` says when a file set is bigger
+than the 20,000 lines it analyses for near-duplicates.
+
+**Snapshot size guard.** Links to folders inside a watched folder are
+followed, so a `.claude/foo` linked to a huge directory used to copy gigabytes
+on every SessionStart (a 3 GB test hit the two-minute timeout). A snapshot now
+refuses (`error:`, exit 2, nothing copied) past 20,000 files or 256 MB
+(`SESSIONSTEWARD_MAX_SNAPSHOT_FILES`, `SESSIONSTEWARD_MAX_SNAPSHOT_MB`; 0 lifts
+a limit). Only taking a snapshot is refused: `log`, `status`, `lost`, `show`
+and `undo --dry-run` keep working. `undo`/`restore` of an unsaved state take a
+`pre-undo` snapshot first, so they too stop with that error until you remove
+the link or raise a limit; nothing is changed when they do.
+
+**Forgetting history.** `prune --keep N` rewrites the snapshots repo as a new
+history of the newest N snapshots of every project (same files, messages and
+times), expires the reflog and deletes the old objects, so a secret that was
+only in a forgotten snapshot is gone from disk. It previews unless `--write`,
+cannot be undone, and keeps a snapshot whose manifest it cannot read. It does
+not touch your watched files.
 
 **Honest limits.** sessionsteward is not a replacement for git in your
 project: it only versions the memory files it watches. It polls (`watch`) or
@@ -180,6 +206,8 @@ sessionsteward scan [--sha SHA]            # secret-shaped values in watched fil
 sessionsteward diet --lint                 # repeated, near-identical, contradicting, dead lines
 sessionsteward diet --fix [--write]        # preview / apply removing repeats (snapshot first)
 sessionsteward diet --history [N]          # session-start tokens over the last N snapshots
+sessionsteward undo --dry-run              # what would change, touching nothing (also: restore <sha> --dry-run)
+sessionsteward prune [--keep N] [--write]  # forget old snapshots (keeps the newest N per project; preview unless --write)
 sessionsteward show <sha> CLAUDE.md --redact  # a snapshot file without its secrets
 sessionsteward diet                        # what's eating the context window
 sessionsteward diet --check [--budget N]   # exit 3 on warnings / over N tokens (CI, pre-commit)

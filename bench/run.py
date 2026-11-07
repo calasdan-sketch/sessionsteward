@@ -239,8 +239,18 @@ def speed():
         extras.find_secrets(extras.live_texts(root, everything=True))
         t4 = time.perf_counter()
         n = sum(len(t.split("\n")) for t in texts.values())
+        # the worst case for the secret scanner: one very long line of
+        # `a.a.a.` (the pre-0.3.1 pattern needed 47 s for a tenth of it),
+        # then a token at its far end
+        from sessionsteward import secrets
+        token = "np" + "m_" + "aB3d" * 9
+        t5 = time.perf_counter()
+        secrets.scan_line("a." * 100000)
+        t6 = time.perf_counter()
+        far = len(secrets.scan_text("x " * 100000 + token))
         return {"lines": n, "diet_s": t1 - t0, "lint_s": t2 - t1,
-                "lost_s": t3 - t2, "scan_s": t4 - t3}
+                "lost_s": t3 - t2, "scan_s": t4 - t3,
+                "long_line_s": t6 - t5, "far_token_found": far == 1}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -304,9 +314,12 @@ def main(argv):
     print(text)
     if "--check" in argv:
         bad = [k for k, floor in FLOORS.items() if m[k] < floor]
+        if sp["long_line_s"] > 5 or not sp["far_token_found"]:
+            bad.append("scan_long_line")
         if bad:
-            print("REGRESSED: " + ", ".join(f"{k}={m[k]:.3f} < {FLOORS[k]}"
-                                            for k in bad), file=sys.stderr)
+            print("REGRESSED: " + ", ".join(
+                f"{k}={m[k]:.3f} < {FLOORS[k]}" if k in FLOORS else k
+                for k in bad), file=sys.stderr)
             return 1
         return 0
     with open(os.path.join(HERE, "RESULTS.md"), "w") as f:
@@ -351,6 +364,9 @@ Re-run: `python bench/run.py`. Detector numbers describe this corpus only.
 
 ## Speed ({sp['lines']:,} lines, 12 files)
 diet {sp['diet_s']:.2f} s, diet --lint {sp['lint_s']:.2f} s, lost {sp['lost_s']:.2f} s, scan {sp['scan_s']:.2f} s
+
+Hostile line (200,000 characters of `a.a.a.`): scan {sp['long_line_s']:.2f} s;
+a token 200,000 characters into one line is {'found' if sp['far_token_found'] else 'MISSED'}.
 """
 
 

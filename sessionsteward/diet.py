@@ -77,7 +77,11 @@ _COMMENT_START = re.compile(r"^ {0,3}<!--")
 _IMPORT = re.compile(r"(?:^|(?<=\s))@((?:\\ |[^\s])+)")
 _TRAILING = ".,;:!?)]}>'\""
 # C0 and C1 control characters but tab: ESC, BEL, CSI (0x9b), ...
-_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+# plus the bidirectional controls (a name can be made to read backwards).
+# U+2028/2029 are left alone: they are not terminal controls and file names
+# containing them are listed exactly.
+_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f"
+                      "\u202a-\u202e\u2060-\u2069\ufeff]")
 
 
 def safe(text: str) -> str:

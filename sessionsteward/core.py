@@ -171,6 +171,38 @@ class SnapshotDamagedError(StewardError):
     snapshot cannot provably supply (a torn or incomplete snapshot)."""
 
 
+class SnapshotTooLargeError(StewardError):
+    """The watched paths hold more than a snapshot may (a symlink to a huge
+    folder, a runaway directory). Nothing was copied."""
+
+
+# A snapshot copies every file below the watched paths. Links to folders are
+# followed, so a link to /usr or a home directory would copy gigabytes (and
+# walk for minutes) on every SessionStart. Over these, refuse and say where.
+MAX_SNAPSHOT_FILES = 20000
+MAX_SNAPSHOT_MB = 256.0
+
+
+def snapshot_budget() -> tuple[int | None, int | None]:
+    """(max files, max bytes) a snapshot may hold; None lifts a limit.
+    SESSIONSTEWARD_MAX_SNAPSHOT_MB overrides the size (0 lifts it);
+    SESSIONSTEWARD_MAX_SNAPSHOT_FILES the count (0 lifts it). Anything that
+    is not a finite number >= 0 is ignored."""
+    def num(name, default):
+        raw = os.environ.get(name)
+        try:
+            v = float(raw) if raw and raw.strip() else default
+        except ValueError:
+            v = default
+        return v if 0 <= v < float("inf") else default
+    files = num("SESSIONSTEWARD_MAX_SNAPSHOT_FILES", MAX_SNAPSHOT_FILES)
+    mb = num("SESSIONSTEWARD_MAX_SNAPSHOT_MB", MAX_SNAPSHOT_MB)
+    try:
+        return (int(files) or None), (int(mb * 1024 * 1024) or None)
+    except OverflowError:
+        return None, None
+
+
 def _ignored_name(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in IGNORE_PATTERNS)
 
@@ -367,17 +399,21 @@ def _run_git(repo: str, args: tuple[str, ...], **kw) -> subprocess.CompletedProc
     and past a .git it finds unusable that is whatever repository the home
     directory happens to be (a dotfiles repo) - which would then receive our
     `add -A` and our commits."""
+    env = _git_env()
+    env.update(kw.pop("env_extra", None) or {})
+    timeout = kw.pop("timeout", 60)
     where = ["-C", repo]
     if _is_snapshots_repo(repo):
         where += ["--git-dir", os.path.join(repo, ".git"), "--work-tree", repo]
     try:
         return subprocess.run([*GIT, *where, *args], capture_output=True,
-                              timeout=60, env=_git_env(), **kw)
+                              timeout=timeout, env=env, **kw)
     except FileNotFoundError:
         raise GitError("git not found — sessionsteward needs git on PATH "
                        "(https://git-scm.com/downloads)") from None
     except subprocess.TimeoutExpired:
-        raise GitError(f"git {' '.join(args)} did not finish within 60s") \
+        raise GitError(f"git {' '.join(args)} did not finish within "
+                       f"{timeout}s") \
             from None
     except OSError as e:   # not executable, wrong format, out of processes
         raise GitError(f"cannot run git: {e.strerror or e}") from None
@@ -492,10 +528,11 @@ def load_config() -> dict:
             cfg.pop(key, None)   # null is the same as not set
         elif not (isinstance(value, list)
                   and all(isinstance(item, str) for item in value)):
+            what = ("lines of text", '["never force-push"]') \
+                if key == "pins" else ("paths", '["NOTES.md"]')
             raise StewardError(
                 f'watch config {CONFIG_PATH}: "{key}" must be a list of '
-                f'{"lines of text" if key == "pins" else "paths"} such as '
-                f'{"[\"never force-push\"]" if key == "pins" else "[\"NOTES.md\"]"}'
+                f'{what[0]} such as {what[1]}'
                 f'; fix it or delete it (it was left as is)')
     return cfg
 
@@ -1223,6 +1260,9 @@ def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     # turned the live file into an empty directory.)
     kinds = {rel: ("dir" if os.path.isdir(ap) else "file")
              for rel, ap, _ in plan}
+    # refuse before anything is removed or copied (raises when too big)
+    for _ in iter_files([ap for _, ap, _ in plan], budget=True):
+        pass
     # files/ holds exactly this snapshot's files: stale mirrors of other
     # projects (the repo is shared) would otherwise ride along in every
     # commit and show up in `diff`.
@@ -1342,6 +1382,79 @@ def _manifest_at(sha: str, strict: bool = False) -> dict:
     except GitError:
         return {}
     return _manifests_at([full], strict).get(full, {})
+
+
+def prune(keep: int, write: bool = False) -> dict:
+    """Forget old snapshots: keep the newest `keep` snapshots of every
+    project (and the newest of each, always). The snapshots repo is rewritten
+    as a fresh history of the kept commits - same trees, messages and dates -
+    and the old objects are deleted, so a secret that was only in a forgotten
+    snapshot is gone from disk. Each snapshot's tree is complete on its own
+    (the mirror is rebuilt per snapshot), so no kept snapshot depends on a
+    removed one. Without write=True nothing is changed. Caller holds the lock.
+    """
+    if keep < 1:
+        raise StewardError("--keep must be 1 or more")
+    if not repo_ready():
+        raise StewardError("no snapshots yet")
+    out = _git(REPO_DIR, "log", "--reverse", "-z",
+               "--pretty=format:%H%x00%T%x00%aI%x00%B")
+    f = out.split("\0")
+    rows = [f[i:i + 4] for i in range(0, len(f) - 3, 4)]
+    manifests = _manifests_at([r[0] for r in rows])
+    per: dict[str, list[int]] = {}
+    for i, (sha, *_rest) in enumerate(rows):
+        root = _norm_root((manifests.get(sha) or {}).get("project_root"))
+        if not root and i > 0:
+            root = "?"          # a torn snapshot: not ours to throw away
+        per.setdefault(root or "", []).append(i)
+    kept = set(per.get("?", []))
+    for root, idx in per.items():
+        if root in ("", "?"):
+            continue            # the init commit: not a snapshot
+        kept.update(idx[-keep:])
+    total = sum(len(v) for k, v in per.items() if k)
+    removed = total - len(kept)
+    before = _store_bytes()
+    result = {"total": total, "kept": len(kept), "removed": removed,
+              "bytes_before": before, "bytes_after": before,
+              "written": False}
+    if not write or removed <= 0 or not kept:
+        return result
+    parent = None
+    for i, (sha, tree, date, msg) in enumerate(rows):
+        if i not in kept:
+            continue
+        env = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
+        args = ["commit-tree", tree] + (["-p", parent] if parent else [])
+        p = _run_git(REPO_DIR, tuple(args), input=msg.rstrip("\n").encode(
+            "utf-8", "surrogateescape") + b"\n", env_extra=env)
+        if p.returncode != 0:
+            raise GitError("git commit-tree failed: " + " ".join(
+                p.stderr.decode("utf-8", "replace").split())[:200])
+        parent = p.stdout.decode().strip()
+    branch = _git(REPO_DIR, "symbolic-ref", "--short", "HEAD").strip()
+    _git(REPO_DIR, "update-ref", f"refs/heads/{branch}", parent)
+    _git(REPO_DIR, "reflog", "expire", "--expire=now", "--all")
+    p = _run_git(REPO_DIR, ("gc", "-q", "--prune=now"), timeout=900)
+    if p.returncode != 0:
+        raise GitError("git gc failed after the history was rewritten (the "
+                       "snapshots are fine; run it again): " + " ".join(
+                           p.stderr.decode("utf-8", "replace").split())[:150])
+    result["bytes_after"] = _store_bytes()
+    result["written"] = True
+    return result
+
+
+def _store_bytes() -> int:
+    total = 0
+    for root, _dirs, files in os.walk(os.path.join(REPO_DIR, ".git")):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                pass
+    return total
 
 
 def log(limit: int = 20, project_root: str | None = None) -> list[dict]:
@@ -1558,7 +1671,7 @@ def check_restore(sha: str, project_root: str | None = None) -> dict:
 # Tree comparison: git blob ids, computed locally
 # ---------------------------------------------------------------------------
 
-def iter_files(paths: list[str]):
+def iter_files(paths: list[str], budget: bool = False):
     """Yield every regular file under the watched paths (directories
     walked, IGNORE_PATTERNS applied, virtual environments and build output
     left out, files inside a directory over max_file_bytes() left out; pipes,
@@ -1566,10 +1679,16 @@ def iter_files(paths: list[str]):
     the set snap() mirrors: what is compared with a snapshot must be what
     went into it.
 
+    With budget=True (what a new snapshot uses) it raises
+    SnapshotTooLargeError past snapshot_budget(); reading commands never do,
+    so `undo` still works however big the watched tree has grown.
+
     Symlinked directories are walked (snap() mirrors what is behind
     them, so the live tree must see the same files), with a guard so a
     link back into the tree cannot loop forever."""
     limit = max_file_bytes()
+    max_files, max_bytes = snapshot_budget() if budget else (None, None)
+    n_files = n_bytes = 0
     for ap in paths:
         if os.path.isdir(ap):
             seen: set[str] = set()
@@ -1590,6 +1709,20 @@ def iter_files(paths: list[str]):
                     # open() what they get, and a named pipe never returns
                     size = None if _ignored_name(fn) else _regular_size(full)
                     if size is not None and (limit is None or size <= limit):
+                        n_files += 1
+                        n_bytes += size
+                        if ((max_files and n_files > max_files)
+                                or (max_bytes and n_bytes > max_bytes)):
+                            raise SnapshotTooLargeError(
+                                f"the watched paths hold more than a snapshot "
+                                f"may ({max_files or 'any number of'} files, "
+                                f"{(max_bytes or 0) // (1024 * 1024)} MB): "
+                                f"stopped inside {ap} - a link to a big "
+                                f"folder? Nothing was copied. "
+                                f"`sessionsteward watch --remove` the path, "
+                                f"or raise SESSIONSTEWARD_MAX_SNAPSHOT_MB / "
+                                f"SESSIONSTEWARD_MAX_SNAPSHOT_FILES (0 lifts "
+                                f"a limit)")
                         yield full
         elif os.path.isfile(ap):
             yield ap

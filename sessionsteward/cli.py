@@ -26,6 +26,7 @@ Memory *storage* is OneMemory's job — the boundary stays clean.
   sessionsteward diet                  # what's eating the context window
   sessionsteward diet --lint / --fix / --history
   sessionsteward diet --check          # exit 3 on warnings (CI / pre-commit)
+  sessionsteward prune [--keep N] [--write]  # forget old snapshots
   sessionsteward install-hooks [--write]  # Claude Code hooks JSON
   sessionsteward watch                 # daemon: auto-snapshot on change
 """
@@ -220,7 +221,7 @@ def _guard(root: str, sha: str) -> None:
     snaps = core_mod.log(2, project_root=root)
     if len(snaps) == 2 and snaps[0]["sha"] == sha:
         for line in core_mod.guard_lines(sha, snaps[1]["sha"]):
-            print(line)
+            print(diet_mod.safe(line))
     for line in extras_mod.pin_lines(root):
         print(line)
     extras_mod.snap_secret_warning(root)
@@ -232,6 +233,24 @@ def cmd_snap(args) -> int:
     print(f"snapshot {sha[:7]}")
     _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
+    return 0
+
+
+def cmd_prune(args) -> int:
+    if not core_mod.repo_ready():
+        print("no snapshots yet", file=sys.stderr)
+        return 2
+    r = core_mod.prune(args.keep, write=args.write)
+    kb = lambda n: f"{n / 1024:,.0f} KB"
+    print(f"{r['total']} snapshots in the store (all projects); keeping the "
+          f"newest {args.keep} of each project: {r['kept']} kept, "
+          f"{r['removed']} would go" if not r["written"] else
+          f"{r['removed']} snapshot(s) forgotten, {r['kept']} kept; store "
+          f"{kb(r['bytes_before'])} -> {kb(r['bytes_after'])}")
+    if not args.write:
+        print("nothing was changed; `sessionsteward prune --write` rewrites "
+              "the history (forgotten snapshots cannot be brought back; a "
+              "secret that was only in them is deleted from disk)")
     return 0
 
 
@@ -257,12 +276,12 @@ def cmd_log(args) -> int:
     # the shrunken top snapshot; after a restore it would re-clobber.
     at_top = core_mod.worktree_matches_snapshot(snaps[0]["sha"], args.root)
     for i, s in enumerate(snaps[:args.limit]):
-        print(f"{s['sha'][:7]}  {s['date'][:16]}  {s['message']}")
+        print(f"{s['sha'][:7]}  {s['date'][:16]}  {diet_mod.safe(s['message'])}")
         if i + 1 < len(snaps):
             hint = ("undo" if at_top else None) if i == 0 else "restore"
             for line in core_mod.guard_lines(s["sha"], snaps[i + 1]["sha"],
                                              hint=hint):
-                print(line)
+                print(diet_mod.safe(line))
     return 0
 
 
@@ -332,6 +351,23 @@ def _restore_errors(fn):
         return None, 1
 
 
+def _dry_run(target: dict, root: str, note: str = "") -> int:
+    """Say what restoring `target` would do, touching nothing."""
+    changes = core_mod.changes_since(target["sha"], root)
+    print(f"dry run: nothing was changed. Going to {target['sha'][:7]}  "
+          f"{diet_mod.safe(target['message'])}{note}")
+    if changes is None:
+        print("  cannot compare: a watched file cannot be read")
+        return 1
+    if not changes:
+        print("  your files already are that snapshot")
+    verb = {"modified": "would be rewritten", "removed": "would come back",
+            "added": "would be moved to the trash"}
+    for kind, path in changes:
+        print(f"  {diet_mod.safe(_short(path, root))}  {verb[kind]}")
+    return 0
+
+
 def cmd_undo(args) -> int:
     if not core_mod.repo_ready():
         print("no snapshots yet")
@@ -344,6 +380,13 @@ def cmd_undo(args) -> int:
     # the first undo; after that they match an older one, and stepping
     # from snaps[0] would restore the state just undone (the clobber).
     pos = core_mod.current_position(snaps, args.root)
+    if pos is None and args.dry_run:
+        # the dirty state would be saved as "pre-undo" first: the target is
+        # the newest snapshot (more steps go further back)
+        i = min(max(1, args.steps) - 1, len(snaps) - 1)
+        return _dry_run(snaps[i], args.root,
+                        "  (your unsaved changes would be snapshotted "
+                        "first as pre-undo)")
     if pos is None:
         # Dirty state: snapshot it first ("pre-undo") so undo is
         # reversible — redo is `restore` of the pre-undo snapshot.
@@ -361,6 +404,8 @@ def cmd_undo(args) -> int:
     last = len(snaps) - 1
     target_i = min(pos + steps, last)
     target = snaps[target_i]
+    if args.dry_run:
+        return _dry_run(target, args.root)
     restored, rc = _restore_errors(
         lambda: core_mod.restore(target["sha"], project_root=args.root))
     if restored is None:
@@ -370,7 +415,7 @@ def cmd_undo(args) -> int:
         note = (f" (asked for {steps} step(s); {target_i - pos} is the "
                 f"oldest snapshot)")
     print(f"undone {target_i - pos} step(s) -> {target['sha'][:7]}  "
-          f"{target['message']}{note}")
+          f"{diet_mod.safe(target['message'])}{note}")
     _print_restored(restored, args.root)
     return 1 if core_mod.skipped(restored) else 0
 
@@ -383,6 +428,11 @@ def cmd_restore(args) -> int:
     _, rc = _restore_errors(lambda: core_mod.check_restore(args.sha, args.root))
     if rc:
         return rc
+    if args.dry_run:
+        sha, _m = core_mod.resolve_snapshot(args.sha, args.root)
+        full = next((x for x in core_mod.log(1_000_000, args.root)
+                     if x["sha"] == sha), {"sha": sha, "message": ""})
+        return _dry_run(full, args.root)
     # Redo support: if the current state isn't snapshotted yet (matches
     # no snapshot), snapshot it first ("pre-restore") so the restore is
     # reversible.
@@ -479,7 +529,7 @@ def cmd_status(args) -> int:
     top = snaps[0]
     ago = _ago(top["date"])
     print(f"snapshots: {len(snaps)}, newest {top['sha'][:7]} "
-          f"{top['date'][:16]}{f' ({ago})' if ago else ''}  {top['message']}")
+          f"{top['date'][:16]}{f' ({ago})' if ago else ''}  {diet_mod.safe(top['message'])}")
     pos = core_mod.current_position(snaps[:50], root)
     if pos == 0:
         print(f"state: your files are snapshot {top['sha'][:7]} (nothing "
@@ -487,7 +537,7 @@ def cmd_status(args) -> int:
     elif pos is not None:
         s = snaps[pos]
         print(f"state: your files are snapshot {s['sha'][:7]} ({pos} "
-              f"back, after an undo or restore)  {s['message']}")
+              f"back, after an undo or restore)  {diet_mod.safe(s['message'])}")
     else:
         changes = core_mod.changes_since(top["sha"], root)
         if changes is None:
@@ -503,7 +553,7 @@ def cmd_status(args) -> int:
                   "shows snapshot changes, `sessionsteward undo` goes back")
     if len(snaps) > 1 and pos == 0:
         for line in core_mod.guard_lines(top["sha"], snaps[1]["sha"]):
-            print(line)
+            print(diet_mod.safe(line))
     pins = core_mod.load_config().get("pins") or []
     if pins:
         gone = extras_mod.pin_lines(root)
@@ -690,11 +740,15 @@ def build_parser() -> argparse.ArgumentParser:
     df.add_argument("sha1", nargs="?")
     df.add_argument("sha2", nargs="?", default=None)
     un = sub.add_parser("undo", help="Restore the previous snapshot.")
+    un.add_argument("--dry-run", action="store_true",
+                    help="say what would change; touch nothing")
     un.add_argument("--steps", type=int, default=1,
                     help="How many snapshots to step back (clamped to the "
                          "oldest; the report says when).")
     rs = sub.add_parser("restore", help="Restore a specific snapshot.")
     rs.add_argument("sha")
+    rs.add_argument("--dry-run", action="store_true",
+                    help="say what would change; touch nothing")
     sub.add_parser("status", help="Where you are: newest snapshot, "
                                   "unsaved changes, hooks.")
     sh = sub.add_parser("show", help="Print one file from a snapshot (or "
@@ -752,6 +806,13 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("--check", action="store_true",
                     help="Exit 3 when a pinned line is no longer in any "
                          "watched file.")
+    pr = sub.add_parser("prune", help="Forget old snapshots (keeps the "
+                        "newest N of every project; preview unless --write).")
+    pr.add_argument("--keep", type=int, default=50, metavar="N",
+                    help="snapshots to keep per project (default 50)")
+    pr.add_argument("--write", action="store_true",
+                    help="really rewrite the history and delete the old "
+                         "objects (cannot be undone)")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")
     ih.add_argument("--write", action="store_true",
@@ -781,7 +842,7 @@ def main(argv=None) -> int:
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
         "status": cmd_status, "show": cmd_show,
         "lost": extras_mod.cmd_lost, "scan": extras_mod.cmd_scan,
-        "pin": extras_mod.cmd_pin,
+        "pin": extras_mod.cmd_pin, "prune": cmd_prune,
         "install-hooks": cmd_install_hooks,
     }
     if args.cmd == "watch" and (args.add or args.remove):
@@ -790,6 +851,7 @@ def main(argv=None) -> int:
     # cannot interleave with a hook's snap. `watch` (the daemon) locks only
     # around each snapshot it takes; read-only commands never wait.
     writes = args.cmd in ("init", "snap", "precompact", "undo", "restore") \
+        or (args.cmd == "prune" and args.write) \
         or (args.cmd == "watch" and (args.add or args.remove)) \
         or (args.cmd == "pin" and args.text) \
         or (args.cmd == "diet" and args.fix and args.write)

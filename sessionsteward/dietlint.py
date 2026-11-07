@@ -255,6 +255,11 @@ def lint(report: dict, project_root: str) -> dict:
         "dead_references": dead,
         "tokens_saved_if_deduped": saved_exact + saved_near,
         "tokens_in_dead_reference_lines": sum(x["tokens"] for x in dead),
+        # near-duplicate and contradiction analysis stops at this many
+        # lines; say so rather than report a clean result for the rest
+        "lines_not_analysed": max(
+            0, sum(t.count("\n") + 1 for t in texts.values())
+            - MAX_LINES_PER_ANALYSIS),
     }
 
 
@@ -292,6 +297,10 @@ def render(lint_report: dict, name, redact) -> str:
     L.append(f"~{lint_report['tokens_saved_if_deduped']:,} tokens would be "
              f"given back by keeping one line per idea; "
              f"`sessionsteward diet --fix` previews the safe part")
+    if lint_report.get("lines_not_analysed"):
+        L.append(f"NOTE: about {lint_report['lines_not_analysed']:,} lines "
+                 f"past the first {MAX_LINES_PER_ANALYSIS:,} were not "
+                 f"checked for near-duplicates or contradictions")
     if ex:
         L.append(f"\n### Same line twice in one file ({len(ex)})")
         for x in ex[:MAX_REPORTED]:

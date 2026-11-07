@@ -27,6 +27,7 @@ except ImportError:
 
 from sessionsteward import cli as cli_mod
 from sessionsteward import core as core_mod
+from sessionsteward import diet as diet_mod
 
 IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(cli_mod.__file__)))
@@ -1161,7 +1162,8 @@ class TestOddCharactersDoNotBreakTheSnapshotLists(Base):
         code, out, err = self.cli("snap", "-m", "shrunk")
         self.assertEqual(code, 0, err)
         for n in names:
-            self.assertIn(f"guard: .claude/{n} shrank 100 -> 1 bytes", out, n)
+            self.assertIn(f"guard: .claude/{diet_mod.safe(n)} shrank 100 -> 1 bytes",
+                          out, n)  # terminal controls are shown as ?
         code, out, err = self.cli("undo")
         self.assertEqual(code, 0, out + err)
         for n in names:

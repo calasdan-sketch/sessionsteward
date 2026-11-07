@@ -17,8 +17,19 @@ from . import secrets as secrets_mod
 from . import textlines as tl
 
 CHECK_FAILED = 3
-MAX_TEXT_BYTES = 1024 * 1024        # a memory file bigger than this is not text we compare
+# Claude Code does not load a memory file over 4 MiB, so none is compared.
+MAX_TEXT_BYTES = 4 * 1024 * 1024
 TEXT_EXT = {".md", ".mdc", ".markdown", ".txt", ""}
+
+
+class Texts(dict):
+    """{path: text} plus `skipped`: [(path, reason)] for every file the
+    caller would have wanted but could not read as text. A report that says
+    "nothing lost" or "no secrets" must also say what it did not look at."""
+
+    def __init__(self):
+        super().__init__()
+        self.skipped: list[tuple[str, str]] = []
 
 
 def _short(path: str, root: str) -> str:
@@ -26,6 +37,12 @@ def _short(path: str, root: str) -> str:
 
 
 def _decode(raw: bytes) -> str | None:
+    # PowerShell 5's `>` writes UTF-16 with a byte-order mark
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeError:
+            return None
     if b"\x00" in raw[:8192]:
         return None
     return raw.decode("utf-8", "replace")
@@ -37,36 +54,52 @@ def _is_memory_text(path: str) -> bool:
             or name in diet_mod.CONTEXT_NAMES)
 
 
-def live_texts(root: str, everything: bool = False) -> dict[str, str]:
+def _add(out: Texts, fp: str, size: int, raw_reader, everything: bool):
+    if size > MAX_TEXT_BYTES and not everything:
+        out.skipped.append((fp, "over 4 MiB"))
+        return
+    text = _decode(raw_reader())
+    if text is None:
+        out.skipped.append((fp, "not text"))
+    else:
+        out[fp] = text
+
+
+def live_texts(root: str, everything: bool = False) -> Texts:
     """{abspath: text} of the watched text files as they are now."""
-    out = {}
+    out = Texts()
     for fp in core_mod.iter_files(core_mod.watched_paths(root)):
         if not everything and not _is_memory_text(fp):
             continue
         try:
-            if os.path.getsize(fp) > MAX_TEXT_BYTES:
-                continue
-            with open(fp, "rb") as f:
-                text = _decode(f.read())
+            def rd(fp=fp):
+                with open(fp, "rb") as f:
+                    return f.read()
+            _add(out, fp, os.path.getsize(fp), rd, everything)
         except OSError:
-            continue
-        if text is not None:
-            out[fp] = text
+            out.skipped.append((fp, "unreadable"))
     return out
 
 
 def snapshot_texts(sha: str, manifest: dict,
-                   everything: bool = False) -> dict[str, str]:
-    out = {}
+                   everything: bool = False) -> Texts:
+    out = Texts()
     for ap, (blob, size) in core_mod.snapshot_files(sha, manifest).items():
         if not everything and not _is_memory_text(ap):
             continue
-        if size > MAX_TEXT_BYTES:
-            continue
-        text = _decode(core_mod.read_blob(blob))
-        if text is not None:
-            out[ap] = text
+        _add(out, ap, size, lambda blob=blob: core_mod.read_blob(blob),
+             everything)
     return out
+
+
+def not_compared_lines(root: str, *texts: "Texts") -> list[str]:
+    seen, lines = set(), []
+    for t in texts:
+        for fp, why in t.skipped:
+            if fp not in seen:
+                seen.add(fp)
+                lines.append(f"  {diet_mod.safe(_short(fp, root))} ({why})")
+    return lines
 
 
 # ---- lost ------------------------------------------------------------------
@@ -104,6 +137,9 @@ def cmd_lost(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     rep = lost_mod.compare(old, new)
+    skipped = not_compared_lines(root, old, new)
+    rep["not_compared"] = [[_short(p, root), why]
+                           for t in (old, new) for p, why in t.skipped]
     if args.json:
         def red(items, keys):
             for it in items:
@@ -116,7 +152,11 @@ def cmd_lost(args) -> int:
     else:
         print(f"lost: {label}")
         print(lost_mod.render(rep, lambda p: _short(p, root)))
-    if args.check and (rep["dropped"] or rep["reversed"]):
+        if skipped:
+            print(f"NOT COMPARED ({len(skipped)} file(s) that could not be "
+                  f"read as text; a loss in them would not show above):")
+            print("\n".join(skipped[:20]))
+    if args.check and (rep["dropped"] or rep["reversed"] or skipped):
         return CHECK_FAILED
     return 0
 
@@ -147,10 +187,17 @@ def cmd_scan(args) -> int:
     else:
         texts, where = live_texts(root, everything=True), "your watched files"
     found = find_secrets(texts)
+    skipped = not_compared_lines(root, texts)
     if args.json:
         print(json.dumps(found, indent=2, ensure_ascii=True))
+        if skipped:
+            print(f"note: {len(skipped)} file(s) were not scanned (not "
+                  f"text)", file=sys.stderr)
     elif not found:
         print(f"no secrets found in {where} ({len(texts)} file(s) scanned)")
+        if skipped:
+            print(f"NOT SCANNED ({len(skipped)} file(s) that are not text):")
+            print("\n".join(skipped[:20]))
     else:
         print(f"{len(found)} possible secret(s) in {where}:")
         for x in found[:100]:

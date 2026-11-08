@@ -64,8 +64,15 @@ AUTO_MEMORY = "~/.claude/projects/<project>/memory"
 
 # ~/.claude/CLAUDE.md is Claude Code's user-level memory; CLAUDE.local.md
 # is the per-project private memory file.
+#
+# Claude Code also loads the CLAUDE.md / CLAUDE.local.md of every folder
+# ABOVE the one it was started in (start it in packages/web of a monorepo and
+# the repository's own CLAUDE.md is loaded too), so those are watched as one
+# entry. Only files that exist are taken.
+ANCESTOR_MEMORY = "<folders above>/CLAUDE.md"
+ANCESTOR_NAMES = ("CLAUDE.md", "CLAUDE.local.md")
 DEFAULT_WATCH = ["CLAUDE.md", "CLAUDE.local.md", ".claude", "AGENTS.md",
-                 "~/.claude/CLAUDE.md", AUTO_MEMORY]
+                 "~/.claude/CLAUDE.md", AUTO_MEMORY, ANCESTOR_MEMORY]
 
 # Names skipped when walking watched directories (snap + watch daemon).
 # Transcripts and logs balloon the snapshots repo; they are never
@@ -118,6 +125,13 @@ _GIT_CONFIG = (
     ("gc.auto", "0"),
     ("maintenance.auto", "false"),
     ("color.ui", "false"),
+    # Our commits carry this identity whatever the repo's own config says
+    # (a store copied to another machine, or whose config was lost, or a
+    # user.useConfigOnly in your global config, used to fail every snap with
+    # "Author identity unknown").
+    ("user.name", "sessionsteward"),
+    ("user.email", "sessionsteward@local"),
+    ("user.useConfigOnly", "false"),
 )
 GIT = ["git"] + [arg for key, value in _GIT_CONFIG
                  for arg in ("-c", f"{key}={value}")]
@@ -636,11 +650,34 @@ def auto_memory_dir(project_root: str) -> str | None:
     return None
 
 
+def ancestor_memory_files(project_root: str) -> list[str]:
+    """The CLAUDE.md / CLAUDE.local.md files that exist in the folders above
+    project_root, nearest first - what Claude Code adds to the context when
+    it is started below them. Plain files only (no link, pipe or device)."""
+    out = []
+    cur = _norm_root(project_root)
+    for _ in range(64):   # a path is never this deep; bound the walk anyway
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+        for name in ANCESTOR_NAMES:
+            p = os.path.join(cur, name)
+            try:
+                if os.path.isfile(p):
+                    out.append(p)
+            except (OSError, ValueError):
+                continue
+    return out
+
+
 def _expand_watch_entry(rel: str, project_root: str) -> str | None:
     """Absolute path for a watch-list entry, or None when it has no
     location (the auto-memory dir of a project without one)."""
     if rel == AUTO_MEMORY:
         return auto_memory_dir(project_root)
+    if rel == ANCESTOR_MEMORY:
+        return None   # several files: see ancestor_memory_files()
     if rel[:1] == "~" and (len(rel) == 1 or rel[1] in "/\\"):
         # `~\x.md` (Windows spelling) must expand like `~/x.md` everywhere
         return os.path.expanduser("~" + rel[1:].replace("\\", os.sep))
@@ -845,8 +882,9 @@ def _watched_entries(project_root: str) -> list[tuple[str, str]]:
     by_fold: dict[str, list[str]] = {}
     listings: dict[str, list[str]] = {}
     root = _norm_root(project_root)
-    for rel in watch_list():
-        p = _expand_watch_entry(rel, project_root)
+    for rel, p in ((r, q) for r in watch_list() for q in (
+            ancestor_memory_files(project_root) if r == ANCESTOR_MEMORY
+            else [_expand_watch_entry(r, project_root)])):
         # A regular file or a directory (or a link to one). A named pipe,
         # socket or device cannot be snapshotted - reading a pipe blocks
         # for ever - so it is as good as absent.
@@ -1249,9 +1287,42 @@ def snap_report(project_root: str, message: str) -> tuple[str, list]:
     return sha, sorted(set(too_big))
 
 
+STALE_LOCK_SECONDS = 120
+
+
+def stale_index_lock(max_age: float = STALE_LOCK_SECONDS) -> str | None:
+    """The snapshots repo's git index.lock when it is older than max_age
+    seconds, else None. A snapshot takes well under a second, and everything
+    that writes holds our own lock, so an old index.lock is what a killed
+    snapshot (power cut, kill -9, a full disk) left behind - and git refuses
+    every later snapshot until someone deletes it by hand."""
+    path = os.path.join(REPO_DIR, ".git", "index.lock")
+    try:
+        age = time.time() - os.lstat(path).st_mtime
+    except OSError:
+        return None
+    return path if age > max_age else None
+
+
+def _clear_stale_lock() -> str | None:
+    """Remove a stale index.lock (see stale_index_lock); the path, or None."""
+    path = stale_index_lock()
+    if path is None:
+        return None
+    try:
+        os.unlink(path)
+    except OSError:
+        return None
+    return path
+
+
 def _snap(project_root: str, message: str, too_big: list | None = None) -> str:
     if not repo_ready():
         init_repo()
+    if _clear_stale_lock():
+        print("warning: removed a leftover git lock in the snapshots repo "
+              "(a snapshot was killed part-way); carrying on",
+              file=sys.stderr)
     _ensure_attributes()
     files_dir = os.path.join(REPO_DIR, "files")
     # Plan every mirror path first: nothing is removed or written until
@@ -2064,17 +2135,17 @@ def _restore(sha: str, trash_dir: str | None,
     algo = _blob_algo(snap_tree)
     modes = _tree_blobs(sha)   # git file mode of every file in the snapshot
     bits = _manifest_modes(manifest)   # group/other bits (see _apply_modes)
+    deferred_links: list[str] = []
     for rel, ap in files.items():
         data, is_dir = _read_snapshot_file(sha, rel)
         if os.path.islink(ap):
             # A top-level watched path that is a link: the snapshot holds
             # the content behind it, and writing it back would go THROUGH
             # the link into a file that was never watched as such.
-            if _live_matches(ap, snap_tree, algo):
-                restored.append(f"unchanged {ap}")
-            else:
-                restored.append(f"skipped {ap}: is a symlink (left "
-                                f"untouched, never written through)")
+            # Judged after the loop: CLAUDE.md -> AGENTS.md is "unchanged"
+            # once AGENTS.md itself has been restored, whatever order the
+            # two come in.
+            deferred_links.append(ap)
             continue
         if is_dir:
             if os.path.isdir(ap) and _live_matches(ap, snap_tree, algo):
@@ -2156,6 +2227,12 @@ def _restore(sha: str, trash_dir: str | None,
                                restored, trashed):
                 _narrow_to_recorded(ap, rel, bits)
                 restored.append(ap)
+    for ap in deferred_links:
+        if _live_matches(ap, snap_tree, algo):
+            restored.append(f"unchanged {ap}")
+        else:
+            restored.append(f"skipped {ap}: is a symlink (left "
+                            f"untouched, never written through)")
     if trashed:
         prune_trash(trash_dir, protect=trashed)
     return restored
@@ -2181,6 +2258,11 @@ def _sizes(sha: str) -> dict[str, int]:
         size = (meta.split() or [""])[-1]
         if size.isdigit():
             out[path[len("files/"):]] = int(size)
+        elif meta.split()[1:2] == ["blob"]:
+            # git could not read the blob: it is damaged, not deleted
+            raise SnapshotDamagedError(
+                f"snapshot {sha[:7]} is damaged ({display_rel(path[6:])} "
+                f"cannot be read); run `sessionsteward doctor`")
     return out
 
 
@@ -2210,7 +2292,12 @@ def guard_lines(sha: str, prev_sha: str, hint: str | None = "undo") -> list[str]
     else:
         tail = ""
     lines = []
-    for rel, o, n in shrunk(sha, prev_sha):
+    try:
+        hits = shrunk(sha, prev_sha)
+    except SnapshotDamagedError:
+        return ["  ! guard: cannot compare these snapshots, the snapshot "
+                "store is damaged - run `sessionsteward doctor`"]
+    for rel, o, n in hits:
         name = display_rel(rel)
         if n is None:
             lines.append(f"  ! guard: {name} deleted ({o} bytes){tail}")
@@ -2373,11 +2460,16 @@ def _self_cmd() -> str:
     return f"{exe} -m sessionsteward"
 
 
-HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact"
-HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap -m "session start"'
+# --hook: print only warnings (a SessionStart hook's output goes into the
+# agent's context, so "snapshot abc1234" every session is noise) and exit 1,
+# not 2, on a failure (Claude Code treats a PreCompact hook's exit 2 as
+# "block the compaction": a backup tool must not stop the work).
+HOOK_PRECOMPACT_CMD = f"{_self_cmd()} precompact --hook"
+HOOK_SESSIONSTART_CMD = f'{_self_cmd()} snap --hook -m "session start"'
 # The arguments each event's hook has when sessionsteward wrote it.
-_HOOK_ARGS = {"PreCompact": ["precompact"],
-              "SessionStart": ["snap", "-m", "session start"]}
+_HOOK_ARGS = {"PreCompact": [["precompact", "--hook"], ["precompact"]],
+              "SessionStart": [["snap", "--hook", "-m", "session start"],
+                               ["snap", "-m", "session start"]]}
 
 
 def _is_ours(event: str, cmd) -> bool:
@@ -2394,11 +2486,13 @@ def _is_ours(event: str, cmd) -> bool:
         words = shlex.split(cmd)
     except ValueError:
         return False
-    args = _HOOK_ARGS[event]
-    return (words == ["sessionsteward", *args]
-            or (len(words) == len(args) + 3
-                and words[1:3] == ["-m", "sessionsteward"]
-                and words[3:] == args))
+    for args in _HOOK_ARGS[event]:
+        if (words == ["sessionsteward", *args]
+                or (len(words) == len(args) + 3
+                    and words[1:3] == ["-m", "sessionsteward"]
+                    and words[3:] == args)):
+            return True
+    return False
 
 
 def build_hooks_json() -> dict:
@@ -2561,3 +2655,46 @@ def write_hooks_file(settings_path: str) -> str:
         raise SettingsError(f"could not write {settings_path}: "
                             f"{e.strerror or e}") from None
     return settings_path
+
+
+# ---------------------------------------------------------------------------
+# doctor: is the snapshot store itself healthy?
+# ---------------------------------------------------------------------------
+
+def doctor() -> list[tuple[str, str]]:
+    """Health checks of the snapshots repo: [(level, text)], level one of
+    "ok", "warn" (works, but look at it) or "problem" (undo may not work).
+    Read-only: nothing is repaired or deleted."""
+    out: list[tuple[str, str]] = []
+    try:
+        v = _run_git(os.path.expanduser("~"), ("--version",),
+                     encoding="utf-8", errors="replace")
+        out.append(("ok", "git works: " + " ".join(v.stdout.split())[:60]))
+    except GitError as e:
+        return [("problem", f"git cannot be run: {e}")]
+    if not repo_ready():
+        out.append(("ok", "no snapshots repo yet (`sessionsteward init` "
+                          "makes it)"))
+        return out
+    lock = stale_index_lock()
+    if lock:
+        out.append(("warn", "a leftover git lock is in the snapshots repo "
+                            "(a snapshot was killed); the next snapshot "
+                            "removes it"))
+    fsck = _run_git(REPO_DIR, ("fsck", "--no-dangling", "--no-progress"),
+                    encoding="utf-8", errors="replace")
+    if fsck.returncode == 0:
+        out.append(("ok", "the snapshot store passes git's integrity check"))
+    else:
+        first = " | ".join((fsck.stdout + fsck.stderr).split("\n")[:3])
+        out.append(("problem", "the snapshot store is damaged ("
+                    + " ".join(first.split())[:200] + "); snapshots that "
+                    "touch the damaged files cannot be restored - copy "
+                    "~/.sessionsteward elsewhere, then delete it and run "
+                    "`sessionsteward init` to start fresh"))
+    try:
+        load_config()
+        out.append(("ok", "the watch config reads fine"))
+    except StewardError as e:
+        out.append(("problem", str(e)))
+    return out

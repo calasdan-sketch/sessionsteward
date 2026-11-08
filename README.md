@@ -199,6 +199,7 @@ sessionsteward precompact                  # snapshot before compaction
 sessionsteward watch [--interval SECONDS]  # daemon: auto-snapshot on change (polls every 5 s)
 
 sessionsteward status                      # newest snapshot, unsaved changes, hooks, guard
+sessionsteward doctor [--json]             # is the snapshot store healthy? (git, integrity, leftover lock, hooks; exit 3 on a problem)
 sessionsteward log                         # list snapshots (this project only, local time)
 sessionsteward log --json                  # the same as JSON (also: status --json)
 sessionsteward diff                        # what changed (e.g. what compaction dropped)
@@ -223,7 +224,12 @@ sessionsteward install-hooks --write       # merge it into ~/.claude/settings.js
 ```
 
 Watched by default: `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, `AGENTS.md`
-(project root), `~/.claude/CLAUDE.md` (your user-level memory) and Claude
+(project root), the `CLAUDE.md` / `CLAUDE.local.md` of every folder *above*
+the project (Claude Code loads those too: start it in `packages/web` of a
+monorepo and the repository's `CLAUDE.md` is part of your context - before
+0.3.0 these were neither snapshotted nor counted by `diet`; the entry is
+`<folders above>/CLAUDE.md` in `watch`, and `watch --remove` drops it),
+`~/.claude/CLAUDE.md` (your user-level memory) and Claude
 Code's auto-memory directory for the project,
 `~/.claude/projects/<project>/memory/` (`MEMORY.md` + topic files), when it
 exists — `<project>` is Claude Code's name for the repository (the path
@@ -323,6 +329,21 @@ default: cwd): snapshots record their project root (one repo is shared by
 all your projects and the whole history is scanned, so another project's
 snapshots never hide yours), and a `restore` of a snapshot from another
 project is refused rather than clobbering your files.
+A parent folder's `CLAUDE.md` is shared by every project below it, so it is in
+each of their snapshots: `undo` in one project can put back an older version
+of a file you edited from another (the `pre-undo` snapshot keeps the newer
+one; `watch --remove "<folders above>/CLAUDE.md"` opts out).
+
+A leftover git lock in the snapshots repo (a snapshot killed by a power cut or
+`kill -9`) used to make every later snapshot fail until you found and deleted
+it; one older than two minutes is now removed with a one-line warning. A
+snapshot whose data git cannot read is reported as damaged (`doctor`,
+exit 3), not as a "deleted" file. A `CLAUDE.md` that is a link to `AGENTS.md`
+is reported `unchanged` after `undo` (the file behind the link is restored
+first), not `skipped` with exit 1. Commits carry a fixed identity, so a store
+without `user.name` (copied to another machine) no longer fails with "Author
+identity unknown".
+
 `undo` steps back from wherever you are: because a restore leaves your
 files equal to its target, after one undo (or a `restore <sha>`) they match
 that snapshot, and the next `undo` continues from there instead of
@@ -493,9 +514,9 @@ sessionsteward install-hooks            # print the hooks JSON + where it goes
 sessionsteward install-hooks --write   # merge into ~/.claude/settings.json
 ```
 
-This wires **PreCompact** → `sessionsteward precompact` (snapshot before
+This wires **PreCompact** → `sessionsteward precompact --hook` (snapshot before
 compaction — run `sessionsteward diff` afterwards to see exactly what the
-compaction dropped) and **SessionStart** → `sessionsteward snap -m "session
+compaction dropped) and **SessionStart** → `sessionsteward snap --hook -m "session
 start"`. Point the steward at the same files your agent's memory hook
 writes (`watch --add`) and those get the same protection.
 
@@ -523,9 +544,16 @@ state just before the latest write), keeps your line endings and
 indentation, and writes through a symlinked `settings.json` instead of
 replacing the link.
 
-Note that what a SessionStart or PreCompact hook prints on stdout is
-added to Claude's context. sessionsteward keeps it to one line
-(`snapshot a3f9c21`) plus any guard warnings, and reports the problems it
+Note that what a SessionStart hook prints on stdout is added to Claude's
+context (Claude Code's [hooks reference](https://code.claude.com/docs/en/hooks),
+read 2026-11-08), and that a PreCompact hook that exits 2 *blocks the
+compaction*. So the `--hook` flag the hooks use prints nothing when all is well
+(no `snapshot a3f9c21` line every session), still prints guard, pin and secret
+warnings, and exits 1 - never 2 - when it fails, so a broken snapshot store
+cannot stop you compacting. Hooks written by earlier builds (without
+`--hook`) keep working; `install-hooks --write` rewrites them. Outside hooks,
+`snap` and `precompact` print `snapshot a3f9c21` as before. sessionsteward
+reports the problems it
 knows about as a single `error: …` line on stderr instead of a traceback:
 exit code 2 for git (missing, unusable, a stale `index.lock`), a corrupt
 config or manifest, or a busy lock; exit code 1 when the operating system

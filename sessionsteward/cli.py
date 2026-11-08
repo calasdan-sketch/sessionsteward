@@ -230,10 +230,38 @@ def _guard(root: str, sha: str) -> None:
 def cmd_snap(args) -> int:
     sha, too_big = core_mod.snap_report(args.root,
                                         args.message or "manual snapshot")
-    print(f"snapshot {sha[:7]}")
+    if not args.hook:
+        print(f"snapshot {sha[:7]}")
     _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
+
+
+def cmd_doctor(args) -> int:
+    rows = core_mod.doctor()
+    root = args.root
+    hooks = core_mod.hooks_installed(CLAUDE_SETTINGS)
+    if hooks is None:
+        rows.append(("warn", f"{CLAUDE_SETTINGS} cannot be read"))
+    elif all(hooks.values()):
+        rows.append(("ok", "Claude Code hooks installed (SessionStart + "
+                           "PreCompact)"))
+    else:
+        missing = " + ".join(e for e, ok in hooks.items() if not ok)
+        rows.append(("warn", f"hooks missing: {missing} - "
+                             f"`sessionsteward install-hooks --write`"))
+    above = core_mod.ancestor_memory_files(root)
+    if above:
+        rows.append(("ok", f"{len(above)} memory file(s) in folders above "
+                           "this folder are watched too"))
+    bad = [t for lvl, t in rows if lvl == "problem"]
+    if args.json:
+        print(json.dumps([{"level": lvl, "text": t} for lvl, t in rows],
+                         indent=2, ensure_ascii=True))
+    else:
+        for lvl, text in rows:
+            print(f"{lvl:7} {diet_mod.safe(text)}")
+    return 3 if bad else 0
 
 
 def cmd_prune(args) -> int:
@@ -256,8 +284,10 @@ def cmd_prune(args) -> int:
 
 def cmd_precompact(args) -> int:
     sha, too_big = core_mod.snap_report(args.root, "pre-compaction snapshot")
-    print(f"pre-compaction snapshot {sha[:7]} — "
-          f"`sessionsteward diff {sha[:7]}` after, to see what was dropped")
+    if not args.hook:
+        print(f"pre-compaction snapshot {sha[:7]} — "
+              f"`sessionsteward diff {sha[:7]}` after, to see what was "
+              f"dropped")
     _warn_too_big(too_big, args.root)
     _guard(args.root, sha)
     return 0
@@ -804,7 +834,11 @@ def build_parser() -> argparse.ArgumentParser:
                          f"to {MAX_INTERVAL:g} (default 5).")
     sn = sub.add_parser("snap", help="Snapshot now.")
     sn.add_argument("-m", "--message", default=None)
-    sub.add_parser("precompact", help="Snapshot before compaction.")
+    _hook_help = ("for Claude Code hooks: print only warnings, and exit 1 "
+                  "(never 2, which would block) when it fails")
+    sn.add_argument("--hook", action="store_true", help=_hook_help)
+    pc = sub.add_parser("precompact", help="Snapshot before compaction.")
+    pc.add_argument("--hook", action="store_true", help=_hook_help)
     lg = sub.add_parser("log", help="List snapshots.")
     lg.add_argument("--limit", type=_positive_int, default=20)
     lg.add_argument("--json", action="store_true",
@@ -889,6 +923,10 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--write", action="store_true",
                     help="really rewrite the history and delete the old "
                          "objects (cannot be undone)")
+    dc = sub.add_parser("doctor", help="Check the snapshot store (git, "
+                        "integrity, leftover lock, hooks). Exit 3 on a "
+                        "problem.")
+    dc.add_argument("--json", action="store_true")
     ih = sub.add_parser("install-hooks",
                         help="Print (or --write) Claude Code hooks JSON.")
     ih.add_argument("--write", action="store_true",
@@ -916,7 +954,7 @@ def main(argv=None) -> int:
         "init": cmd_init, "watch": cmd_watch, "snap": cmd_snap,
         "precompact": cmd_precompact, "log": cmd_log, "diff": cmd_diff,
         "undo": cmd_undo, "restore": cmd_restore, "diet": cmd_diet,
-        "status": cmd_status, "show": cmd_show,
+        "status": cmd_status, "show": cmd_show, "doctor": cmd_doctor,
         "lost": extras_mod.cmd_lost, "scan": extras_mod.cmd_scan,
         "pin": extras_mod.cmd_pin, "prune": cmd_prune,
         "install-hooks": cmd_install_hooks,
@@ -953,7 +991,7 @@ def main(argv=None) -> int:
         # git missing, a stale .git/index.lock, a corrupt config or
         # manifest: one line on stderr, exit 2 — never a traceback (as a
         # SessionStart hook that would be pasted into the agent's context).
-        return _fail(e, 2)
+        return _fail(e, 1 if getattr(args, "hook", False) else 2)
     except subprocess.SubprocessError as e:
         return _fail(e, 1)
     except Exception as e:   # noqa: BLE001 - input nobody foresaw, or a bug

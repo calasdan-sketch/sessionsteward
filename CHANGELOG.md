@@ -2,6 +2,38 @@
 
 ## 0.3.0 (unreleased)
 
+Round 5 (specialists: Claude Code power user, git internals, developer
+productivity, data recovery; details in docs/ROUND5.md)
+
+Fixed
+- Started in a subfolder (monorepo `packages/web`), sessionsteward saw no
+  memory files and committed empty snapshots, while Claude Code loads the
+  `CLAUDE.md` of every folder above. Those files (`CLAUDE.md`,
+  `CLAUDE.local.md`) are now watched (one new default entry
+  `<folders above>/CLAUDE.md`), snapshotted, restored and counted by `diet`.
+- A PreCompact hook that fails exits 2, which Claude Code reads as "block
+  the compaction". The hooks now use `--hook`: warnings only, exit 1 on a
+  failure. SessionStart output goes into the agent's context, so the
+  `snapshot abc1234` line is no longer printed there either.
+- A killed snapshot left `.git/index.lock`; every later snapshot failed until
+  it was deleted by hand. A lock older than two minutes is now removed.
+- Unreadable data in a snapshot was reported by the shrink guard as a
+  "deleted" file; it is now "damaged - run doctor".
+- `undo` of a `CLAUDE.md` that links to `AGENTS.md` said `skipped` and exited
+  1 although the content was restored; it says `unchanged`, exit 0.
+- Commits used the repo's own `user.name`; a store without one failed.
+
+Added
+- `doctor [--json]`: git, store integrity (`git fsck`), leftover lock, config,
+  hooks. Exit 3 on a problem.
+- `snap --hook`, `precompact --hook`; `sessionsteward.__author__`.
+- Upgrade check: a store written by 0.1.0 works with this version.
+
+Behaviour change: the default watch list has a seventh entry, and the hooks
+written by `install-hooks` carry `--hook` (old hooks keep working; re-run
+`install-hooks --write` to update them). A snapshot taken earlier is not
+affected: restoring it leaves the newly watched parent files alone.
+
 Round 4 (the first hour with the installed package)
 
 Fixed

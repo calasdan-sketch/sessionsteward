@@ -26,8 +26,8 @@ Re-run: `python bench/run.py`. Detector numbers describe this corpus only.
 | lines moved to another file recognised | no | 100% |
 
 ## Speed (3,433 lines, 12 files)
-diet 0.05 s, diet --lint 4.60 s, lost 0.24 s, scan 0.25 s
+diet 0.10 s, diet --lint 4.68 s, lost 0.24 s, scan 0.24 s
 
-Hostile line (200,000 characters of `a.a.a.`): scan 0.14 s;
+Hostile line (200,000 characters of `a.a.a.`): scan 0.11 s;
 a token 200,000 characters into one line is found.
 
